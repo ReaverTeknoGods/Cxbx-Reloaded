@@ -595,20 +595,20 @@ static bool CxbxrKrnlXbeSystemSelector(int BootFlags,
 
 		std::string chihiroMediaBoardRom = g_MediaBoardBasePath + MediaBoardRomFile;
 		if (!std::filesystem::exists(chihiroMediaBoardRom)) {
-			CxbxrAbort("Chihiro Media Board ROM (fpr21042_m29w160et.bin) could not be found (should be placed in /EmuMediaBoard/)");
+			CxbxrAbort("Chihiro Media Board ROM could not be found at: %s", chihiroMediaBoardRom.c_str());
 		}
 
 		// Open a handle to the mediaboard rom
 		FILE* fpRom = fopen(chihiroMediaBoardRom.c_str(), "rb");
 		if (fpRom == nullptr) {
-			CxbxrAbort("Chihiro Media Board ROM (fpr21042_m29w160et.bin) could not be opened for read");
+			CxbxrAbort("Chihiro Media Board ROM could not be opened for read: %s", chihiroMediaBoardRom.c_str());
 		}
 
 		// Verify the size of media board rom
 		fseek(fpRom, 0, SEEK_END);
 		auto length = ftell(fpRom);
 		if (length != 2 * ONE_MB) {
-			CxbxrAbort("Chihiro Media Board ROM (fpr21042_m29w160et.bin) has an invalid size");
+			CxbxrAbort("Chihiro Media Board ROM has an invalid size: %s", chihiroMediaBoardRom.c_str());
 
 		}
 		fseek(fpRom, 0, SEEK_SET);
@@ -843,6 +843,14 @@ void CxbxKrnlEmulate(unsigned int reserved_systems, blocks_reserved_t blocks_res
 		g_EmuShared->Reset();
 
 		g_Settings->Verify();
+		// Apply /fs or /win command line override before syncing
+		if (cli_config::hasKey(cli_config::fullscreen)) {
+			g_Settings->m_video.bFullScreen = true;
+		}
+		else if (cli_config::hasKey(cli_config::windowed)) {
+			g_Settings->m_video.bFullScreen = false;
+		}
+
 		g_Settings->SyncToEmulator();
 
 		// We don't need to keep Settings open plus allow emulator to use unused memory.

@@ -156,6 +156,11 @@ bool EmuExceptionNonBreakpointUnhandledShow(LPEXCEPTION_POINTERS e)
 {
 	EmuExceptionPrintDebugInformation(e, /*IsBreakpointException=*/false);
 
+#ifdef NDEBUG
+	// In Release mode, auto-ignore unhandled exceptions to avoid blocking popups
+	e->ContextRecord->Eip += EmuX86_OpcodeSize((uint8_t*)e->ContextRecord->Eip); // Skip 1 instruction
+	return true;
+#else
 	auto result = PopupFatalEx(nullptr, PopupButtons::AbortRetryIgnore, PopupReturn::Abort,
 		"  The running xbe has encountered an unhandled exception (Code := 0x%.8X) at address 0x%.08X.\n"
 		"\n"
@@ -172,6 +177,7 @@ bool EmuExceptionNonBreakpointUnhandledShow(LPEXCEPTION_POINTERS e)
 	}
 
 	return false;
+#endif
 }
 
 // Returns weither the given address is part of an Xbox managed memory region

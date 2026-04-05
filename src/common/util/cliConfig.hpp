@@ -41,6 +41,8 @@ static constexpr char sid[] = "sid";
 static constexpr char system_retail[] = "retail";
 static constexpr char system_devkit[] = "devkit";
 static constexpr char system_chihiro[] = "chihiro";
+static constexpr char fullscreen[] = "fs";
+static constexpr char windowed[] = "win";
 
 bool GenConfig(char** argv, int argc);
 size_t ConfigSize();

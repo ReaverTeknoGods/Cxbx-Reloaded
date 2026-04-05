@@ -40,7 +40,7 @@ source_group(TREE ${CXBXR_ROOT_DIR}/src PREFIX header FILES ${HEADERS})
 
 source_group(TREE ${CXBXR_ROOT_DIR}/src PREFIX source FILES ${SOURCES})
 
-add_executable(cxbxr-ldr ${HEADERS} ${SOURCES})
+add_executable(cxbxr-ldr ${HEADERS} ${SOURCES} "${CMAKE_CURRENT_LIST_DIR}/cxbxr-ldr.rc")
 
 # Link and compile flags
 if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC")

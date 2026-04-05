@@ -884,37 +884,15 @@ void Settings::Verify()
 
 std::string Settings::GetDataLocation()
 {
+	// TeknoParrot mode: always use <exe_dir>\TeknoParrot as data location
+	m_current_data_location = GenerateExecDirectoryStr() + "\\TeknoParrot";
+	m_current_DataStorageToggle = CXBX_DATA_EXECDIR;
+	m_gui.DataStorageToggle = CXBX_DATA_EXECDIR;
 
-	// Optimization purpose for not require to re-process when toggle state has not changed.
-	if (m_current_DataStorageToggle == m_gui.DataStorageToggle) {
-		return m_current_data_location;
+	// Create the TeknoParrot directory if it doesn't exist
+	if (!std::filesystem::exists(m_current_data_location)) {
+		std::filesystem::create_directories(m_current_data_location);
 	}
-
-	switch (m_gui.DataStorageToggle) {
-		default:
-#ifdef RETRO_API_VERSION // TODO: Change me to #ifndef QT_VERSION
-
-			m_gui.DataStorageToggle = CXBX_DATA_EXECDIR;
-
-#else // Only support for Qt compile build.
-
-			m_gui.DataStorageToggle = CXBX_DATA_APPDATA;
-			// If unknown value, default to CXBX_DATA_APPDATA (below, don't use break)
-
-		case CXBX_DATA_APPDATA:
-			m_current_data_location = GenerateUserProfileDirectoryStr();
-			break;
-#endif
-
-		case CXBX_DATA_EXECDIR:
-			m_current_data_location = GenerateExecDirectoryStr();
-			break;
-
-		case CXBX_DATA_CUSTOM:
-			m_current_data_location = m_gui.szCustomLocation;
-			break;
-	}
-	m_current_DataStorageToggle = m_gui.DataStorageToggle;
 
 	return m_current_data_location;
 }
@@ -922,75 +900,38 @@ std::string Settings::GetDataLocation()
 // Detect where settings file is located and return default data mode.
 CXBX_DATA Settings::FindSettingsLocation(std::string& file_path_out)
 {
-	std::string fileSearch = GenerateExecDirectoryStr();
-	CXBX_DATA ret = CXBX_DATA_EXECDIR;
+	// TeknoParrot mode: always look in <exe_dir>\TeknoParrot\settings.ini
+	std::string teknoDir = GenerateExecDirectoryStr() + "\\TeknoParrot";
+	std::string fileSearch = teknoDir + szSettings_settings_file;
 
-	fileSearch.append(szSettings_settings_file);
-
-	// Check and see if file exists from portable, current, directory.
-	if (std::filesystem::exists(fileSearch) == false) {
-
-		fileSearch = GenerateUserProfileDirectoryStr();
-		if (fileSearch.size() == 0) {
-			return CXBX_DATA_INVALID;
-		}
-		CXBX_DATA ret = CXBX_DATA_APPDATA;
-		fileSearch.append(szSettings_settings_file);
-
-		// Check if the user profile directory settings file exists.
-		if (std::filesystem::exists(fileSearch) == false) {
-			return CXBX_DATA_INVALID;
-		}
+	if (std::filesystem::exists(fileSearch)) {
+		file_path_out = fileSearch;
+		return CXBX_DATA_EXECDIR;
 	}
-	file_path_out = fileSearch;
 
-	return ret;
+	return CXBX_DATA_INVALID;
 }
 
 // Enter setup installer process
 CXBX_DATA Settings::SetupFile(std::string& file_path_out)
 {
-	std::string setupFile;
-	CXBX_DATA data_ret = CXBX_DATA_INVALID;
-#ifdef RETRO_API_VERSION // TODO: Change me to #ifndef QT_VERSION
-	// Can only have one option without Qt.
-	setupFile = GenerateExecDirectoryStr();
+	// TeknoParrot mode: auto-create TeknoParrot folder and settings.ini (no prompt)
+	std::string setupDir = GenerateExecDirectoryStr() + "\\TeknoParrot";
+	CXBX_DATA data_ret = CXBX_DATA_EXECDIR;
 
-#else // Only support for Qt compile build.
-	PopupReturn eRet = PopupQuestion(nullptr, szSettings_save_user_option_message);
-
-	if (eRet == PopupReturn::Yes) {
-		setupFile = GenerateExecDirectoryStr();
-		data_ret = CXBX_DATA_EXECDIR;
-	}
-	else if (eRet == PopupReturn::No) {
-		setupFile = GenerateUserProfileDirectoryStr();
-		data_ret = CXBX_DATA_APPDATA;
-		if (setupFile.size() != 0) {
-			// Check if data directory exists.
-			if (!std::filesystem::exists(setupFile)) {
-				// Then try create data directory.
-				if (!std::filesystem::create_directory(setupFile)) {
-					// Unable to create a data directory
-					data_ret = CXBX_DATA_INVALID;
-				}
-			}
+	if (!std::filesystem::exists(setupDir)) {
+		if (!std::filesystem::create_directories(setupDir)) {
+			PopupError(nullptr, szSettings_setup_error);
+			return CXBX_DATA_INVALID;
 		}
 	}
-#endif
 
-	if (data_ret == CXBX_DATA_INVALID) {
-		PopupError(nullptr, szSettings_setup_error);
+	std::string setupFile = setupDir + szSettings_settings_file;
+	std::ofstream createFile(setupFile);
+	if (createFile.is_open()) {
+		createFile.close();
 	}
-	else {
-		setupFile.append(szSettings_settings_file);
-		// Create the file, that's it. Load the default configuration later on;
-		std::ofstream createFile(setupFile);
-		if (createFile.is_open()) {
-			createFile.close();
-		}
-		file_path_out = setupFile;
-	}
+	file_path_out = setupFile;
 
 	return data_ret;
 }

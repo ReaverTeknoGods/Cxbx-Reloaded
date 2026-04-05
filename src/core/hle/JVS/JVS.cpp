@@ -142,15 +142,23 @@ bool JVS_LoadFile(std::string path, mio::mmap_sink& data)
 	return true;
 }
 
+// Forward declaration: check if TeknoParrot shared memory is active
+extern void* g_jvs_view_ptr;
+
 void JvsInputThread()
 {
 	g_AffinityPolicy->SetAffinityOther(GetCurrentThread());
 
 	while (true) {
-		// This thread is responsible for reading the emulated Baseboard state
-		// and setting the correct internal variables
-		ChihiroBaseBoardState.TestButton = GetAsyncKeyState(VK_F1);
-		ChihiroBaseBoardState.ServiceButton = GetAsyncKeyState(VK_F2);
+		// Read Test/Service from shared memory if TeknoParrot is connected
+		if (g_jvs_view_ptr) {
+			uint32_t control = *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(g_jvs_view_ptr) + 8);
+			ChihiroBaseBoardState.TestButton = (control & 0x01) != 0;
+			ChihiroBaseBoardState.ServiceButton = (control & 0x40) != 0;
+		} else {
+			ChihiroBaseBoardState.TestButton = GetAsyncKeyState(VK_F1);
+			ChihiroBaseBoardState.ServiceButton = GetAsyncKeyState(VK_F2);
+		}
 
 		// Call into the Jvs I/O board update function
 		g_pJvsIo->Update();

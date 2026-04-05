@@ -86,7 +86,7 @@ void CxbxrInitFilePaths()
 		CxbxrAbort("%s : Couldn't create Cxbx-Reloaded's data folder!", __func__);
 	}
 
-	// Make sure the EmuDisk folder exists
+	// All subdirectories go inside g_DataFilePath (TeknoParrot dir)
 	g_DiskBasePath = g_DataFilePath + "\\EmuDisk";
 	result = std::filesystem::exists(g_DiskBasePath);
 	if (!result && !std::filesystem::create_directory(g_DiskBasePath)) {
@@ -95,7 +95,6 @@ void CxbxrInitFilePaths()
 	CxbxResolveHostToFullPath(g_DiskBasePath, "Cxbx-Reloaded's EmuDisk directory");
 	g_DiskBasePath = std::filesystem::path(g_DiskBasePath).append("").string();
 
-	// Make sure the EmuDMu folder exists
 	g_MuBasePath = g_DataFilePath + "\\EmuMu";
 	result = std::filesystem::exists(g_MuBasePath);
 	if (!result && !std::filesystem::create_directory(g_MuBasePath)) {
@@ -106,7 +105,6 @@ void CxbxrInitFilePaths()
 
 	snprintf(szFilePath_EEPROM_bin, MAX_PATH, "%s\\EEPROM.bin", g_DataFilePath.c_str());
 
-	// Make sure the EmuMediaBoard folder exists
 	g_MediaBoardBasePath = g_DataFilePath + "\\EmuMediaBoard";
 	result = std::filesystem::exists(g_MediaBoardBasePath);
 	if (!result && !std::filesystem::create_directory(g_MediaBoardBasePath)) {

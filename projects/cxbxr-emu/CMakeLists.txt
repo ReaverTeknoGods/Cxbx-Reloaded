@@ -105,6 +105,7 @@ add_library(cxbxr-emu SHARED ${RESOURCES}
  ${CXBXR_GIT_VERSION_H}
  "${CXBXR_ROOT_DIR}/src/emulator/cxbxr-emu.cpp"
  "${CXBXR_ROOT_DIR}/src/emulator/dllmain.cpp"
+ "${CMAKE_CURRENT_LIST_DIR}/cxbxr-emu.rc"
 )
 
 # Link and compile flags

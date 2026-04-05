@@ -1547,9 +1547,19 @@ static DWORD WINAPI EmuRenderWindow(LPVOID lpParam)
 			}
 		}
 
+        // Build window title with XBE filename
+        std::string windowTitle = "Cxbx-TeknoParrot";
+        {
+            std::string xbePath(szFilePath_Xbe);
+            size_t lastSep = xbePath.find_last_of("\\/;");
+            if (lastSep != std::string::npos) {
+                windowTitle += " - " + xbePath.substr(lastSep + 1);
+            }
+        }
+
         g_hEmuWindow = CreateWindow
         (
-            "CxbxRender", "Cxbx-Reloaded",
+            "CxbxRender", windowTitle.c_str(),
             dwStyle, 
 			windowRect.left,
 			windowRect.top,
@@ -1752,17 +1762,10 @@ static LRESULT WINAPI EmuMsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 
         case WM_KEYDOWN:
         {
-            /*! disable fullscreen if we are set to faux mode, and faux fullscreen is active */
+            /*! ESC always quits the application */
             if(wParam == VK_ESCAPE)
             {
-                if(g_XBVideo.bFullScreen)
-                {
-                    SendMessage(hWnd, WM_CLOSE, 0, 0);
-                }
-                else if(g_bIsFauxFullscreen)
-                {
-                    ToggleFauxFullscreen(hWnd);
-                }
+                ExitProcess(0);
             }
             else if (wParam == VK_F1)
             {
