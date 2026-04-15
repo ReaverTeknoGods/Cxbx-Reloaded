@@ -34,6 +34,7 @@
 //#include "CxbxKrnl/Emu.h"
 #include "EmuShared.h"
 #include "core\kernel\init\CxbxKrnl.h" // For HandleFirstLaunch() and LaunchEmulation()
+#include "core\hle\D3D8\Direct3D9\Shader.h" // For ShaderCacheShutdown()
 //#include <commctrl.h>
 #include "common/util/cliConverter.hpp"
 #include "common/util/cliConfig.hpp"
@@ -189,6 +190,11 @@ DWORD WINAPI Emulate(unsigned int reserved_systems, blocks_reserved_t blocks_res
 
 	/*! cleanup shared memory */
 	EmuShared::Cleanup();
+
+	// Flush shader cache saves to disk before terminating — the save thread is
+	// detached and TerminateProcess would kill it mid-write, losing all shaders
+	// compiled this session.
+	ShaderCacheShutdown();
 
 	// Note : Emulate() must never return to it's caller (rawMain() in loader.cpp),
 	// because that function resides in a block of memory that's overwritten with

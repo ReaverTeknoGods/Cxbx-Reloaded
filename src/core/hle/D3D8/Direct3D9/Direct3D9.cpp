@@ -1766,6 +1766,7 @@ static LRESULT WINAPI EmuMsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             /*! ESC always quits the application */
             if(wParam == VK_ESCAPE)
             {
+                ShaderCacheShutdown();
                 ExitProcess(0);
             }
             else if (wParam == VK_F1)
