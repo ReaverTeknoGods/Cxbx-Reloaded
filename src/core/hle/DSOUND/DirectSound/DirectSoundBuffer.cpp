@@ -198,7 +198,7 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(DirectSoundCreateBuffer)
         DWORD dwAcceptableMask = 0x00000010 | 0x00000020 | 0x00000080 | 0x00000100 | 0x00020000 | 0x00040000 /*| 0x00080000*/;
 
         if (pdsbd->dwFlags & (~dwAcceptableMask)) {
-            EmuLog(LOG_LEVEL::WARNING, "Use of unsupported pdsbd->dwFlags mask(s) (0x%.08X)", pdsbd->dwFlags & (~dwAcceptableMask));
+            EmuLog(LOG_LEVEL::DEBUG, "Use of unsupported pdsbd->dwFlags mask(s) (0x%.08X)", pdsbd->dwFlags & (~dwAcceptableMask));
         }
 
         DSBufferDesc.dwSize = sizeof(DSBUFFERDESC);

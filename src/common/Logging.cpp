@@ -166,19 +166,21 @@ void EmuLogEx(CXBXR_MODULE cxbxr_module, LOG_LEVEL level, const char *szWarningM
 		return;
 	}
 
-	LOG_CHECK_ENABLED_EX(cxbxr_module, level) {
-		if (g_bPrintfOn) {
-
-			LOG_THREAD_INIT;
-
-			va_list argp;
-			va_start(argp, szWarningMessage);
-
-			EmuLogOutput(cxbxr_module, level, szWarningMessage, argp);
-
-			va_end(argp);
-		}
+#ifdef NDEBUG
+	// In Release builds, suppress all DEBUG-level messages — they're too noisy for production
+	if (level == LOG_LEVEL::DEBUG) {
+		return;
 	}
+#endif
+
+	LOG_THREAD_INIT;
+
+	va_list argp;
+	va_start(argp, szWarningMessage);
+
+	EmuLogOutput(cxbxr_module, level, szWarningMessage, argp);
+
+	va_end(argp);
 }
 
 void EmuLogInit(LOG_LEVEL level, const char *szWarningMessage, ...)

@@ -58,7 +58,7 @@ void D3D8LightState::EnableLight(uint32_t index, bool enable) {
 
             if (enable) {
                 // Don't need to do anything
-                EmuLog(LOG_LEVEL::INFO, "Enabled light %d but it was already enabled", index);
+                EmuLog(LOG_LEVEL::DEBUG, "Enabled light %d but it was already enabled", index);
             }
             else {
                 // Disable the light
@@ -77,13 +77,13 @@ void D3D8LightState::EnableLight(uint32_t index, bool enable) {
         }
         else {
             // Replace the oldest element and move to end
-            EmuLog(LOG_LEVEL::INFO, "Can't enable any more lights. Replacing the oldest light %i", EnabledLights[0]);
+            EmuLog(LOG_LEVEL::DEBUG, "Can't enable any more lights. Replacing the oldest light %i", EnabledLights[0]);
             EnabledLights[0] = index;
             std::rotate(std::begin(EnabledLights), std::begin(EnabledLights) + 1, std::end(EnabledLights));
         }
     }
     else {
-        EmuLog(LOG_LEVEL::INFO, "Could not disable light %d because it wasn't enabled", index);
+        EmuLog(LOG_LEVEL::DEBUG, "Could not disable light %d because it wasn't enabled", index);
     }
 }
 

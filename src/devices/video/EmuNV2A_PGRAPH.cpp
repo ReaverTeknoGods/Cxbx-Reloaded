@@ -1322,7 +1322,7 @@ void pgraph_handle_method(NV2AState *d,
 
 			break;
 		default:
-			EmuLog(LOG_LEVEL::WARNING, "Unknown NV_IMAGE_BLIT Method: 0x%08X", method);
+			EmuLog(LOG_LEVEL::DEBUG, "Unknown NV_IMAGE_BLIT Method: 0x%08X", method);
 		}
 		break;
 	}

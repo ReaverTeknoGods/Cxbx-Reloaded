@@ -32,6 +32,9 @@ extern std::string g_DiskBasePath;
 extern std::string g_MediaBoardBasePath;
 extern std::string g_MuBasePath;
 extern std::string g_TitleMountPath;
+// Per-game isolated data directory (empty when no game key is available)
+extern std::string g_GameDataPath;
+extern std::string g_GameMediaBoardPath;
 
 #include <filesystem>
 

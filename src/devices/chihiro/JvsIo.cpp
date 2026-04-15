@@ -26,6 +26,8 @@
 
 #include "JvsIo.h"
 #include <cstdio>
+#include <cstdarg>
+#include <ctime>
 #include <string>
 
 JvsIo* g_pJvsIo;
@@ -34,10 +36,92 @@ JvsIo* g_pJvsIo;
 #include <vector>
 #include <Windows.h>
 
+// ============================================================================
+// JVS logging
+// ============================================================================
+#ifdef JVS_LOG
+FILE* g_JvsLogFile = nullptr;
+static ULONGLONG g_JvsLogStartMs = 0;
+
+void JvsLog(const char* fmt, ...)
+{
+	if (!g_JvsLogFile) return;
+	va_list args;
+	va_start(args, fmt);
+	vfprintf(g_JvsLogFile, fmt, args);
+	va_end(args);
+	fflush(g_JvsLogFile);
+}
+
+// Returns milliseconds elapsed since the JVS log was opened
+static ULONGLONG JvsElapsedMs()
+{
+	return GetTickCount64() - g_JvsLogStartMs;
+}
+
+void JvsIo::OpenLog(const std::string& dataFilePath)
+{
+	if (!dataFilePath.empty()) {
+		std::string path = dataFilePath + "\\jvs_io.log";
+		g_JvsLogFile = fopen(path.c_str(), "wt");
+	}
+	if (!g_JvsLogFile) {
+		// Fallback: open in working directory
+		g_JvsLogFile = fopen("jvs_io.log", "wt");
+	}
+	g_JvsLogStartMs = GetTickCount64();
+	time_t now = time(nullptr);
+	JvsLog("JVS I/O log opened %s", ctime(&now));
+	JvsLog("BoardID: %s\n", BoardID.c_str());
+	JvsLog("Emulated: CommandFormatRevision=0x%02X JvsVersion=0x%02X CommVersion=0x%02X\n\n",
+		CommandFormatRevision, JvsVersion, CommunicationVersion);
+}
+#else
+void JvsIo::OpenLog(const std::string& /*dataFilePath*/) {}
+#endif
+
+// Returns a human-readable name for a JVS command byte
+static const char* JvsCommandName(uint8_t cmd)
+{
+	switch (cmd) {
+		case 0xF0: return "F0_Reset";
+		case 0xF1: return "F1_SetDeviceId";
+		case 0x10: return "10_GetBoardId";
+		case 0x11: return "11_GetCommandFormat";
+		case 0x12: return "12_GetJvsRevision";
+		case 0x13: return "13_GetCommunicationVersion";
+		case 0x14: return "14_GetCapabilities";
+		case 0x15: return "15_ConveyMainBoardId";
+		case 0x20: return "20_ReadSwitchInputs";
+		case 0x21: return "21_ReadCoinInputs";
+		case 0x22: return "22_ReadAnalogInputs";
+		case 0x26: return "26_ReadMiscSwitchInputs";
+		case 0x2E: return "2E_ReadPayoutHopperStatus";
+		case 0x2F: return "2F_RetransmitData";
+		case 0x30: return "30_CoinDecrease";
+		case 0x31: return "31_CoinIncrease";
+		case 0x32: return "32_GeneralPurposeOutput";
+		case 0x33: return "33_AnalogOutput";
+		case 0x34: return "34_CharacterOutput";
+		case 0x36: return "36_PayoutSubtractionOutput";
+		case 0x37: return "37_GeneralPurposeOutput2";
+		case 0x70: return "70_NamcoCustom";
+		default:   return "??_Unknown";
+	}
+}
+
+static void LogPacketHex(const char* prefix, const uint8_t* data, size_t len)
+{
+	JvsLog("%s (%zu bytes):", prefix, len);
+	for (size_t i = 0; i < len; i++) JvsLog(" %02X", data[i]);
+	JvsLog("\n");
+}
+
 // TeknoParrot JVS shared memory for input passthrough
 static HANDLE g_jvs_file_mapping = nullptr;
 void* g_jvs_view_ptr = nullptr;
 static bool g_coin_pressed_prev[JVS_MAX_PLAYERS] = { false };
+JvsGameType g_jvs_game_type = JvsGameType::Generic;
 // We will emulate SEGA 837-13551 IO Board
 JvsIo::JvsIo(uint8_t* sense)
 {
@@ -65,6 +149,7 @@ JvsIo::JvsIo(uint8_t* sense)
 
 void JvsIo::Update()
 {
+	std::lock_guard<std::mutex> lock(IoBoardMutex);
 	// Read input from TeknoParrot shared memory if available, otherwise fall back to keyboard
 	uint32_t control = 0;
 	uint32_t coin_state = 0;
@@ -131,7 +216,10 @@ void JvsIo::Update()
 		Inputs.switches.player[0].button[3] = (control & 0x80000) != 0;  // Button4
 		Inputs.switches.player[0].button[4] = (control & 0x100000) != 0; // Button5
 		Inputs.switches.player[0].button[5] = (control & 0x200000) != 0; // Button6
-		Inputs.switches.player[0].button[6] = (control & 0x400000) != 0; // Button7
+		Inputs.switches.player[0].button[6] = 0;
+		Inputs.switches.player[0].button[7] = 0;
+		Inputs.switches.player[0].button[8] = (control & 0x400000) != 0; // Button7 (ExtensionButton1_1 / Intrude)
+		Inputs.switches.player[0].button[9] = (control & 0x8000000) != 0; // Button8 (ExtensionButton1_2 / View Change)
 
 		// Player 2 digital inputs
 		Inputs.switches.player[1].start     = (control & 0x08) != 0;
@@ -146,14 +234,41 @@ void JvsIo::Update()
 		Inputs.switches.player[1].button[3] = (control & 0x800000) != 0;  // Button4
 		Inputs.switches.player[1].button[4] = (control & 0x1000000) != 0; // Button5
 		Inputs.switches.player[1].button[5] = (control & 0x2000000) != 0; // Button6
-		Inputs.switches.player[1].button[6] = (control & 0x4000000) != 0; // Button7
+		Inputs.switches.player[1].button[6] = (control & 0x4000000) != 0; // Button7 (ExtensionButton1_1 / Intrude)
+		Inputs.switches.player[1].button[7] = (control & 0x20000000) != 0; // Button8 (ExtensionButton1_2 / View Change)
 
-		// Analog inputs from shared memory (offsets 12-15)
+		// Expand an 8-bit TP axis byte [0,255] to 16-bit [0,65535] via bit
+		// replication (byte << 8 | byte).  Preserves both endpoints exactly:
+		// 0x00→0x0000, 0xFF→0xFFFF.  Center byte 0x80 maps to 0x8080,
+		// which is within 128 counts (~0.2%) of the JVS centre (0x8000).
+		auto expand8to16 = [](uint8_t b) -> uint16_t {
+			return ((uint16_t)b << 8) | b;
+		};
+
+		// Analog inputs from shared memory (offsets 12-15).
+		// Channel assignments are game-specific.
 		uint8_t* analog_base = static_cast<uint8_t*>(g_jvs_view_ptr) + 12;
-		Inputs.analog[0].value = (uint16_t)analog_base[1] << 8;
-		Inputs.analog[1].value = (uint16_t)analog_base[0] << 8;
-		Inputs.analog[2].value = (uint16_t)analog_base[3] << 8;
-		Inputs.analog[3].value = (uint16_t)analog_base[2] << 8;
+		switch (g_jvs_game_type) {
+			case JvsGameType::WanganMT1:
+			case JvsGameType::WanganMT2:
+				// WMMT analog layout (confirmed via JVS trace):
+				//   analog[0] = steering  <- byte[1]
+				//   analog[1] = accel     <- byte[0]
+				//   analog[2] = brake     <- byte[3]
+				//   analog[3] = unused    <- byte[2]
+				Inputs.analog[0].value = expand8to16(analog_base[0]); // steering
+				Inputs.analog[1].value = expand8to16(analog_base[1]); // accel
+				Inputs.analog[2].value = expand8to16(analog_base[2]); // brake
+				Inputs.analog[3].value = expand8to16(analog_base[3]);
+				break;
+			default:
+				// Generic: channel N maps straight from byte N
+				Inputs.analog[0].value = expand8to16(analog_base[1]);
+				Inputs.analog[1].value = expand8to16(analog_base[0]);
+				Inputs.analog[2].value = expand8to16(analog_base[3]);
+				Inputs.analog[3].value = expand8to16(analog_base[2]);
+				break;
+		}
 
 		// Coin handling (edge-triggered from shared memory offset 32)
 		bool coin_pressed_now = (coin_state != 0);
@@ -190,9 +305,11 @@ int JvsIo::Jvs_Command_F0_Reset(uint8_t* data)
 
 	if (ensure_reset == 0xD9) {
 		// Set sense to 3 (2.5v) to instruct the baseboard we're ready.
+		uint8_t prevSense = *pSense;
 		*pSense = 3;
 		ResponseBuffer.push_back(ReportCode::Handled); // Note : Without this, Chihiro software stops sending packets (but JVS V3 doesn't send this?)
 		DeviceId = 0;
+		JvsLog("  F0_Reset: sense %u->3 (2.5V, ready), DeviceId reset to 0\n", prevSense);
 	}
 #if 0 // TODO : Is the following required?
 	else {
@@ -216,10 +333,13 @@ int JvsIo::Jvs_Command_F0_Reset(uint8_t* data)
 int JvsIo::Jvs_Command_F1_SetDeviceId(uint8_t* data)
 {
 	// Set Address
+	uint8_t prevId = DeviceId;
 	DeviceId = data[1];
 
+	uint8_t prevSense = *pSense;
 	*pSense = 0; // Set sense to 0v
 	ResponseBuffer.push_back(ReportCode::Handled);
+	JvsLog("  F1_SetDeviceId: DeviceId %u->%u, sense %u->0 (0V, assigned)\n", prevId, DeviceId, prevSense);
 
 	return 1;
 }
@@ -264,27 +384,44 @@ int JvsIo::Jvs_Command_14_GetCapabilities()
 {
 	ResponseBuffer.push_back(ReportCode::Handled);
 
-	// Capabilities list (4 bytes each)
+	// Capabilities list (4 bytes each).
+	// Each game type reports its own capability values to match what the real
+	// cabinet hardware declares. Add a new case here when bringing up a new title.
+	uint8_t buttons    = 14; // real SEGA 837-13551 default
+	uint8_t analogBits = 10;
+	uint8_t gpoCount   = 20;
+
+	switch (g_jvs_game_type) {
+		case JvsGameType::WanganMT1:
+		case JvsGameType::WanganMT2:
+			buttons    = 13;
+			analogBits = 16;
+			gpoCount   =  6;
+			break;
+		// TODO: case JvsGameType::GhostSquad: ...
+		default: // JvsGameType::Generic — use the defaults above
+			break;
+	}
 
 	// Input capabilities
 	ResponseBuffer.push_back(CapabilityCode::PlayerSwitchButtonSets);
-	ResponseBuffer.push_back(JVS_MAX_PLAYERS); // number of players
-	ResponseBuffer.push_back(13); // 13 button switches per player
+	ResponseBuffer.push_back(JVS_MAX_PLAYERS);
+	ResponseBuffer.push_back(buttons);
 	ResponseBuffer.push_back(0);
 
 	ResponseBuffer.push_back(CapabilityCode::CoinSlots);
-	ResponseBuffer.push_back(JVS_MAX_COINS); // number of coin slots
+	ResponseBuffer.push_back(JVS_MAX_COINS);
 	ResponseBuffer.push_back(0);
 	ResponseBuffer.push_back(0);
 
 	ResponseBuffer.push_back(CapabilityCode::AnalogInputs);
-	ResponseBuffer.push_back(JVS_MAX_ANALOG); // number of analog input channels
-	ResponseBuffer.push_back(16); // 16 bits per analog input channel
+	ResponseBuffer.push_back(JVS_MAX_ANALOG);
+	ResponseBuffer.push_back(analogBits);
 	ResponseBuffer.push_back(0);
 
 	// Output capabilities
 	ResponseBuffer.push_back(CapabilityCode::GeneralPurposeOutputs);
-	ResponseBuffer.push_back(6); // number of outputs
+	ResponseBuffer.push_back(gpoCount);
 	ResponseBuffer.push_back(0);
 	ResponseBuffer.push_back(0);
 
@@ -295,10 +432,12 @@ int JvsIo::Jvs_Command_14_GetCapabilities()
 
 int JvsIo::Jvs_Command_15_ConveyMainBoardId(uint8_t* data, size_t remaining)
 {
-	// Main board sends its ID as a null-terminated string
-	// We just acknowledge it
+	// Main board sends its ID as a null-terminated string.
+	// TeknoParrot's working emulator returns report + 0x01 + 0x05 (3 bytes total),
+	// matching observed real hardware behaviour.
 	ResponseBuffer.push_back(ReportCode::Handled);
-
+	ResponseBuffer.push_back(0x01);
+	ResponseBuffer.push_back(0x05);
 	// Scan past the null-terminated string starting at data[1]
 	int consumed = 0;
 	for (size_t j = 1; j < remaining; j++) {
@@ -595,10 +734,15 @@ void JvsIo::HandlePacket(jvs_packet_header_t* header, std::vector<uint8_t>& pack
 			case 0x7F:
 			case 0x80: i += Jvs_Command_78_80_SkipNamcoUnknownCustom(); break;
 			default:
-				// Overwrite the verly-optimistic StatusCode::StatusOkay with Status::Unsupported command
-				// Don't process any further commands. Existing processed commands must still return their responses.
-				ResponseBuffer[0] = StatusCode::UnsupportedCommand;
-				printf("JvsIo::HandlePacket: Unhandled Command %02X\n", packet[i]);
+				// Do NOT set UnsupportedCommand in the packet status byte — that signals to the game that the
+				// IO board is entirely disconnected (causes "Error 11 JVS I/O not connected" in Virtua Cop 3
+				// when the cabinet sends a header-light LED command with no registered handler).
+				// Instead, append InvalidParameter in the report for this specific command so the game sees
+				// a valid response and knows the board is alive.  We must still stop processing further
+				// commands in this packet because we don't know the unknown command's parameter byte count.
+				ResponseBuffer.push_back(ReportCode::InvalidParameter);
+				JvsLog("  UNKNOWN command 0x%02X at offset %zu — returning InvalidParameter (board stays connected)\n", packet[i], i);
+				printf("JvsIo::HandlePacket: Unhandled Command %02X (acknowledged with InvalidParameter)\n", packet[i]);
 				return;
 		}
 	}
@@ -606,6 +750,7 @@ void JvsIo::HandlePacket(jvs_packet_header_t* header, std::vector<uint8_t>& pack
 
 size_t JvsIo::SendPacket(uint8_t* buffer)
 {
+	std::lock_guard<std::mutex> lock(IoBoardMutex);
 	// Remember where the buffer started (so we can calculate the number of bytes we've handled)
 	uint8_t* buffer_start = buffer;
 
@@ -625,9 +770,14 @@ size_t JvsIo::SendPacket(uint8_t* buffer)
 		return 1;
 	}
 
-	// Read the target and count bytes
-	header.target = GetEscapedByte(buffer);
-	header.count = GetEscapedByte(buffer);
+	// Read the target and count bytes.
+	// NOTE: JVS over Chihiro USB is a raw byte stream — the escape-byte mechanism (0xD0)
+	// is a physical RS-485 layer concern and is NOT applied by the Xbox USB driver.
+	// Using GetEscapedByte here would misinterpret any data byte that happens to equal
+	// ESCAPE_BYTE (0xD0), consuming the following byte (often the real checksum) as the
+	// escape suffix and cascading the mis-alignment across several subsequent packets.
+	header.target = GetByte(buffer);
+	header.count = GetByte(buffer);
 
 	// Calculate the checksum
 	uint8_t actual_checksum = header.target + header.count;
@@ -635,13 +785,13 @@ size_t JvsIo::SendPacket(uint8_t* buffer)
 	// Decode the payload data
 	std::vector<uint8_t> packet;
 	for (int i = 0; i < header.count - 1; i++) { // Note : -1 to avoid adding the checksum byte to the packet
-		uint8_t value = GetEscapedByte(buffer);
+		uint8_t value = GetByte(buffer);
 		packet.push_back(value);
 		actual_checksum += value;
 	}
 
-	// Read the checksum from the last byte
-	uint8_t packet_checksum = GetEscapedByte(buffer);
+	// Read the checksum from the last byte (raw — not escaped, see note above)
+	uint8_t packet_checksum = GetByte(buffer);
 #ifdef DEBUG_JVS_PACKETS
 	printf("\n");
 #endif
@@ -650,10 +800,21 @@ size_t JvsIo::SendPacket(uint8_t* buffer)
 	ResponseBuffer.clear();
 	if (packet_checksum != actual_checksum) {
 		ResponseBuffer.push_back(StatusCode::ChecksumError);
+		JvsLog("SendPacket: CHECKSUM ERROR target=0x%02X count=%u expected=0x%02X got=0x%02X — discarding packet\n",
+			header.target, header.count, actual_checksum, packet_checksum);
 	} else {
 		// If the packet was intended for us, we need to handle it
 		if (header.target == TARGET_BROADCAST || header.target == DeviceId) {
+			// Log full raw packet bytes
+			JvsLog("[+%llums] SendPacket -> target=0x%02X (DeviceId=%u) count=%u payload(%zu):",
+				JvsElapsedMs(), header.target, DeviceId, header.count, packet.size());
+			for (size_t pi = 0; pi < packet.size(); pi++)
+				JvsLog(" %02X", packet[pi]);
+			JvsLog("\n");
 			HandlePacket(&header, packet);
+		} else {
+			JvsLog("SendPacket: packet for target=0x%02X ignored (our DeviceId=%u)\n",
+				header.target, DeviceId);
 		}
 	}
 
@@ -681,6 +842,7 @@ void JvsIo::SendEscapedByte(uint8_t* &buffer, uint8_t value)
 
 size_t JvsIo::ReceivePacket(uint8_t* buffer)
 {
+	std::lock_guard<std::mutex> lock(IoBoardMutex);
 	if (ResponseBuffer.empty()) {
 		return 0;
 	}
@@ -697,8 +859,8 @@ size_t JvsIo::ReceivePacket(uint8_t* buffer)
 
 	// Send the header bytes
 	SendByte(buffer, header.sync); // Do not escape the sync byte!
-	SendEscapedByte(buffer, header.target);
-	SendEscapedByte(buffer, header.count);
+	SendByte(buffer, header.target);
+	SendByte(buffer, header.count);
 
 	// Calculate the checksum
 	uint8_t packet_checksum = header.target + header.count;
@@ -706,12 +868,12 @@ size_t JvsIo::ReceivePacket(uint8_t* buffer)
 	// Encode the payload data
 	for (size_t i = 0; i < ResponseBuffer.size(); i++) {
 		uint8_t value = ResponseBuffer[i];
-		SendEscapedByte(buffer, value);
+		SendByte(buffer, value);
 		packet_checksum += value;
 	}
 
 	// Write the checksum to the last byte
-	SendEscapedByte(buffer, packet_checksum);
+	SendByte(buffer, packet_checksum);
 
 	ResponseBuffer.clear();
 
@@ -725,6 +887,13 @@ size_t JvsIo::ReceivePacket(uint8_t* buffer)
 	}
 
 	printf("\n");
+#endif
+	// Log outgoing response
+#ifdef JVS_LOG
+	if (g_JvsLogFile && total_packet_size > 0) {
+		JvsLog("[+%llums] ", JvsElapsedMs());
+		LogPacketHex("ReceivePacket <-", buffer_start, total_packet_size);
+	}
 #endif
 	return total_packet_size;
 }

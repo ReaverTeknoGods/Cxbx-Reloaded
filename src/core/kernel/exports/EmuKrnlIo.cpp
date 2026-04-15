@@ -1075,7 +1075,7 @@ xbox::ntstatus_xt NTAPI xbox::IopParseDevice(
 	}
 	else {
 		std::string xPathName(CompleteName->Buffer, CompleteName->Length);
-		EmuLog(LOG_LEVEL::ERROR2, "Unable to access directory or file: %s", xPathName.c_str());
+		EmuLog(LOG_LEVEL::DEBUG, "Unable to access directory or file: %s", xPathName.c_str());
 	}
 #endif
 

@@ -28,6 +28,8 @@
 
 #include "core\kernel\init\CxbxKrnl.h"
 #include "core\kernel\support\Emu.h"
+#include "common\util\hasher.h" // For ComputeHash
+#include "common\xbe\Xbe.h"   // For Xbe::Header
 #include "core\hle\D3D8\Direct3D9/Direct3D9.h"
 #include "core\hle\JVS\JVS.h"
 #include "core\hle\DSOUND\DirectSound\DirectSound.hpp"
@@ -516,6 +518,16 @@ inline void EmuInstallPatch(const std::string FunctionName, const xbox::addr_xt 
 	
 }
 
+// Write NOP bytes over a range of guest virtual addresses, bypassing write protection.
+static void EmuNopPatch(uintptr_t addr, size_t len)
+{
+	DWORD oldProtect;
+	if (VirtualProtect((void*)addr, len, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+		memset((void*)addr, 0x90, len);
+		VirtualProtect((void*)addr, len, oldProtect, &oldProtect);
+	}
+}
+
 void EmuInstallPatches()
 {
 	for (const auto& it : g_SymbolAddresses) {
@@ -524,6 +536,17 @@ void EmuInstallPatches()
 
 	LookupTrampolinesD3D();
 	LookupTrampolinesXAPI();
+
+	// Per-game byte patches keyed by XBE header hash
+	uint64_t xbeHash = ComputeHash((void*)&CxbxKrnl_Xbe->m_Header, sizeof(Xbe::Header));
+
+	// Crazy Taxi (Chihiro) ctx_ac[r].xbe — hash f319c176ab55e589
+	// DSOUND:0011FDA5  jnz short loc_11FDA1  (75 FA)
+	// Patch to NOP so the sound init loop exits instead of spinning forever.
+	if (xbeHash == 0xf319c176ab55e589ULL) {
+		EmuNopPatch(0x0011FDA5, 2);
+		EmuNopPatch(0x0003CB81, 2);
+	}
 }
 
 void* GetPatchedFunctionTrampoline(const std::string functionName)

@@ -110,7 +110,7 @@ public:
 		char szKrnlDebug[MAX_PATH] = "";
 		char szStorageLocation[xbox::max_path] = "";
         unsigned int LoggedModules[NUM_INTEGERS_LOG];
-		int LogLevel = 1;
+		int LogLevel = 0;
 		bool bUnused_WasUseLoaderExec;
 		bool allowAdminPrivilege;
 		bool bLogPopupTestCase;

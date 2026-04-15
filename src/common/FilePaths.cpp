@@ -26,12 +26,14 @@
 #define LOG_PREFIX_INIT CXBXR_MODULE::INIT
 
 #include <filesystem>
+#include <fstream>
 #include "common/cxbxr.hpp"
 #include "Settings.hpp"
 #include "EmuShared.h"
 #include "xxhash.h" // for XXH3_64bits
 #include "core/kernel/common/xbox.h"
 #include "Logging.h"
+#include "common/util/cliConfig.hpp"
 
 char szFilePath_CxbxReloaded_Exe[MAX_PATH] = { 0 };
 char szFilePath_EEPROM_bin[MAX_PATH] = { 0 };
@@ -40,6 +42,8 @@ std::string g_DataFilePath;
 std::string g_DiskBasePath;
 std::string g_MediaBoardBasePath;
 std::string g_MuBasePath;
+std::string g_GameDataPath;
+std::string g_GameMediaBoardPath;
 
 //TODO: Possible move CxbxResolveHostToFullPath inline function someplace else if become useful elsewhere.
 // Let filesystem library clean it up for us, including resolve host's symbolic link path.
@@ -86,8 +90,56 @@ void CxbxrInitFilePaths()
 		CxbxrAbort("%s : Couldn't create Cxbx-Reloaded's data folder!", __func__);
 	}
 
+	// ---------------------------------------------------------------------------
+	// Per-game data isolation.
+	// Derive a stable 64-bit key from the initial commandline XBE path and store
+	// it in EmuShared so that every process in the session (BIOS -> game XBE ->
+	// test menu XBE -> game XBE ...) resolves to the same per-game folder.
+	// Mutable per-game state (EEPROM, EmuDisk, EmuMu, MediaBoard partitions,
+	// backup_ram) lives under:  <DataFilePath>\Games\<key>\
+	// Shared read-only firmware (fpr21042_m29w160et.bin, ic10_g24lc64.bin, …)
+	// remains at:               <DataFilePath>\EmuMediaBoard\
+	// ---------------------------------------------------------------------------
+	g_GameDataPath.clear();
+	g_GameMediaBoardPath.clear();
+	if (g_EmuShared != nullptr) {
+		char szGameKey[20] = { 0 };
+		g_EmuShared->GetGameSessionKey(szGameKey);
+
+		if (szGameKey[0] == '\0') {
+			// First process in session — compute key from the commandline XBE path.
+			std::string xbePath;
+			if (cli_config::GetValue(cli_config::load, &xbePath) && !xbePath.empty()) {
+				std::error_code ec;
+				std::string norm = std::filesystem::absolute(xbePath, ec).string();
+				if (!ec) {
+					// Normalize to lowercase for case-insensitive consistency on Windows.
+					for (char& c : norm) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+					uint64_t hash = XXH3_64bits(norm.data(), norm.size());
+					snprintf(szGameKey, sizeof(szGameKey), "%016llx", static_cast<unsigned long long>(hash));
+					g_EmuShared->SetGameSessionKey(szGameKey);
+				}
+			}
+		}
+
+		if (szGameKey[0] != '\0') {
+			g_GameDataPath = g_DataFilePath + "\\Games\\" + szGameKey;
+			// Pre-create the per-game directory tree so subsequent code can find
+			// the directories without needing to create them.
+			std::filesystem::create_directories(g_GameDataPath + "\\EmuDisk");
+			std::filesystem::create_directories(g_GameDataPath + "\\EmuMu");
+			std::filesystem::create_directories(g_GameDataPath + "\\EmuMediaBoard\\Chihiro");
+			// Store the resolved per-game MediaBoard path with trailing separator,
+			// matching the format used by g_MediaBoardBasePath.
+			g_GameMediaBoardPath = std::filesystem::path(g_GameDataPath + "\\EmuMediaBoard").append("").string();
+		}
+	}
+
+	// Choose base directory: per-game when available, shared TeknoParrot dir otherwise.
+	const std::string& baseForGame = g_GameDataPath.empty() ? g_DataFilePath : g_GameDataPath;
+
 	// All subdirectories go inside g_DataFilePath (TeknoParrot dir)
-	g_DiskBasePath = g_DataFilePath + "\\EmuDisk";
+	g_DiskBasePath = baseForGame + "\\EmuDisk";
 	result = std::filesystem::exists(g_DiskBasePath);
 	if (!result && !std::filesystem::create_directory(g_DiskBasePath)) {
 		CxbxrAbort("%s : Couldn't create Cxbx-Reloaded EmuDisk folder!", __func__);
@@ -95,7 +147,7 @@ void CxbxrInitFilePaths()
 	CxbxResolveHostToFullPath(g_DiskBasePath, "Cxbx-Reloaded's EmuDisk directory");
 	g_DiskBasePath = std::filesystem::path(g_DiskBasePath).append("").string();
 
-	g_MuBasePath = g_DataFilePath + "\\EmuMu";
+	g_MuBasePath = baseForGame + "\\EmuMu";
 	result = std::filesystem::exists(g_MuBasePath);
 	if (!result && !std::filesystem::create_directory(g_MuBasePath)) {
 		CxbxrAbort("%s : Couldn't create Cxbx-Reloaded EmuMu folder!", __func__);
@@ -103,7 +155,16 @@ void CxbxrInitFilePaths()
 	CxbxResolveHostToFullPath(g_MuBasePath, "Cxbx-Reloaded's EmuMu directory");
 	g_MuBasePath = std::filesystem::path(g_MuBasePath).append("").string();
 
-	snprintf(szFilePath_EEPROM_bin, MAX_PATH, "%s\\EEPROM.bin", g_DataFilePath.c_str());
+	// io_mu_metadata opens F.bin–M.bin with ios::in|ios::out which fails if the file
+	// doesn't exist yet. Create zero-byte stubs so the constructor can open them.
+	for (char letter = 'F'; letter <= 'M'; ++letter) {
+		std::string muBin = g_MuBasePath + letter + ".bin";
+		if (!std::filesystem::exists(muBin)) {
+			std::ofstream stub(muBin, std::ios_base::out | std::ios_base::binary);
+		}
+	}
+
+	snprintf(szFilePath_EEPROM_bin, MAX_PATH, "%s\\EEPROM.bin", baseForGame.c_str());
 
 	g_MediaBoardBasePath = g_DataFilePath + "\\EmuMediaBoard";
 	result = std::filesystem::exists(g_MediaBoardBasePath);

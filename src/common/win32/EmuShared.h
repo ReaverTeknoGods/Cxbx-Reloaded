@@ -327,6 +327,12 @@ class EmuShared : public Mutex
 		}
 
 		// ******************************************************************
+		// * Per-game session key (16 hex chars, stable across XBE chain)
+		// ******************************************************************
+		void GetGameSessionKey(char value[20]) { Lock(); std::strncpy(value, m_GameSessionKey, sizeof(m_GameSessionKey)); Unlock(); }
+		void SetGameSessionKey(const char* value) { Lock(); std::strncpy(m_GameSessionKey, value, sizeof(m_GameSessionKey) - 1); Unlock(); }
+
+		// ******************************************************************
 		// * Reset specific variables to default for kernel mode.
 		// ******************************************************************
 		void ResetKrnl()
@@ -379,6 +385,7 @@ class EmuShared : public Mutex
 		char         m_DeviceControlNames[XBOX_NUM_PORTS][HIGHEST_NUM_BUTTONS][HOST_BUTTON_NAME_LENGTH];
 		char         m_DeviceName[XBOX_NUM_PORTS][50];
 		char         m_TitleMountPath[xbox::max_path];
+		char         m_GameSessionKey[20];  // 16 hex chars + null, derived from initial commandline XBE
 
 		// Settings class in memory should not be tampered by third-party.
 		// Third-party program should only be allow to edit settings.ini file.

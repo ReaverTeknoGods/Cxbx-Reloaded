@@ -390,7 +390,7 @@ static inline HRESULT DSoundBufferCreate(LPDSBUFFERDESC pDSBufferDesc, LPDIRECTS
 static inline void DSound3DBufferCreate(LPDIRECTSOUNDBUFFER8 pDSBuffer, LPDIRECTSOUND3DBUFFER8 &pDS3DBuffer) {
     HRESULT hRetDS3D = pDSBuffer->QueryInterface(IID_IDirectSound3DBuffer, (LPVOID*)&(pDS3DBuffer));
     if (hRetDS3D != DS_OK) {
-        EmuLog(LOG_LEVEL::WARNING, "CreateSound3DBuffer Failed!");
+        EmuLog(LOG_LEVEL::DEBUG, "CreateSound3DBuffer Failed!");
         pDS3DBuffer = nullptr;
     }
 }

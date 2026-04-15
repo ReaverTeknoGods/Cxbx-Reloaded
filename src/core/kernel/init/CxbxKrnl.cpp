@@ -134,6 +134,9 @@ void SetupPerTitleKeys()
 xbox::void_xt NTAPI CxbxLaunchXbe(xbox::PVOID Entry)
 {
 	EmuLogInit(LOG_LEVEL::DEBUG, "Calling XBE entry point...");
+	char msg[128];
+	sprintf_s(msg, sizeof(msg), "OEP = 0x%08X\n\nAttach debugger now, then click OK.", (DWORD)(uintptr_t)Entry);
+	//MessageBoxA(nullptr, msg, "Cxbx OEP Break", MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
 	static_cast<void(*)()>(Entry)();
 	EmuLogInit(LOG_LEVEL::DEBUG, "XBE entry point returned");
 }
@@ -413,6 +416,15 @@ FILE* CxbxrKrnlSetupVerboseLog(int BootFlags)
 			return krnlLog;
 		}
 		else {
+			// No GUI-configured debug file — always write to <DataFilePath>\cxbxr_debug.log
+			// so we can capture errors (like Error 11) that don't appear in jvs_io.log.
+			if (!g_DataFilePath.empty()) {
+				std::string autoLogPath = g_DataFilePath + "\\cxbxr_debug.log";
+				FILE* autoLog = freopen(autoLogPath.c_str(), "wt", stdout);
+				if (autoLog) {
+					return autoLog;
+				}
+			}
 			char buffer[16];
 			if (GetConsoleTitle(buffer, 16) != NULL)
 				(void)freopen("nul", "w", stdout);

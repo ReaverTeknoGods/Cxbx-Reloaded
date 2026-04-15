@@ -21,3 +21,4 @@ LAST_GIT_VERSION
 
 # git mergetool backup
 *.orig
+/temp
