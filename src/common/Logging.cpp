@@ -149,7 +149,12 @@ void EmuLogOutput(CXBXR_MODULE cxbxr_module, LOG_LEVEL level, const char *szWarn
 
 	fprintf(stdout, "\n");
 
-	fflush(stdout);
+	// Only flush synchronously on fatal errors. Flushing on every message
+	// adds a synchronous OS round-trip (~0.1–10 ms on Windows Console Host)
+	// that stalls the emulation thread and causes GPU under-submission on AMD.
+	if (level == LOG_LEVEL::FATAL) {
+		fflush(stdout);
+	}
 }
 inline void EmuLogOutputEx(const CXBXR_MODULE cxbxr_module, const LOG_LEVEL level, const char *szWarningMessage, ...)
 {
@@ -166,20 +171,31 @@ void EmuLogEx(CXBXR_MODULE cxbxr_module, LOG_LEVEL level, const char *szWarningM
 		return;
 	}
 
+	// Master switch: if the user has disabled logging output, bail immediately.
+	if (!g_bPrintfOn) {
+		return;
+	}
+
+	// Per-module enable check: skip if this module is not enabled in the GUI.
+	if (!g_EnabledModules[to_underlying(cxbxr_module)]) {
+		return;
+	}
+
+	// Minimum log-level filter.
+	if (to_underlying(level) < g_CurrentLogLevel.load(std::memory_order_relaxed)) {
+		return;
+	}
+
 #ifdef NDEBUG
-	// In Release builds, suppress all DEBUG-level messages — they're too noisy for production
+	// In Release builds, suppress all DEBUG-level messages — they're too noisy for production.
 	if (level == LOG_LEVEL::DEBUG) {
 		return;
 	}
 #endif
 
-	LOG_THREAD_INIT;
-
 	va_list argp;
 	va_start(argp, szWarningMessage);
-
 	EmuLogOutput(cxbxr_module, level, szWarningMessage, argp);
-
 	va_end(argp);
 }
 
