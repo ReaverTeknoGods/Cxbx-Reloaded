@@ -34,6 +34,7 @@
 #include "Emu.h"
 #include "devices\x86\EmuX86.h"
 #include "EmuShared.h"
+#include "common/cxbxr.hpp" // For CxbxrShutDown()
 #include "core\hle\Intercept.hpp"
 #include "CxbxDebugger.h"
 
@@ -137,11 +138,7 @@ void EmuExceptionExitProcess()
 	printf("[0x%.4X] MAIN: Aborting Emulation\n", GetCurrentThreadId());
 	fflush(stdout);
 
-	if (CxbxKrnl_hEmuParent != NULL)
-		SendMessage(CxbxKrnl_hEmuParent, WM_PARENTNOTIFY, WM_DESTROY, 0);
-
-	EmuShared::Cleanup();
-	ExitProcess(1);
+	CxbxrShutDown();
 }
 
 bool EmuExceptionBreakpointAsk(LPEXCEPTION_POINTERS e)
@@ -380,12 +377,7 @@ int ExitException(LPEXCEPTION_POINTERS e)
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    if(CxbxKrnl_hEmuParent != NULL)
-        SendMessage(CxbxKrnl_hEmuParent, WM_PARENTNOTIFY, WM_DESTROY, 0);
-
-    ExitProcess(1);
-
-    return EXCEPTION_CONTINUE_SEARCH;
+    CxbxrShutDown();
 }
 
 // Exception Mananger class; Any custom exceptions must be above this line.
