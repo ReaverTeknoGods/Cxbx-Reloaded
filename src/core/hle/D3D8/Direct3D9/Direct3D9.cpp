@@ -27,6 +27,7 @@
 #define LOG_PREFIX CXBXR_MODULE::D3D8
 
 #include "common\util\hasher.h" // For ComputeHash
+#include <string>
 #include <condition_variable>
 #include <stack>
 
@@ -68,6 +69,7 @@
 #include "Shader.h"
 #include "Timer.h"
 #include "common/PerfTrace.h"
+#include "common/RenderTrace.h"
 
 #include <imgui.h>
 #include <backends/imgui_impl_dx9.h>
@@ -3437,6 +3439,7 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(D3DDevice_BeginVisibilityTest)()
 	LOG_FUNC();
 
 	if (g_bEnableHostQueryVisibilityTest) {
+		RenderTrace_RecordVisibilityBegin(true);
 		// Create a D3D occlusion query to handle "visibility test" with
 		IDirect3DQuery* pHostQueryVisibilityTest = nullptr;
 		HRESULT hRet = g_pD3DDevice->CreateQuery(D3DQUERYTYPE_OCCLUSION, &pHostQueryVisibilityTest);
@@ -3453,6 +3456,8 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(D3DDevice_BeginVisibilityTest)()
 
 			pHostQueryVisibilityTest = nullptr;
 		}
+	} else {
+		RenderTrace_RecordVisibilityBegin(false);
 	}
 
 	return D3D_OK;
@@ -3494,10 +3499,12 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(D3DDevice_EndVisibilityTest)
 	if (g_bEnableHostQueryVisibilityTest) {
 		// Check that the dedicated storage for the given Index isn't in use
 		if (g_HostVisibilityTestMap[Index] != nullptr) {
+			RenderTrace_RecordVisibilityEnd(Index, true, false, E_OUTOFMEMORY);
 			return E_OUTOFMEMORY;
 		}
 
 		if (g_HostQueryVisibilityTests.empty()) {
+			RenderTrace_RecordVisibilityEnd(Index, true, true, 2088);
 			return 2088; // visibility test incomplete (a prior BeginVisibilityTest call is needed)
 		}
 
@@ -3507,6 +3514,7 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(D3DDevice_EndVisibilityTest)
 
 		HRESULT hRet = pHostQueryVisibilityTest->Issue(D3DISSUE_END);
 		DEBUG_D3DRESULT(hRet, "g_pHostQueryVisibilityTest->Issue(D3DISSUE_END)");
+		RenderTrace_RecordVisibilityEnd(Index, true, false, hRet);
 		if (hRet == D3D_OK) {
 			// Associate the result of this call with the given Index
 			g_HostVisibilityTestMap[Index] = pHostQueryVisibilityTest;
@@ -3514,6 +3522,8 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(D3DDevice_EndVisibilityTest)
 			LOG_TEST_CASE("Failed to issue query");
 			pHostQueryVisibilityTest->Release();
 		}
+	} else {
+		RenderTrace_RecordVisibilityEnd(Index, false, false, D3D_OK);
 	}
 
     return D3D_OK;
@@ -3548,10 +3558,13 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(D3DDevice_GetVisibilityTestResult)
 		LOG_FUNC_ARG(pResult)
 		LOG_FUNC_ARG(pTimeStamp)
 		LOG_FUNC_END;
+	bool fallbackPath = false;
+	HRESULT traceResult = D3D_OK;
 
 	if (g_bEnableHostQueryVisibilityTest) {
 		IDirect3DQuery* pHostQueryVisibilityTest = g_HostVisibilityTestMap[Index];
 		if (pHostQueryVisibilityTest == nullptr) {
+			RenderTrace_RecordVisibilityResult(Index, true, false, 0, E_OUTOFMEMORY);
 			return E_OUTOFMEMORY;
 		}
 
@@ -3566,10 +3579,18 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(D3DDevice_GetVisibilityTestResult)
 		pHostQueryVisibilityTest->Release();
 	} else {
 		// Fallback to old faked result when there's no host occlusion query :
+		fallbackPath = true;
 		if (pResult != xbox::zeroptr) {
 			*pResult = 640 * 480; // TODO : Use actual backbuffer dimensions
 		}
 	}
+
+	RenderTrace_RecordVisibilityResult(
+		Index,
+		g_bEnableHostQueryVisibilityTest,
+		fallbackPath,
+		(pResult != xbox::zeroptr) ? *pResult : 0,
+		traceResult);
 
 	if (pTimeStamp != xbox::zeroptr) {
 		LOG_TEST_CASE("requested value for pTimeStamp");
@@ -4150,13 +4171,22 @@ void ValidateRenderTargetDimensions(DWORD HostRenderTarget_Width, DWORD HostRend
     // TEST CASE: Chihiro Factory Test Program
     DWORD XboxRenderTarget_Width_Scaled = XboxRenderTarget_Width * g_RenderUpscaleFactor;
     DWORD XboxRenderTarget_Height_Scaled = XboxRenderTarget_Height * g_RenderUpscaleFactor;
+	bool recreated = false;
 
     if (HostRenderTarget_Width != XboxRenderTarget_Width_Scaled || HostRenderTarget_Height != XboxRenderTarget_Height_Scaled) {
+		recreated = true;
         LOG_TEST_CASE("Existing RenderTarget width/height changed");
 
         FreeHostResource(GetHostResourceKey(g_pXbox_RenderTarget)); g_pD3DDevice->SetRenderTarget(0, GetHostSurface(g_pXbox_RenderTarget, D3DUSAGE_RENDERTARGET));
         FreeHostResource(GetHostResourceKey(g_pXbox_DepthStencil)); g_pD3DDevice->SetDepthStencilSurface(GetHostSurface(g_pXbox_DepthStencil, D3DUSAGE_DEPTHSTENCIL));
     }
+
+	RenderTrace_RecordRenderTargetValidation(
+		HostRenderTarget_Width,
+		HostRenderTarget_Height,
+		XboxRenderTarget_Width_Scaled,
+		XboxRenderTarget_Height_Scaled,
+		recreated);
 }
 
 float GetZScaleForPixelContainer(xbox::X_D3DPixelContainer* pSurface)
@@ -4312,6 +4342,7 @@ void CxbxImpl_SetViewport(xbox::X_D3DVIEWPORT8* pViewport)
 	// Set the default viewport?
 	// Clamp the current viewport to the current rendertarget?
 	if (pViewport == nullptr) {
+		RenderTrace_RecordNullViewport();
 		LOG_TEST_CASE("pViewport = null");
 		return;
 	}
@@ -4328,7 +4359,10 @@ void CxbxImpl_SetViewport(xbox::X_D3DVIEWPORT8* pViewport)
 	// Guard against Xbox surface structs in Xbox VM regions not committed in host memory
 	// (e.g. Chihiro arcade games with firmware pre-mapped surfaces, or after NtFreeVirtualMemory).
 	// Must be checked unconditionally — the same pointer can become decommitted at any time.
-	if (!CheckXboxRenderTargetReadable()) { return; /* Surface struct not CPU-accessible; skip dimension-based viewport clamping */ }
+	if (!CheckXboxRenderTargetReadable()) {
+		RenderTrace_RecordUnreadableRenderTarget();
+		return; /* Surface struct not CPU-accessible; skip dimension-based viewport clamping */
+	}
 
 	float rendertargetBaseWidth;
 	float rendertargetBaseHeight;
@@ -5095,6 +5129,7 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_Clear)
     }
 
 	DEBUG_D3DRESULT(hRet, "g_pD3DDevice->Clear");
+	RenderTrace_RecordClear(HostFlags, Color, hRet);
 }
 
 
@@ -5268,6 +5303,7 @@ xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap)
 {
 	LOG_FUNC_ONE_ARG(Flags);
 	PerfTrace_OnSwapBegin(); // prints previous frame, resets accumulators, starts swap timer
+	RenderTrace_OnSwapBegin();
 
 	// Handle swap flags
 	// We don't maintain a swap chain, and draw everything to backbuffer 0
@@ -5298,14 +5334,22 @@ xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap)
 	if (Flags != X_D3DSWAP_DEFAULT && !(Flags & X_D3DSWAP_FINISH)) {
 		if (Flags == X_D3DSWAP_COPY) { LOG_TEST_CASE("X_D3DSWAP_COPY"); }
 		if (Flags == X_D3DSWAP_BYPASSCOPY) { LOG_TEST_CASE("X_D3DSWAP_BYPASSCOPY"); }
+		RenderTrace_RecordSwap(Flags, true, false, false, nullptr, S_FALSE, S_FALSE, g_OverlayProxy.Surface.Common != 0);
 		return g_Xbox_SwapData.Swap;
 	}
 
 	// Fetch the host backbuffer
 	IDirect3DSurface *pCurrentHostBackBuffer = nullptr;
+	RECT tracedDest = {};
+	bool tracedHasDest = false;
+	bool tracedHadXboxBackBuffer = false;
+	const bool tracedHadOverlay = (g_OverlayProxy.Surface.Common != 0);
+	HRESULT tracedBlitResult = S_FALSE;
+	HRESULT getBackBufferResult = S_FALSE;
 	HRESULT hRet = g_pD3DDevice->GetBackBuffer(
 		0, // iSwapChain
 		0, D3DBACKBUFFER_TYPE_MONO, &pCurrentHostBackBuffer);
+	getBackBufferResult = hRet;
 
 	DEBUG_D3DRESULT(hRet, "g_pD3DDevice->GetBackBuffer - Unable to get backbuffer surface!");
 	if (hRet == D3D_OK) {
@@ -5326,6 +5370,7 @@ xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap)
 		// Pre-compute the destination rectangle so we can decide whether a pre-clear is necessary
 		auto pXboxBackBufferHostSurface = GetHostSurface(g_pXbox_BackBufferSurface, D3DUSAGE_RENDERTARGET);
 		if (pXboxBackBufferHostSurface) {
+			tracedHadXboxBackBuffer = true;
 			PERF_SCOPE(PERF_CAT_BLIT);
             // Calculate the centered rectangle
             RECT dest{};
@@ -5351,6 +5396,9 @@ xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap)
                 /* pDestRect = */ &dest,
                 /* Filter = */ LoadSurfaceFilter
             );
+			tracedDest = dest;
+			tracedHasDest = true;
+			tracedBlitResult = hRet;
 		
 			if (hRet != D3D_OK) {
 				EmuLog(LOG_LEVEL::WARNING, "Couldn't blit Xbox BackBuffer to host BackBuffer : %X", hRet);
@@ -5530,6 +5578,16 @@ xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap)
 
 		pCurrentHostBackBuffer->Release();
 	}
+
+	RenderTrace_RecordSwap(
+		Flags,
+		false,
+		getBackBufferResult == D3D_OK,
+		tracedHadXboxBackBuffer,
+		tracedHasDest ? &tracedDest : nullptr,
+		getBackBufferResult,
+		tracedBlitResult,
+		tracedHadOverlay);
 
 	g_pD3DDevice->EndScene();
 
@@ -7495,6 +7553,7 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_SetVertexShader)
 	XB_TRMP(D3DDevice_SetVertexShader)(Handle);
 
 	CxbxImpl_SetVertexShader(Handle);
+	RenderTrace_RecordVertexShader(Handle);
 }
 
 // Overload for logging
@@ -7527,6 +7586,7 @@ __declspec(naked) xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_SetVertexShader_
 	}
 
 	CxbxImpl_SetVertexShader(Handle);
+	RenderTrace_RecordVertexShader(Handle);
 
 	__asm {
 		LTCG_EPILOGUE
@@ -7697,6 +7757,587 @@ void CxbxDrawIndexedClosingLineUP(INDEX16 LowIndex, INDEX16 HighIndex, void *pHo
 	g_dwPrimPerFrame++;
 }
 
+static size_t CxbxRenderTracePrimitiveIndexCount(D3DPRIMITIVETYPE primitiveType, UINT primitiveCount)
+{
+	switch (primitiveType) {
+	case D3DPT_POINTLIST:
+		return primitiveCount;
+	case D3DPT_LINELIST:
+		return static_cast<size_t>(primitiveCount) * 2;
+	case D3DPT_LINESTRIP:
+		return static_cast<size_t>(primitiveCount) + 1;
+	case D3DPT_TRIANGLELIST:
+		return static_cast<size_t>(primitiveCount) * 3;
+	case D3DPT_TRIANGLESTRIP:
+	case D3DPT_TRIANGLEFAN:
+		return static_cast<size_t>(primitiveCount) + 2;
+	default:
+		return 0;
+	}
+}
+
+static unsigned long long CxbxRenderTraceHashBytes(const void* data, size_t size)
+{
+	if (data == nullptr || size == 0) {
+		return 0;
+	}
+
+	return ComputeHash(data, size);
+}
+
+static unsigned long long CxbxRenderTraceGeometryHash(
+	const void* vertexData,
+	size_t vertexDataSize,
+	const void* indexData,
+	size_t indexDataSize)
+{
+	struct GeometryHashInputs {
+		unsigned long long vertexHash;
+		unsigned long long indexHash;
+		size_t vertexDataSize;
+		size_t indexDataSize;
+	};
+
+	const GeometryHashInputs inputs = {
+		CxbxRenderTraceHashBytes(vertexData, vertexDataSize),
+		CxbxRenderTraceHashBytes(indexData, indexDataSize),
+		vertexDataSize,
+		indexDataSize,
+	};
+
+	if (inputs.vertexHash == 0 && inputs.indexHash == 0) {
+		return 0;
+	}
+
+	return ComputeHash(&inputs, sizeof(inputs));
+}
+
+struct CxbxRenderTracePositionBounds {
+	bool hasBounds;
+	float minX;
+	float minY;
+	float maxX;
+	float maxY;
+};
+
+struct CxbxRenderTraceTexCoordBounds {
+	bool hasBounds;
+	float minU;
+	float minV;
+	float maxU;
+	float maxV;
+};
+
+struct CxbxRenderTraceDiffuseColorBounds {
+	bool hasBounds;
+	DWORD minR;
+	DWORD minG;
+	DWORD minB;
+	DWORD minA;
+	DWORD maxR;
+	DWORD maxG;
+	DWORD maxB;
+	DWORD maxA;
+};
+
+static bool CxbxRenderTraceTryGetDeclarationElements(D3DVERTEXELEMENT9* elements, UINT* count)
+{
+	auto declaration = CxbxGetVertexDeclaration();
+	if (declaration == nullptr || declaration->pHostVertexDeclaration == nullptr) {
+		return false;
+	}
+
+	return SUCCEEDED(declaration->pHostVertexDeclaration->GetDeclaration(elements, count));
+}
+
+static bool CxbxRenderTraceTryGetPositionElement(D3DVERTEXELEMENT9* positionElement)
+{
+	D3DVERTEXELEMENT9 elements[MAXD3DDECLLENGTH + 1] = {};
+	UINT count = MAXD3DDECLLENGTH + 1;
+	if (!CxbxRenderTraceTryGetDeclarationElements(elements, &count)) {
+		return false;
+	}
+
+	for (UINT elementIndex = 0; elementIndex < count; ++elementIndex) {
+		const auto& element = elements[elementIndex];
+		if (element.Stream == 0xFF) {
+			break;
+		}
+
+		if (element.Stream != 0) {
+			continue;
+		}
+
+		if (element.Usage == D3DDECLUSAGE_POSITION ||
+			(element.Usage == D3DDECLUSAGE_TEXCOORD && element.UsageIndex == xbox::X_D3DVSDE_POSITION)) {
+			*positionElement = element;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool CxbxRenderTraceTryGetTexCoord0Element(D3DVERTEXELEMENT9* texCoordElement)
+
+{
+	D3DVERTEXELEMENT9 positionElement = {};
+	const bool havePositionElement = CxbxRenderTraceTryGetPositionElement(&positionElement);
+
+	D3DVERTEXELEMENT9 elements[MAXD3DDECLLENGTH + 1] = {};
+	UINT count = MAXD3DDECLLENGTH + 1;
+	if (!CxbxRenderTraceTryGetDeclarationElements(elements, &count)) {
+		return false;
+	}
+
+	for (UINT elementIndex = 0; elementIndex < count; ++elementIndex) {
+		const auto& element = elements[elementIndex];
+		if (element.Stream == 0xFF) {
+			break;
+		}
+
+		if (element.Stream != 0) {
+			continue;
+		}
+
+		if (element.Usage == D3DDECLUSAGE_TEXCOORD &&
+			element.UsageIndex == xbox::X_D3DVSDE_TEXCOORD0) {
+			*texCoordElement = element;
+			return true;
+		}
+	}
+
+	for (UINT elementIndex = 0; elementIndex < count; ++elementIndex) {
+		const auto& element = elements[elementIndex];
+		if (element.Stream == 0xFF) {
+			break;
+		}
+
+		if (element.Stream != 0) {
+			continue;
+		}
+
+		if (element.Usage != D3DDECLUSAGE_TEXCOORD || element.UsageIndex != 0) {
+			continue;
+		}
+
+		if (havePositionElement &&
+			element.Stream == positionElement.Stream &&
+			element.Offset == positionElement.Offset &&
+			element.Type == positionElement.Type &&
+			element.Method == positionElement.Method &&
+			element.Usage == positionElement.Usage &&
+			element.UsageIndex == positionElement.UsageIndex) {
+			continue;
+		}
+
+		*texCoordElement = element;
+		return true;
+	}
+
+	return false;
+}
+
+static bool CxbxRenderTraceTryGetDiffuseColorElement(D3DVERTEXELEMENT9* colorElement)
+{
+	D3DVERTEXELEMENT9 elements[MAXD3DDECLLENGTH + 1] = {};
+	UINT count = MAXD3DDECLLENGTH + 1;
+	if (!CxbxRenderTraceTryGetDeclarationElements(elements, &count)) {
+		return false;
+	}
+
+	for (UINT elementIndex = 0; elementIndex < count; ++elementIndex) {
+		const auto& element = elements[elementIndex];
+		if (element.Stream == 0xFF) {
+			break;
+		}
+
+		if (element.Stream != 0) {
+			continue;
+		}
+
+		if (element.Usage == D3DDECLUSAGE_TEXCOORD &&
+			element.UsageIndex == xbox::X_D3DVSDE_DIFFUSE) {
+			*colorElement = element;
+			return true;
+		}
+	}
+
+	for (UINT elementIndex = 0; elementIndex < count; ++elementIndex) {
+		const auto& element = elements[elementIndex];
+		if (element.Stream == 0xFF) {
+			break;
+		}
+
+		if (element.Stream != 0) {
+			continue;
+		}
+
+		if (element.Usage == D3DDECLUSAGE_COLOR && element.UsageIndex == 0) {
+			*colorElement = element;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static DWORD CxbxRenderTraceClampColorComponent(float value)
+{
+	if (value <= 0.0f) {
+		return 0;
+	}
+	if (value >= 1.0f) {
+		return 255;
+	}
+	return static_cast<DWORD>((value * 255.0f) + 0.5f);
+}
+
+static bool CxbxRenderTraceTryReadElementXY(
+	const uint8_t* vertexData,
+	UINT vertexStride,
+	const D3DVERTEXELEMENT9& element,
+	float* x,
+	float* y)
+{
+	if (vertexData == nullptr || vertexStride <= element.Offset) {
+		return false;
+	}
+
+	const uint8_t* elementData = vertexData + element.Offset;
+	switch (element.Type) {
+	case D3DDECLTYPE_FLOAT1:
+		*x = reinterpret_cast<const float*>(elementData)[0];
+		*y = 0.0f;
+		return true;
+	case D3DDECLTYPE_FLOAT2:
+	case D3DDECLTYPE_FLOAT3:
+	case D3DDECLTYPE_FLOAT4:
+		*x = reinterpret_cast<const float*>(elementData)[0];
+		*y = reinterpret_cast<const float*>(elementData)[1];
+		return true;
+	case D3DDECLTYPE_SHORT2:
+		*x = static_cast<float>(reinterpret_cast<const int16_t*>(elementData)[0]);
+		*y = static_cast<float>(reinterpret_cast<const int16_t*>(elementData)[1]);
+		return true;
+	case D3DDECLTYPE_SHORT4:
+		*x = static_cast<float>(reinterpret_cast<const int16_t*>(elementData)[0]);
+		*y = static_cast<float>(reinterpret_cast<const int16_t*>(elementData)[1]);
+		return true;
+	case D3DDECLTYPE_SHORT2N:
+		*x = static_cast<float>(reinterpret_cast<const int16_t*>(elementData)[0]) / 32767.0f;
+		*y = static_cast<float>(reinterpret_cast<const int16_t*>(elementData)[1]) / 32767.0f;
+		return true;
+	case D3DDECLTYPE_SHORT4N:
+		*x = static_cast<float>(reinterpret_cast<const int16_t*>(elementData)[0]) / 32767.0f;
+		*y = static_cast<float>(reinterpret_cast<const int16_t*>(elementData)[1]) / 32767.0f;
+		return true;
+	case D3DDECLTYPE_UBYTE4:
+		*x = static_cast<float>(elementData[0]);
+		*y = static_cast<float>(elementData[1]);
+		return true;
+	case D3DDECLTYPE_UBYTE4N:
+		*x = static_cast<float>(elementData[0]) / 255.0f;
+		*y = static_cast<float>(elementData[1]) / 255.0f;
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool CxbxRenderTraceTryReadElementDiffuseColor(
+	const uint8_t* vertexData,
+	UINT vertexStride,
+	const D3DVERTEXELEMENT9& element,
+	DWORD* r,
+	DWORD* g,
+	DWORD* b,
+	DWORD* a)
+{
+	if (vertexData == nullptr || vertexStride <= element.Offset) {
+		return false;
+	}
+
+	const uint8_t* elementData = vertexData + element.Offset;
+	switch (element.Type) {
+	case D3DDECLTYPE_D3DCOLOR: {
+		const DWORD color = *reinterpret_cast<const DWORD*>(elementData);
+		*r = (color >> 16) & 0xFF;
+		*g = (color >> 8) & 0xFF;
+		*b = color & 0xFF;
+		*a = (color >> 24) & 0xFF;
+		return true;
+	}
+	case D3DDECLTYPE_FLOAT1:
+		*r = CxbxRenderTraceClampColorComponent(reinterpret_cast<const float*>(elementData)[0]);
+		*g = 0;
+		*b = 0;
+		*a = 255;
+		return true;
+	case D3DDECLTYPE_FLOAT2:
+		*r = CxbxRenderTraceClampColorComponent(reinterpret_cast<const float*>(elementData)[0]);
+		*g = CxbxRenderTraceClampColorComponent(reinterpret_cast<const float*>(elementData)[1]);
+		*b = 0;
+		*a = 255;
+		return true;
+	case D3DDECLTYPE_FLOAT3:
+		*r = CxbxRenderTraceClampColorComponent(reinterpret_cast<const float*>(elementData)[0]);
+		*g = CxbxRenderTraceClampColorComponent(reinterpret_cast<const float*>(elementData)[1]);
+		*b = CxbxRenderTraceClampColorComponent(reinterpret_cast<const float*>(elementData)[2]);
+		*a = 255;
+		return true;
+	case D3DDECLTYPE_FLOAT4:
+		*r = CxbxRenderTraceClampColorComponent(reinterpret_cast<const float*>(elementData)[0]);
+		*g = CxbxRenderTraceClampColorComponent(reinterpret_cast<const float*>(elementData)[1]);
+		*b = CxbxRenderTraceClampColorComponent(reinterpret_cast<const float*>(elementData)[2]);
+		*a = CxbxRenderTraceClampColorComponent(reinterpret_cast<const float*>(elementData)[3]);
+		return true;
+	case D3DDECLTYPE_UBYTE4:
+	case D3DDECLTYPE_UBYTE4N:
+		*r = elementData[0];
+		*g = elementData[1];
+		*b = elementData[2];
+		*a = elementData[3];
+		return true;
+	default:
+		return false;
+	}
+}
+
+static CxbxRenderTracePositionBounds CxbxRenderTraceComputePositionBounds(
+	const void* vertexData,
+	UINT vertexStride,
+	UINT vertexCount,
+	const void* indexData,
+	size_t indexCount)
+{
+	CxbxRenderTracePositionBounds bounds = {};
+	D3DVERTEXELEMENT9 positionElement = {};
+	if (!CxbxRenderTraceTryGetPositionElement(&positionElement)) {
+		return bounds;
+	}
+
+	float minX = 0.0f;
+	float minY = 0.0f;
+	float maxX = 0.0f;
+	float maxY = 0.0f;
+	bool havePoint = false;
+
+	auto updateBounds = [&](UINT vertexIndex) {
+		if (vertexIndex >= vertexCount) {
+			return;
+		}
+
+		float x = 0.0f;
+		float y = 0.0f;
+		if (!CxbxRenderTraceTryReadElementXY(
+			static_cast<const uint8_t*>(vertexData) + (static_cast<size_t>(vertexIndex) * vertexStride),
+			vertexStride,
+			positionElement,
+			&x,
+			&y)) {
+			return;
+		}
+
+		if (!havePoint) {
+			minX = maxX = x;
+			minY = maxY = y;
+			havePoint = true;
+			return;
+		}
+
+		minX = std::min(minX, x);
+		minY = std::min(minY, y);
+		maxX = std::max(maxX, x);
+		maxY = std::max(maxY, y);
+	};
+
+	if (indexData != nullptr && indexCount != 0) {
+		const auto* indices = static_cast<const INDEX16*>(indexData);
+		for (size_t index = 0; index < indexCount; ++index) {
+			updateBounds(indices[index]);
+		}
+	}
+	else {
+		for (UINT vertexIndex = 0; vertexIndex < vertexCount; ++vertexIndex) {
+			updateBounds(vertexIndex);
+		}
+	}
+
+	if (!havePoint) {
+		return bounds;
+	}
+
+	bounds.hasBounds = true;
+	bounds.minX = minX;
+	bounds.minY = minY;
+	bounds.maxX = maxX;
+	bounds.maxY = maxY;
+	return bounds;
+}
+
+static CxbxRenderTraceTexCoordBounds CxbxRenderTraceComputeTexCoord0Bounds(
+	const void* vertexData,
+	UINT vertexStride,
+	UINT vertexCount,
+	const void* indexData,
+	size_t indexCount)
+{
+	CxbxRenderTraceTexCoordBounds bounds = {};
+	D3DVERTEXELEMENT9 texCoordElement = {};
+	if (!CxbxRenderTraceTryGetTexCoord0Element(&texCoordElement)) {
+		return bounds;
+	}
+
+	float minU = 0.0f;
+	float minV = 0.0f;
+	float maxU = 0.0f;
+	float maxV = 0.0f;
+	bool havePoint = false;
+
+	auto updateBounds = [&](UINT vertexIndex) {
+		if (vertexIndex >= vertexCount) {
+			return;
+		}
+
+		float u = 0.0f;
+		float v = 0.0f;
+		if (!CxbxRenderTraceTryReadElementXY(
+			static_cast<const uint8_t*>(vertexData) + (static_cast<size_t>(vertexIndex) * vertexStride),
+			vertexStride,
+			texCoordElement,
+			&u,
+			&v)) {
+			return;
+		}
+
+		if (!havePoint) {
+			minU = maxU = u;
+			minV = maxV = v;
+			havePoint = true;
+			return;
+		}
+
+		minU = std::min(minU, u);
+		minV = std::min(minV, v);
+		maxU = std::max(maxU, u);
+		maxV = std::max(maxV, v);
+	};
+
+	if (indexData != nullptr && indexCount != 0) {
+		const auto* indices = static_cast<const INDEX16*>(indexData);
+		for (size_t index = 0; index < indexCount; ++index) {
+			updateBounds(indices[index]);
+		}
+	}
+	else {
+		for (UINT vertexIndex = 0; vertexIndex < vertexCount; ++vertexIndex) {
+			updateBounds(vertexIndex);
+		}
+	}
+
+	if (!havePoint) {
+		return bounds;
+	}
+
+	bounds.hasBounds = true;
+	bounds.minU = minU;
+	bounds.minV = minV;
+	bounds.maxU = maxU;
+	bounds.maxV = maxV;
+	return bounds;
+}
+
+static CxbxRenderTraceDiffuseColorBounds CxbxRenderTraceComputeDiffuseColorBounds(
+	const void* vertexData,
+	UINT vertexStride,
+	UINT vertexCount,
+	const void* indexData,
+	size_t indexCount)
+{
+	CxbxRenderTraceDiffuseColorBounds bounds = {};
+	D3DVERTEXELEMENT9 colorElement = {};
+	if (!CxbxRenderTraceTryGetDiffuseColorElement(&colorElement)) {
+		return bounds;
+	}
+
+	DWORD minR = 0;
+	DWORD minG = 0;
+	DWORD minB = 0;
+	DWORD minA = 0;
+	DWORD maxR = 0;
+	DWORD maxG = 0;
+	DWORD maxB = 0;
+	DWORD maxA = 0;
+	bool havePoint = false;
+
+	auto updateBounds = [&](UINT vertexIndex) {
+		if (vertexIndex >= vertexCount) {
+			return;
+		}
+
+		DWORD r = 0;
+		DWORD g = 0;
+		DWORD b = 0;
+		DWORD a = 0;
+		if (!CxbxRenderTraceTryReadElementDiffuseColor(
+			static_cast<const uint8_t*>(vertexData) + (static_cast<size_t>(vertexIndex) * vertexStride),
+			vertexStride,
+			colorElement,
+			&r,
+			&g,
+			&b,
+			&a)) {
+			return;
+		}
+
+		if (!havePoint) {
+			minR = maxR = r;
+			minG = maxG = g;
+			minB = maxB = b;
+			minA = maxA = a;
+			havePoint = true;
+			return;
+		}
+
+		minR = std::min(minR, r);
+		minG = std::min(minG, g);
+		minB = std::min(minB, b);
+		minA = std::min(minA, a);
+		maxR = std::max(maxR, r);
+		maxG = std::max(maxG, g);
+		maxB = std::max(maxB, b);
+		maxA = std::max(maxA, a);
+	};
+
+	if (indexData != nullptr && indexCount != 0) {
+		const auto* indices = static_cast<const INDEX16*>(indexData);
+		for (size_t index = 0; index < indexCount; ++index) {
+			updateBounds(indices[index]);
+		}
+	}
+	else {
+		for (UINT vertexIndex = 0; vertexIndex < vertexCount; ++vertexIndex) {
+			updateBounds(vertexIndex);
+		}
+	}
+
+	if (!havePoint) {
+		return bounds;
+	}
+
+	bounds.hasBounds = true;
+	bounds.minR = minR;
+	bounds.minG = minG;
+	bounds.minB = minB;
+	bounds.minA = minA;
+	bounds.maxR = maxR;
+	bounds.maxG = maxG;
+	bounds.maxB = maxB;
+	bounds.maxA = maxA;
+	return bounds;
+}
+
 // Requires assigned pXboxIndexData
 // Called by D3DDevice_DrawIndexedVertices and EmuExecutePushBufferRaw (twice)
 void CxbxDrawIndexed(CxbxDrawContext &DrawContext)
@@ -7744,6 +8385,7 @@ void CxbxDrawIndexed(CxbxDrawContext &DrawContext)
 		/* startIndex = DrawContext.dwStartVertex = */0,
 		primCount);
 	DEBUG_D3DRESULT(hRet, "g_pD3DDevice->DrawIndexedPrimitive");
+	RenderTrace_RecordDraw(true, false, EmuXB2PC_D3DPrimitiveType(DrawContext.XboxPrimitiveType), primCount, hRet, false, 0, false, 0.0f, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0.0f, 0.0f, false, 0, 0, 0, 0, 0, 0, 0, 0);
 
 	g_dwPrimPerFrame += primCount;
 	if (DrawContext.XboxPrimitiveType == xbox::X_D3DPT_LINELOOP) {
@@ -7801,6 +8443,60 @@ void CxbxDrawPrimitiveUP(CxbxDrawContext &DrawContext)
 			DrawContext.uiHostVertexStreamZeroStride
 		);
 		DEBUG_D3DRESULT(hRet, "g_pD3DDevice->DrawIndexedPrimitieUP(X_D3DPT_QUADLIST)");
+		if (g_RenderTraceEnabled) {
+			const size_t vertexDataSize = static_cast<size_t>(DrawContext.dwVertexCount) * DrawContext.uiHostVertexStreamZeroStride;
+			const size_t indexDataSize = CxbxRenderTracePrimitiveIndexCount(D3DPT_TRIANGLELIST, PrimitiveCount) * sizeof(INDEX16);
+			const unsigned long long geometryHash = CxbxRenderTraceGeometryHash(
+				DrawContext.pHostVertexStreamZeroData,
+				vertexDataSize,
+				pIndexData,
+				indexDataSize);
+			const auto positionBounds = CxbxRenderTraceComputePositionBounds(
+				DrawContext.pHostVertexStreamZeroData,
+				DrawContext.uiHostVertexStreamZeroStride,
+				DrawContext.dwVertexCount,
+				pIndexData,
+				CxbxRenderTracePrimitiveIndexCount(D3DPT_TRIANGLELIST, PrimitiveCount));
+			const auto texCoordBounds = CxbxRenderTraceComputeTexCoord0Bounds(
+				DrawContext.pHostVertexStreamZeroData,
+				DrawContext.uiHostVertexStreamZeroStride,
+				DrawContext.dwVertexCount,
+				pIndexData,
+				CxbxRenderTracePrimitiveIndexCount(D3DPT_TRIANGLELIST, PrimitiveCount));
+			const auto diffuseColorBounds = CxbxRenderTraceComputeDiffuseColorBounds(
+				DrawContext.pHostVertexStreamZeroData,
+				DrawContext.uiHostVertexStreamZeroStride,
+				DrawContext.dwVertexCount,
+				pIndexData,
+				CxbxRenderTracePrimitiveIndexCount(D3DPT_TRIANGLELIST, PrimitiveCount));
+			RenderTrace_RecordDraw(
+				true,
+				true,
+				D3DPT_TRIANGLELIST,
+				PrimitiveCount,
+				hRet,
+				true,
+				geometryHash,
+				positionBounds.hasBounds,
+				positionBounds.minX,
+				positionBounds.minY,
+				positionBounds.maxX,
+				positionBounds.maxY,
+				texCoordBounds.hasBounds,
+				texCoordBounds.minU,
+				texCoordBounds.minV,
+				texCoordBounds.maxU,
+				texCoordBounds.maxV,
+				diffuseColorBounds.hasBounds,
+				diffuseColorBounds.minR,
+				diffuseColorBounds.minG,
+				diffuseColorBounds.minB,
+				diffuseColorBounds.minA,
+				diffuseColorBounds.maxR,
+				diffuseColorBounds.maxG,
+				diffuseColorBounds.maxB,
+				diffuseColorBounds.maxA);
+		}
 
 		g_dwPrimPerFrame += PrimitiveCount;
 	}
@@ -7813,6 +8509,59 @@ void CxbxDrawPrimitiveUP(CxbxDrawContext &DrawContext)
 			DrawContext.uiHostVertexStreamZeroStride
 		);
 		DEBUG_D3DRESULT(hRet, "g_pD3DDevice->DrawPrimitiveUP");
+		if (g_RenderTraceEnabled) {
+			const size_t vertexDataSize = static_cast<size_t>(DrawContext.dwVertexCount) * DrawContext.uiHostVertexStreamZeroStride;
+			const unsigned long long geometryHash = CxbxRenderTraceGeometryHash(
+				DrawContext.pHostVertexStreamZeroData,
+				vertexDataSize,
+				nullptr,
+				0);
+			const auto positionBounds = CxbxRenderTraceComputePositionBounds(
+				DrawContext.pHostVertexStreamZeroData,
+				DrawContext.uiHostVertexStreamZeroStride,
+				DrawContext.dwVertexCount,
+				nullptr,
+				0);
+			const auto texCoordBounds = CxbxRenderTraceComputeTexCoord0Bounds(
+				DrawContext.pHostVertexStreamZeroData,
+				DrawContext.uiHostVertexStreamZeroStride,
+				DrawContext.dwVertexCount,
+				nullptr,
+				0);
+			const auto diffuseColorBounds = CxbxRenderTraceComputeDiffuseColorBounds(
+				DrawContext.pHostVertexStreamZeroData,
+				DrawContext.uiHostVertexStreamZeroStride,
+				DrawContext.dwVertexCount,
+				nullptr,
+				0);
+			RenderTrace_RecordDraw(
+				false,
+				true,
+				EmuXB2PC_D3DPrimitiveType(DrawContext.XboxPrimitiveType),
+				DrawContext.dwHostPrimitiveCount,
+				hRet,
+				true,
+				geometryHash,
+				positionBounds.hasBounds,
+				positionBounds.minX,
+				positionBounds.minY,
+				positionBounds.maxX,
+				positionBounds.maxY,
+				texCoordBounds.hasBounds,
+				texCoordBounds.minU,
+				texCoordBounds.minV,
+				texCoordBounds.maxU,
+				texCoordBounds.maxV,
+				diffuseColorBounds.hasBounds,
+				diffuseColorBounds.minR,
+				diffuseColorBounds.minG,
+				diffuseColorBounds.minB,
+				diffuseColorBounds.minA,
+				diffuseColorBounds.maxR,
+				diffuseColorBounds.maxG,
+				diffuseColorBounds.maxB,
+				diffuseColorBounds.maxA);
+		}
 
 		g_dwPrimPerFrame += DrawContext.dwHostPrimitiveCount;
 		if (DrawContext.XboxPrimitiveType == xbox::X_D3DPT_LINELOOP) {
@@ -7861,6 +8610,66 @@ void CxbxUpdateHostTextures()
 	static IDirect3DBaseTexture* s_lastHostTexture[xbox::X_D3DTS_STAGECOUNT] = {};
 	static xbox::X_D3DBaseTexture* s_lastXboxTexture[xbox::X_D3DTS_STAGECOUNT] = {};
 	static xbox::addr_xt s_lastXboxTextureData[xbox::X_D3DTS_STAGECOUNT] = {};
+	static bool s_haveTracedTextureState[xbox::X_D3DTS_STAGECOUNT] = {};
+
+	auto recordTextureBinding = [&](int stage, xbox::X_D3DBaseTexture* pXboxBaseTexture, xbox::addr_xt xboxData, IDirect3DBaseTexture* pHostBaseTexture) {
+		if (!g_RenderTraceEnabled || stage >= 2) {
+			return;
+		}
+
+		bool hasXboxTexture = pXboxBaseTexture != xbox::zeroptr;
+		bool hasXboxDataHash = false;
+		unsigned long long xboxDataHash = 0;
+		DWORD textureResourceType = 0;
+		DWORD xboxFormat = 0;
+		DWORD xboxWidth = 0;
+		DWORD xboxHeight = 0;
+
+		if (hasXboxTexture) {
+			auto key = GetHostResourceKey((xbox::X_D3DResource*)pXboxBaseTexture, stage);
+			auto& resourceCache = GetResourceCache(key);
+			auto it = resourceCache.find(key);
+			if (it != resourceCache.end() && it->second.pHostResource) {
+				hasXboxDataHash = true;
+				xboxDataHash = it->second.hash;
+			}
+
+			switch (GetXboxCommonResourceType(pXboxBaseTexture)) {
+			case X_D3DCOMMON_TYPE_TEXTURE:
+				textureResourceType = 1;
+				break;
+			case X_D3DCOMMON_TYPE_SURFACE:
+				textureResourceType = 2;
+				break;
+			default:
+				textureResourceType = 3;
+				break;
+			}
+
+			if (textureResourceType == 1 || textureResourceType == 2) {
+				xboxFormat = GetXboxPixelContainerFormat(pXboxBaseTexture);
+				xboxWidth = GetPixelContainerWidth(pXboxBaseTexture);
+				xboxHeight = GetPixelContainerHeight(pXboxBaseTexture);
+			}
+		}
+
+		RenderTrace_RecordTextureBinding(
+			stage,
+			hasXboxTexture,
+			hasXboxTexture && xboxData != 0,
+			(DWORD)xboxData,
+			hasXboxDataHash,
+			xboxDataHash,
+			textureResourceType,
+			xboxFormat,
+			xboxWidth,
+			xboxHeight,
+			pHostBaseTexture != nullptr,
+			textureResourceType == 2 && pHostBaseTexture != nullptr,
+			hasXboxTexture && (xbox::X_D3DSurface*)pXboxBaseTexture == g_pXbox_BackBufferSurface,
+			hasXboxTexture && (xbox::X_D3DSurface*)pXboxBaseTexture == g_pXbox_RenderTarget);
+		s_haveTracedTextureState[stage] = true;
+	};
 
 	// Set the host texture for each stage
 	for (int stage = 0; stage < xbox::X_D3DTS_STAGECOUNT; stage++) {
@@ -7870,6 +8679,9 @@ void CxbxUpdateHostTextures()
 		// We check Data too because SwitchTexture reuses the same pointer with different Data.
 		xbox::addr_xt xboxData = (pXboxBaseTexture != xbox::zeroptr) ? pXboxBaseTexture->Data : 0;
 		if (pXboxBaseTexture == s_lastXboxTexture[stage] && xboxData == s_lastXboxTextureData[stage]) {
+			if (!s_haveTracedTextureState[stage]) {
+				recordTextureBinding(stage, pXboxBaseTexture, xboxData, s_lastHostTexture[stage]);
+			}
 			continue;
 		}
 
@@ -7898,6 +8710,7 @@ void CxbxUpdateHostTextures()
 
 		HRESULT hRet = g_pD3DDevice->SetTexture(stage, pHostBaseTexture);
 		DEBUG_D3DRESULT(hRet, "g_pD3DDevice->SetTexture");
+		recordTextureBinding(stage, pXboxBaseTexture, xboxData, pHostBaseTexture);
 		s_lastHostTexture[stage] = pHostBaseTexture;
 		s_lastXboxTexture[stage] = pXboxBaseTexture;
 		s_lastXboxTextureData[stage] = xboxData;
@@ -8102,6 +8915,7 @@ void CxbxUpdateHostViewport() {
 
 	DWORD HostRenderTarget_Width, HostRenderTarget_Height;
 	if (!GetHostRenderTargetDimensions(&HostRenderTarget_Width, &HostRenderTarget_Height)) {
+		RenderTrace_RecordHostRenderTargetDimensionFailure();
 		LOG_TEST_CASE("Could not get rendertarget dimensions while setting the viewport");
 	}
 
@@ -8147,6 +8961,20 @@ void CxbxUpdateHostViewport() {
 		viewportRect.right = HostRenderTarget_Width;
 		viewportRect.bottom = HostRenderTarget_Height;
 		g_pD3DDevice->SetScissorRect(&viewportRect);
+		RenderTrace_RecordViewportState(
+			true,
+			g_Xbox_Viewport.X,
+			g_Xbox_Viewport.Y,
+			g_Xbox_Viewport.Width,
+			g_Xbox_Viewport.Height,
+			HostRenderTarget_Width,
+			HostRenderTarget_Height,
+			hostViewport.X,
+			hostViewport.Y,
+			hostViewport.Width,
+			hostViewport.Height,
+			false,
+			&viewportRect);
 	}
 	else {
 		// Set default viewport over the whole screen
@@ -8174,6 +9002,20 @@ void CxbxUpdateHostViewport() {
 		viewportRect.right = viewportRect.left + (g_Xbox_Viewport.Width * Xscale);
 		viewportRect.bottom = viewportRect.top + (g_Xbox_Viewport.Height * Yscale);
 		g_pD3DDevice->SetScissorRect(&viewportRect);
+		RenderTrace_RecordViewportState(
+			false,
+			g_Xbox_Viewport.X,
+			g_Xbox_Viewport.Y,
+			g_Xbox_Viewport.Width,
+			g_Xbox_Viewport.Height,
+			HostRenderTarget_Width,
+			HostRenderTarget_Height,
+			hostViewport.X,
+			hostViewport.Y,
+			hostViewport.Width,
+			hostViewport.Height,
+			true,
+			&viewportRect);
 	}
 }
 
@@ -8346,6 +9188,7 @@ xbox::void_xt CxbxImpl_SetPixelShader(xbox::dword_xt Handle)
 {
     // Cache the active shader handle
     g_pXbox_PixelShader = (xbox::X_PixelShader*)Handle;
+	RenderTrace_RecordPixelShader(Handle);
 
     // Copy the Pixel Shader data to our RenderState handler (this includes values for pixel shader constants)
     // This mirrors the fact that unpatched SetPixelShader does the same thing!
@@ -8559,6 +9402,7 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_DrawVertices)
 				primCount
 			);
 			DEBUG_D3DRESULT(hRet, "g_pD3DDevice->DrawIndexedPrimitive(X_D3DPT_QUADLIST)");
+			RenderTrace_RecordDraw(true, false, D3DPT_TRIANGLELIST, primCount, hRet, false, 0, false, 0.0f, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0.0f, 0.0f, false, 0, 0, 0, 0, 0, 0, 0, 0);
 
 			g_dwPrimPerFrame += primCount;
 		}
@@ -8570,6 +9414,7 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_DrawVertices)
 				DrawContext.dwHostPrimitiveCount
 			);
 			DEBUG_D3DRESULT(hRet, "g_pD3DDevice->DrawPrimitive");
+			RenderTrace_RecordDraw(false, false, EmuXB2PC_D3DPrimitiveType(DrawContext.XboxPrimitiveType), DrawContext.dwHostPrimitiveCount, hRet, false, 0, false, 0.0f, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0.0f, 0.0f, false, 0, 0, 0, 0, 0, 0, 0, 0);
 
 			g_dwPrimPerFrame += DrawContext.dwHostPrimitiveCount;
 			if (DrawContext.XboxPrimitiveType == X_D3DPT_LINELOOP) {
@@ -8767,6 +9612,61 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_DrawIndexedVerticesUP)
 			DrawContext.uiHostVertexStreamZeroStride
 		);
 		DEBUG_D3DRESULT(hRet, "g_pD3DDevice->DrawIndexedPrimitiveUP");
+		if (g_RenderTraceEnabled) {
+			const D3DPRIMITIVETYPE hostPrimitiveType = EmuXB2PC_D3DPrimitiveType(DrawContext.XboxPrimitiveType);
+			const size_t vertexDataSize = static_cast<size_t>(DrawContext.dwVertexCount) * DrawContext.uiHostVertexStreamZeroStride;
+			const size_t indexDataSize = CxbxRenderTracePrimitiveIndexCount(hostPrimitiveType, PrimitiveCount) * sizeof(INDEX16);
+			const unsigned long long geometryHash = CxbxRenderTraceGeometryHash(
+				DrawContext.pHostVertexStreamZeroData,
+				vertexDataSize,
+				pHostIndexData,
+				indexDataSize);
+			const auto positionBounds = CxbxRenderTraceComputePositionBounds(
+				DrawContext.pHostVertexStreamZeroData,
+				DrawContext.uiHostVertexStreamZeroStride,
+				DrawContext.dwVertexCount,
+				pHostIndexData,
+				CxbxRenderTracePrimitiveIndexCount(hostPrimitiveType, PrimitiveCount));
+			const auto texCoordBounds = CxbxRenderTraceComputeTexCoord0Bounds(
+				DrawContext.pHostVertexStreamZeroData,
+				DrawContext.uiHostVertexStreamZeroStride,
+				DrawContext.dwVertexCount,
+				pHostIndexData,
+				CxbxRenderTracePrimitiveIndexCount(hostPrimitiveType, PrimitiveCount));
+			const auto diffuseColorBounds = CxbxRenderTraceComputeDiffuseColorBounds(
+				DrawContext.pHostVertexStreamZeroData,
+				DrawContext.uiHostVertexStreamZeroStride,
+				DrawContext.dwVertexCount,
+				pHostIndexData,
+				CxbxRenderTracePrimitiveIndexCount(hostPrimitiveType, PrimitiveCount));
+			RenderTrace_RecordDraw(
+				true,
+				true,
+				hostPrimitiveType,
+				PrimitiveCount,
+				hRet,
+				true,
+				geometryHash,
+				positionBounds.hasBounds,
+				positionBounds.minX,
+				positionBounds.minY,
+				positionBounds.maxX,
+				positionBounds.maxY,
+				texCoordBounds.hasBounds,
+				texCoordBounds.minU,
+				texCoordBounds.minV,
+				texCoordBounds.maxU,
+				texCoordBounds.maxV,
+				diffuseColorBounds.hasBounds,
+				diffuseColorBounds.minR,
+				diffuseColorBounds.minG,
+				diffuseColorBounds.minB,
+				diffuseColorBounds.minA,
+				diffuseColorBounds.maxR,
+				diffuseColorBounds.maxG,
+				diffuseColorBounds.maxB,
+				diffuseColorBounds.maxA);
+		}
 
 		if (bConvertQuadListToTriangleList) {
 			CxbxReleaseQuadListToTriangleListIndexData(pHostIndexData);

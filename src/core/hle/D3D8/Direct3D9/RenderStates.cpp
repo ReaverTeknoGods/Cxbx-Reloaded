@@ -29,6 +29,7 @@
 
 #include "RenderStates.h"
 #include "Logging.h"
+#include "common/RenderTrace.h"
 #include "core/hle/D3D8/Direct3D9/Direct3D9.h" // For g_pD3DDevice
 #include "core/hle/D3D8/XbConvert.h"
 
@@ -256,6 +257,7 @@ void XboxRenderStateConverter::ApplySimpleRenderState(uint32_t State, uint32_t V
     }
 
     g_pD3DDevice->SetRenderState((D3DRENDERSTATETYPE)(RenderStateInfo.PC), Value);
+    RenderTrace_RecordRenderState(RenderStateInfo.PC, Value);
 }
 
 void XboxRenderStateConverter::ApplyDeferredRenderState(uint32_t State, uint32_t Value)
@@ -344,6 +346,7 @@ void XboxRenderStateConverter::ApplyDeferredRenderState(uint32_t State, uint32_t
     }
 
     g_pD3DDevice->SetRenderState(RenderStateInfo.PC, Value);
+    RenderTrace_RecordRenderState(RenderStateInfo.PC, Value);
 }
 
 void XboxRenderStateConverter::ApplyComplexRenderState(uint32_t State, uint32_t Value)
@@ -416,4 +419,5 @@ void XboxRenderStateConverter::ApplyComplexRenderState(uint32_t State, uint32_t 
     }
 
     g_pD3DDevice->SetRenderState(RenderStateInfo.PC, Value);
+    RenderTrace_RecordRenderState(RenderStateInfo.PC, Value);
 }

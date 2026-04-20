@@ -56,6 +56,7 @@ const _XboxAddressRanges XboxAddressRanges[] = {
 	RANGE_ENTRY(PAGE_TABLES_BASE  , PAGE_TABLES_END  , PAGE_TABLES_SIZE  , PROT_RW , SYSTEM_ALL              , "MemPageTable"), // See PAGE_TABLES_SIZE, which contains one 4 byte entry per PAGE_SIZE
 	RANGE_ENTRY(SYSTEM_MEMORY_BASE, SYSTEM_MEMORY_END, SYSTEM_MEMORY_SIZE, PROT_RW , SYSTEM_ALL    | MAY_FAIL, "SystemMemory  Optional"), // TODO : Check reserved range (might behave like MemTiled)
 	RANGE_ENTRY(TILED_MEMORY_BASE , TILED_MEMORY_END , TILED_MEMORY_SIZE , PROT_UNH, SYSTEM_ALL              , "MemTiled      Optional (even though it can't be reserved, MapViewOfFileEx to this range still works!?)"),
+	RANGE_ENTRY(TILED_MEMORY2_BASE, TILED_MEMORY2_END, TILED_MEMORY2_SIZE, PROT_UNH, SYSTEM_128MB            , "MemTiled      (Chihiro / DevKit)  ^ + upper 64 MiB"),
 	RANGE_ENTRY(NV2A_DEVICE1_BASE , NV2A_DEVICE1_END , NV2A_DEVICE1_SIZE , PROT_NAC, SYSTEM_ALL              , "DeviceNV2A_a  (GPU)"),
 	RANGE_ENTRY(NV2A_PRAMIN_BASE  , NV2A_PRAMIN_END  , NV2A_PRAMIN_SIZE1 , PROT_RW , SYSTEM_ALL              , "MemNV2APRAMIN"),
 	RANGE_ENTRY(NV2A_DEVICE2_BASE , NV2A_DEVICE2_END , NV2A_DEVICE2_SIZE , PROT_NAC, SYSTEM_ALL              , "DeviceNV2A_b  (GPU)"),

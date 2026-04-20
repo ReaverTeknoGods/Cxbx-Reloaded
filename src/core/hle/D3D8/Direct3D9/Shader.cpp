@@ -31,6 +31,7 @@
 #include "Shader.h"
 #include "common/FilePaths.hpp" // For szFilePath_CxbxReloaded_Exe
 #include "common/PerfTrace.h"
+#include "common/RenderTrace.h"
 #include "core\kernel\init\CxbxKrnl.h" // LOG_TEST_CASE
 #include "core\kernel\support\Emu.h" // EmuLog
 
@@ -269,6 +270,10 @@ static bool EnsureShaderCacheDir()
 	if (g_PerfTraceEnabled) {
 		std::string perfLogPath = g_ShaderCacheDir + "\\perf_trace.log";
 		PerfTrace_Init(perfLogPath.c_str());
+	}
+	if (g_RenderTraceEnabled) {
+		std::string renderTraceLogPath = g_ShaderCacheDir + "\\render_trace.log";
+		RenderTrace_Init(renderTraceLogPath.c_str());
 	}
 	ShaderCacheLog("ShaderCache initialized: %s\n", g_ShaderCacheDir.c_str());
 	ShaderCacheLog("AdapterFingerprint = %s\n", g_AdapterFingerprint.empty() ? "<not set>" : g_AdapterFingerprint.c_str());
@@ -556,14 +561,33 @@ extern HRESULT EmuCompileShader
 	bool asyncAllowed
 )
 {
-	// 1. Fast-path: check the in-memory cache first.  Building cacheInput (~10 µs for
-	//    a string alloc+copy) is still far cheaper than any filesystem I/O or compile,
-	//    and using the same key that all store-sites use guarantees a real hit.
+	const std::string originalHlsl = hlsl_str;
+
+	// Compute the original shader cache key from the untranslated HLSL.
 	std::string cacheInput = hlsl_str + "|" + shader_profile;
 	uint64_t cacheHash = ComputeHash(cacheInput.c_str(), cacheInput.size());
+
+	// Resolve any replacement before consulting caches. Otherwise a preloaded original
+	// shader can short-circuit the lookup and make Replacements\ appear ignored.
+	bool cacheReady = EnsureShaderCacheDir();
+	bool hasReplacement = false;
+	uint64_t activeCacheHash = cacheHash;
+	if (cacheReady) {
+		std::string replacementHlsl;
+		if (TryLoadReplacementShader(cacheHash, shader_profile, replacementHlsl)) {
+			hasReplacement = true;
+			hlsl_str = std::move(replacementHlsl);
+			std::string repInput = hlsl_str + "|" + shader_profile + "|repl";
+			activeCacheHash = ComputeHash(repInput.c_str(), repInput.size());
+		}
+	}
+
+	// 1. Fast-path: check the in-memory cache using the active key after replacement
+	//    resolution. This keeps replacements authoritative even when .cso files were
+	//    preloaded into memory at startup.
 	{
 		std::lock_guard<std::mutex> lock(g_AsyncMutex);
-		auto it = g_MemCache.find(cacheHash);
+		auto it = g_MemCache.find(activeCacheHash);
 		if (it != g_MemCache.end()) {
 			it->second->AddRef();
 			*ppHostShader = it->second;
@@ -572,39 +596,11 @@ extern HRESULT EmuCompileShader
 	}
 
 	// Cache miss — do the full work: disk I/O, hot-swap check, compile.
-	bool cacheReady = EnsureShaderCacheDir();
 
 	// Dump original HLSL source to Dumped\ (once per unique shader, for user inspection).
 	// Only runs on first compile per shader — filesystem::exists() guards subsequent calls.
 	if (cacheReady) {
-		DumpShaderSource(cacheHash, shader_profile, hlsl_str);
-	}
-
-	// Check for a user replacement in Replacements\.
-	// If found: use that HLSL instead of the original, compute a distinct cache hash
-	// from the replacement content so edits always trigger a fresh compile, and force
-	// synchronous compilation so the user sees the result immediately.
-	bool hasReplacement = false;
-	uint64_t activeCacheHash = cacheHash;
-	if (cacheReady) {
-		std::string replacementHlsl;
-		if (TryLoadReplacementShader(cacheHash, shader_profile, replacementHlsl)) {
-			hasReplacement = true;
-			hlsl_str = std::move(replacementHlsl);
-			// The replacement cache key encodes the replacement content, so any edit
-			// to the file produces a new key and forces a fresh compile.
-			std::string repInput = hlsl_str + "|" + shader_profile + "|repl";
-			activeCacheHash = ComputeHash(repInput.c_str(), repInput.size());
-
-			// Re-check the memory cache with the replacement hash before going further.
-			std::lock_guard<std::mutex> lock(g_AsyncMutex);
-			auto it = g_MemCache.find(activeCacheHash);
-			if (it != g_MemCache.end()) {
-				it->second->AddRef();
-				*ppHostShader = it->second;
-				return S_OK;
-			}
-		}
+		DumpShaderSource(cacheHash, shader_profile, originalHlsl);
 	}
 
 	// 2. Try loading from disk cache (fast — ~0.08ms, but only once per hash per session)

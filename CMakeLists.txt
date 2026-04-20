@@ -270,6 +270,7 @@ file (GLOB CXBXR_SOURCE_COMMON
  "${CXBXR_ROOT_DIR}/src/common/input/RawDevice.cpp"
  "${CXBXR_ROOT_DIR}/src/common/Logging.cpp"
  "${CXBXR_ROOT_DIR}/src/common/PerfTrace.cpp"
+ "${CXBXR_ROOT_DIR}/src/common/RenderTrace.cpp"
  "${CXBXR_ROOT_DIR}/src/common/Settings.cpp"
  "${CXBXR_ROOT_DIR}/src/common/util/cliConfig.cpp"
  "${CXBXR_ROOT_DIR}/src/common/util/cliConverter.cpp"

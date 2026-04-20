@@ -34,6 +34,7 @@
 //#include "CxbxKrnl/Emu.h"
 #include "EmuShared.h"
 #include "common/PerfTrace.h"
+#include "common/RenderTrace.h"
 #include "core\kernel\init\CxbxKrnl.h" // For HandleFirstLaunch() and LaunchEmulation()
 #include "core\hle\D3D8\Direct3D9\Shader.h" // For ShaderCacheShutdown()
 //#include <commctrl.h>
@@ -159,7 +160,9 @@ DWORD WINAPI Emulate(unsigned int reserved_systems, blocks_reserved_t blocks_res
 	for (int i = 0; i < argc; i++) {
 		if (argv[i] && _stricmp(argv[i], "--perf-trace") == 0) {
 			g_PerfTraceEnabled = true;
-			break;
+		}
+		if (argv[i] && _stricmp(argv[i], "--render-trace") == 0) {
+			g_RenderTraceEnabled = true;
 		}
 	}
 	LocalFree(argv);

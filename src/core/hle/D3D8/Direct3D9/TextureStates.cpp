@@ -27,6 +27,7 @@
 #define LOG_PREFIX CXBXR_MODULE::D3DST
 
 #include "TextureStates.h"
+#include "common/RenderTrace.h"
 #include "core\kernel\init\CxbxKrnl.h"
 #include "core\kernel\support\Emu.h"
 #include "Logging.h"
@@ -305,6 +306,7 @@ void XboxTextureStateConverter::Apply()
                 g_pD3DDevice->SetSamplerState(HostStage, (D3DSAMPLERSTATETYPE)CxbxTextureStateInfo[State].PC, PcValue);
             } else {
                 g_pD3DDevice->SetTextureStageState(HostStage, (D3DTEXTURESTAGESTATETYPE)CxbxTextureStateInfo[State].PC, PcValue);
+                RenderTrace_RecordTextureStageState(HostStage, CxbxTextureStateInfo[State].PC, PcValue);
             }
 
             // Record we set a state
@@ -332,6 +334,8 @@ void XboxTextureStateConverter::Apply()
         // disable all other stages
         g_pD3DDevice->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
         g_pD3DDevice->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+        RenderTrace_RecordTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+        RenderTrace_RecordTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
 
         // no need to actually copy here, since it was handled in the loop above
     }

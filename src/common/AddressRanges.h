@@ -79,6 +79,10 @@ inline constexpr uint32_t TILED_MEMORY_BASE =      0xF0000000;
 inline constexpr uint32_t TILED_MEMORY_SIZE =      (MiB(64)); // = 0x04000000
 inline constexpr uint32_t TILED_MEMORY_END  =      (TILED_MEMORY_BASE + TILED_MEMORY_SIZE - 1); // 0xF3FFFFFF
 
+inline constexpr uint32_t TILED_MEMORY2_BASE =     0xF4000000;
+inline constexpr uint32_t TILED_MEMORY2_SIZE =     (MiB(64)); // = 0x04000000
+inline constexpr uint32_t TILED_MEMORY2_END  =     (TILED_MEMORY2_BASE + TILED_MEMORY2_SIZE - 1); // 0xF7FFFFFF
+
 #define XBOX_WRITE_COMBINED_BASE            0xF0000000 // WC (The WC memory is another name of the tiled memory)
 #define XBOX_WRITE_COMBINED_SIZE            (MiB(128)) // = 0x08000000
 #define XBOX_WRITE_COMBINED_END             (XBOX_WRITE_COMBINED_BASE + XBOX_WRITE_COMBINED_SIZE - 1) // 0xF7FFFFFF

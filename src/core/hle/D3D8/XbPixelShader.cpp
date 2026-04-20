@@ -49,6 +49,7 @@
 #include "core\hle\D3D8\Direct3D9\FixedFunctionPixelShader.hlsli"
 #include "common/FilePaths.hpp" // For szFilePath_CxbxReloaded_Exe
 #include "common/PerfTrace.h"
+#include "common/RenderTrace.h"
 
 #include <assert.h> // assert()
 #include <process.h>
@@ -794,33 +795,13 @@ std::string GetD3DTASumString(int d3dta, bool allowModifier = true) {
 
 // TODO we have to create and cache shaders over and over and over and over
 // Deduplicate this resource management
-IDirect3DPixelShader9* GetFixedFunctionShader()
+static uint64_t ComputeFixedFunctionShaderKey(
+    FixedFunctionPixelShader::PsTextureHardcodedState (&states)[4],
+    int (&sampleType)[4])
 {
 	using namespace FixedFunctionPixelShader;
 
-	// TODO move this cache elsewhere - and flush it when the device is released!
-	static std::unordered_map<uint64_t, IDirect3DPixelShader9*> ffPsCache = {};
-
-	// Support hotloading hlsl
-	static int pixelShaderVersion = -1;
-	int shaderVersion = g_ShaderSources.Update();
-	if (pixelShaderVersion != shaderVersion) {
-		pixelShaderVersion = shaderVersion;
-		g_pD3DDevice->SetPixelShader(nullptr);
-
-		for (auto& hostShader : ffPsCache) {
-			if (hostShader.second)
-				hostShader.second->Release();
-		}
-
-		ffPsCache.clear();
-	}
-
-	// Create a key from state that will be baked in to the shader
-	PsTextureHardcodedState states[4] = {};
-	int sampleType[4] = { SAMPLE_NONE, SAMPLE_NONE, SAMPLE_NONE, SAMPLE_NONE };
 	bool pointSpriteEnable = XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_POINTSPRITEENABLE);
-
 	bool previousStageDisabled = false;
 	for (int i = 0; i < 4; i++) {
 		// Determine COLOROP
@@ -886,10 +867,39 @@ IDirect3DPixelShader9* GetFixedFunctionShader()
 		states[i].RESULTARG = (float)XboxTextureStates.Get(i, xbox::X_D3DTSS_RESULTARG);
 	}
 
-	// Create a key from the shader state
-	// Note currently this is padded since it's what we send to the GPU
-	auto key = 3 * ComputeHash(states, sizeof(states))
+	return 3 * ComputeHash(states, sizeof(states))
 		+ ComputeHash(sampleType, sizeof(sampleType));
+}
+
+IDirect3DPixelShader9* GetFixedFunctionShader(uint64_t* outKey = nullptr)
+{
+	using namespace FixedFunctionPixelShader;
+
+	// TODO move this cache elsewhere - and flush it when the device is released!
+	static std::unordered_map<uint64_t, IDirect3DPixelShader9*> ffPsCache = {};
+
+	// Support hotloading hlsl
+	static int pixelShaderVersion = -1;
+	int shaderVersion = g_ShaderSources.Update();
+	if (pixelShaderVersion != shaderVersion) {
+		pixelShaderVersion = shaderVersion;
+		g_pD3DDevice->SetPixelShader(nullptr);
+
+		for (auto& hostShader : ffPsCache) {
+			if (hostShader.second)
+				hostShader.second->Release();
+		}
+
+		ffPsCache.clear();
+	}
+
+	// Create a key from state that will be baked in to the shader
+	PsTextureHardcodedState states[4] = {};
+	int sampleType[4] = { SAMPLE_NONE, SAMPLE_NONE, SAMPLE_NONE, SAMPLE_NONE };
+	auto key = ComputeFixedFunctionShaderKey(states, sampleType);
+	if (outKey != nullptr) {
+		*outKey = key;
+	}
 
 	auto got = ffPsCache.find(key);
 	if (got != ffPsCache.end()) {
@@ -1061,8 +1071,12 @@ void DxbxUpdateActivePixelShader() // NOPATCH
   if (pPSDef == nullptr) {
 	IDirect3DPixelShader9* pShader = nullptr;
 	if (g_UseFixedFunctionPixelShader) {
-		pShader = GetFixedFunctionShader();
+		uint64_t fixedFunctionShaderKey = 0;
+		pShader = GetFixedFunctionShader(&fixedFunctionShaderKey);
+		RenderTrace_RecordPixelShaderKey(true, fixedFunctionShaderKey);
 		UpdateFixedFunctionPixelShaderState();
+	} else {
+		RenderTrace_RecordPixelShaderKey(false, 0);
 	}
 
     g_pD3DDevice->SetPixelShader(pShader);
@@ -1099,6 +1113,7 @@ void DxbxUpdateActivePixelShader() // NOPATCH
   // O(1) hash-based pixel shader cache lookup (replaces old linear search)
   const PSH_RECOMPILED_SHADER* RecompiledPixelShader = nullptr;
   uint64_t psHash = CompletePSDef.ComputeIdentityHash();
+	RenderTrace_RecordPixelShaderKey(true, psHash);
   auto it = g_RecompiledPixelShaders.find(psHash);
   if (it != g_RecompiledPixelShaders.end()) {
     if (it->second.isPending) {

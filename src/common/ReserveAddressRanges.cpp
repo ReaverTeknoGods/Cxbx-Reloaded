@@ -77,7 +77,8 @@ bool ReserveMemoryRange(int index, blocks_reserved_t blocks_reserved)
 			[[fallthrough]];
 
 		case PHYSICAL_MAP2_BASE:
-		case TILED_MEMORY_BASE: {
+		case TILED_MEMORY_BASE:
+		case TILED_MEMORY2_BASE: {
 			static bool NeedsInitializationMap = true;
 
 			if (NeedsInitializationMap) {
@@ -174,7 +175,8 @@ void FreeMemoryRange(int index, blocks_reserved_t blocks_reserved)
 	switch (Start) {
 		case PHYSICAL_MAP1_BASE:
 		case PHYSICAL_MAP2_BASE:
-		case TILED_MEMORY_BASE: {
+		case TILED_MEMORY_BASE:
+		case TILED_MEMORY2_BASE: {
 			(void)UnmapViewOfFile((LPVOID)Start);
 #ifdef DEBUG
 			std::printf("     : UnmapViewOfFile; Start = 0x%08X\n", Start);
