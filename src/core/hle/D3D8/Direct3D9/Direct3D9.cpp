@@ -951,6 +951,23 @@ static std::unordered_map<xbox::addr_xt, Microsoft::WRL::ComPtr<IDirect3DBaseTex
 // CxbxUpdateHostTextures uses this to invalidate its per-stage fast-path cache.
 static uint32_t g_RTAliasGeneration = 0;
 
+static void InvalidateRTAliasForXboxData(xbox::addr_xt dataAddr, const char* reason)
+{
+	if (dataAddr == 0) {
+		return;
+	}
+
+	auto it = g_RTDataToHostTexture.find(dataAddr);
+	if (it == g_RTDataToHostTexture.end()) {
+		return;
+	}
+
+	g_RTDataToHostTexture.erase(it);
+	++g_RTAliasGeneration;
+	EmuLog(LOG_LEVEL::DEBUG, "RT alias removed: Data=0x%08X reason=%s gen=%u (total=%zu)",
+		dataAddr, reason ? reason : "unknown", g_RTAliasGeneration, g_RTDataToHostTexture.size());
+}
+
 // 1x1 transparent (RGBA=0,0,0,0) texture used as default for unbound texture stages.
 // In D3D9, an unbound sampler returns (1,1,1,1) = white. On Xbox NV2A, it returns (0,0,0,0).
 // Binding this texture to all stages by default prevents white artifacts from the mismatch.
@@ -2452,6 +2469,11 @@ static void EmuVerifyResourceIsRegistered(xbox::X_D3DResource *pResource, DWORD 
 
 		if (!HostResourceRequiresUpdate(key, pResource, dwSize)) {
 			return;
+		}
+
+		if ((D3DUsage & D3DUSAGE_RENDERTARGET) == 0
+			&& GetXboxCommonResourceType(pResource) == X_D3DCOMMON_TYPE_TEXTURE) {
+			InvalidateRTAliasForXboxData((xbox::addr_xt)pResource->Data, "texture-cache-refresh");
 		}
 
 		FreeHostResource(key);
