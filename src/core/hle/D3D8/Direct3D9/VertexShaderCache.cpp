@@ -10,18 +10,43 @@ VertexShaderCache g_VertexShaderCache = VertexShaderCache();
 // FIXME : This should really be released and created in step with the D3D device lifecycle rather than being a thing on its own
 // (And the ResetD3DDevice method should be removed)
 
+static bool DetectIndexedBoneConstants(const IntermediateVertexShader& intermediateShader)
+{
+	auto isIndexedBoneParam = [](const VSH_IMD_PARAMETER& parameter, bool indexesWithA0_X) {
+		return indexesWithA0_X
+			&& parameter.Type == PARAM_C
+			&& parameter.Address >= 4
+			&& parameter.Address <= 11;
+	};
 
-ID3DBlob* AsyncCreateVertexShader(IntermediateVertexShader intermediateShader, ShaderKey key) {
-	ID3DBlob* pCompiledShader;
+	for (const auto& instruction : intermediateShader.Instructions) {
+		for (uint8_t i = 0; i < instruction.MAC.ParamCount; i++) {
+			if (isIndexedBoneParam(instruction.MAC.Parameters[i], instruction.IndexesWithA0_X)) {
+				return true;
+			}
+		}
+
+		if (isIndexedBoneParam(instruction.ILU.Parameter, instruction.IndexesWithA0_X)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+
+VertexShaderCache::CompiledVertexShaderResult AsyncCreateVertexShader(IntermediateVertexShader intermediateShader, ShaderKey key) {
+	VertexShaderCache::CompiledVertexShaderResult result = {};
 
 	auto hRet = EmuCompileVertexShader(
 		&intermediateShader,
-		&pCompiledShader
+		&result.pCompiledShader,
+		&result.shaderCacheHash
 	);
 
 	EmuLog(LOG_LEVEL::DEBUG, "Finished compiling shader %llx", key);
 
-	return pCompiledShader;
+	return result;
 }
 
 // Find a shader
@@ -63,6 +88,7 @@ ShaderKey VertexShaderCache::CreateShader(const xbox::dword_xt* pXboxFunction, D
 	// We're going to create a new shader
 	auto newShader = LazyVertexShader();
 	newShader.referenceCount = 1;
+	newShader.usesIndexedBoneConstants = DetectIndexedBoneConstants(intermediateShader);
 
 	if (!intermediateShader.Instructions.empty())
 	{
@@ -111,7 +137,9 @@ IDirect3DVertexShader* VertexShaderCache::GetShader(ShaderKey key)
 	ID3DBlob* pCompiledShader = nullptr;
 	try {
 		// Block until background compile finishes (fast with disk cache ~0.08ms)
-		pCompiledShader = pLazyShader->compileResult.get();
+		auto compileResult = pLazyShader->compileResult.get();
+		pCompiledShader = compileResult.pCompiledShader;
+		pLazyShader->shaderCacheHash = compileResult.shaderCacheHash;
 
 		if (!pCompiledShader) {
 			EmuLog(LOG_LEVEL::ERROR2, "Failed to compile vertex shader for %llx", key);
@@ -150,6 +178,26 @@ IDirect3DVertexShader* VertexShaderCache::GetShader(ShaderKey key)
 	return pLazyShader->pHostVertexShader;
 }
 
+uint64_t VertexShaderCache::GetShaderCacheHash(ShaderKey key)
+{
+	LazyVertexShader* pLazyShader = nullptr;
+	if (!_FindShader(key, &pLazyShader)) {
+		return 0;
+	}
+
+	return pLazyShader->shaderCacheHash;
+}
+
+bool VertexShaderCache::UsesIndexedBoneConstants(ShaderKey key)
+{
+	LazyVertexShader* pLazyShader = nullptr;
+	if (!_FindShader(key, &pLazyShader)) {
+		return false;
+	}
+
+	return pLazyShader->usesIndexedBoneConstants;
+}
+
 // Release a shader. Doesn't actually release any resources for now
 void VertexShaderCache::ReleaseShader(ShaderKey key)
 {
@@ -182,9 +230,9 @@ void VertexShaderCache::Clear()
 {
 	for (auto& x : cache) {
 		if (!x.second.isReady) {
-			auto pBlob = x.second.compileResult.get();
-			if (pBlob) {
-				pBlob->Release();
+			auto compileResult = x.second.compileResult.get();
+			if (compileResult.pCompiledShader) {
+				compileResult.pCompiledShader->Release();
 			}
 		}
 		else if(x.second.pHostVertexShader) {

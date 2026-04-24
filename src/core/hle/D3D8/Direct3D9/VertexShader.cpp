@@ -285,7 +285,8 @@ void BuildShader(IntermediateVertexShader* pShader, std::stringstream& hlsl)
 extern HRESULT EmuCompileVertexShader
 (
 	IntermediateVertexShader* pIntermediateShader,
-	ID3DBlob** ppHostShader
+	ID3DBlob** ppHostShader,
+	uint64_t* pActiveCacheHash
 )
 {
 	assert(pIntermediateShader->Instructions.size() > 0);
@@ -298,13 +299,13 @@ extern HRESULT EmuCompileVertexShader
 	std::string hlsl_str = hlsl_stream.str();
 
 	const char* notionalSourceName = "CxbxVertexShaderTemplate.hlsl";
-	HRESULT hRet = EmuCompileShader(hlsl_str, g_vs_model, ppHostShader, notionalSourceName);
+	HRESULT hRet = EmuCompileShader(hlsl_str, g_vs_model, ppHostShader, notionalSourceName, false, pActiveCacheHash);
 	
 	if (FAILED(hRet) && (g_vs_model != vs_model_3_0)) {
 		// If the shader failed in the default vertex shader model, retry in vs_model_3_0
 		// This allows shaders too large for 2_a to be compiled (Test Case: Shenmue 2)
 		EmuLog(LOG_LEVEL::WARNING, "Shader compile failed. Retrying with shader model 3.0");
-		hRet = EmuCompileShader(hlsl_str, vs_model_3_0, ppHostShader, notionalSourceName);
+		hRet = EmuCompileShader(hlsl_str, vs_model_3_0, ppHostShader, notionalSourceName, false, pActiveCacheHash);
 	}
 		
 	return hRet;

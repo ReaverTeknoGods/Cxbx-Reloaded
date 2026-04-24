@@ -10,7 +10,8 @@ extern HRESULT EmuCompileShader
 	const char* shader_profile,
 	ID3DBlob** ppHostShader,
 	const char* pSourceName = nullptr,
-	bool asyncAllowed = false
+	bool asyncAllowed = false,
+	uint64_t* pActiveCacheHash = nullptr
 );
 
 // Flush the background shader save queue and stop the save thread.
@@ -58,3 +59,7 @@ extern ShaderSources g_ShaderSources;
 // GPU or driver has changed since the cache was written, all stale .cso files
 // are silently removed so they are recompiled rather than causing a crash.
 void ShaderCacheSetAdapterFingerprint(const char* adapterDesc, uint32_t driverVersionHigh, uint32_t driverVersionLow);
+
+// Returns the per-game shader cache directory path (e.g. "...\ShaderCache\00000000-OllieKing").
+// Returns empty string if the cache is not yet initialized.
+const std::string& GetShaderCacheDir();

@@ -11,8 +11,15 @@ typedef uint64_t ShaderKey;
 class VertexShaderCache {
 
 public:
+	struct CompiledVertexShaderResult {
+		ID3DBlob* pCompiledShader = nullptr;
+		uint64_t shaderCacheHash = 0;
+	};
+
 	ShaderKey CreateShader(const xbox::dword_xt* pXboxFunction, DWORD* pXboxFunctionSize);
 	IDirect3DVertexShader *GetShader(ShaderKey key);
+	uint64_t GetShaderCacheHash(ShaderKey key);
+	bool UsesIndexedBoneConstants(ShaderKey key);
 	void ReleaseShader(ShaderKey key);
 
 	void ResetD3DDevice(IDirect3DDevice9* pD3DDevice);
@@ -25,8 +32,9 @@ public:
 private:
 	struct LazyVertexShader {
 		bool isReady = false;
-		std::future<ID3DBlob*> compileResult;
+		std::future<CompiledVertexShaderResult> compileResult;
 		IDirect3DVertexShader* pHostVertexShader = nullptr;
+		uint64_t shaderCacheHash = 0;
 
 		// TODO when is it a good idea to releas eshaders?
 		int referenceCount = 0;
@@ -34,6 +42,7 @@ private:
 		// TODO persist shaders to disk
 		// ShaderVersion?
 		// OptimizationLevel?
+		bool usesIndexedBoneConstants = false;
 	};
 
 	IDirect3DDevice9* pD3DDevice;

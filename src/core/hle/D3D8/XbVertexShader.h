@@ -28,6 +28,7 @@
 #include <d3dcompiler.h>
 #include <vector>
 #include <future>
+#include <cstdint>
 
 #include "core\hle\D3D8\XbD3D8Types.h" // for X_VSH_MAX_ATTRIBUTES
 
@@ -90,6 +91,9 @@ enum class VertexShaderMode {
 
 extern VertexShaderMode g_Xbox_VertexShaderMode;
 extern bool g_UseFixedFunctionVertexShader;
+extern bool g_ActiveXboxVertexShaderUsesIndexedBoneConstants;
+extern uint64_t g_ActiveXboxVertexShaderKey;
+extern uint64_t g_ActiveXboxVertexShaderCacheHash;
 
 // Intermediate vertex shader structures
 

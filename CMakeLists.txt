@@ -228,6 +228,7 @@ file (GLOB CXBXR_HEADER_EMU
  "${CXBXR_ROOT_DIR}/src/devices/usb/UsbCommon.h"
  "${CXBXR_ROOT_DIR}/src/devices/usb/USBDevice.h"
  "${CXBXR_ROOT_DIR}/src/devices/usb/XidGamepad.h"
+ "${CXBXR_ROOT_DIR}/src/devices/video/NV2AConstDump.h"
  "${CXBXR_ROOT_DIR}/src/devices/video/nv2a.h"
  "${CXBXR_ROOT_DIR}/src/devices/video/nv2a_debug.h"
  "${CXBXR_ROOT_DIR}/src/devices/video/nv2a_int.h"
@@ -442,6 +443,7 @@ file (GLOB CXBXR_SOURCE_EMU
  #"${CXBXR_ROOT_DIR}/src/devices/video/EmuNV2A_USER.cpp"
 
  "${CXBXR_ROOT_DIR}/src/devices/video/nv2a.cpp"
+ "${CXBXR_ROOT_DIR}/src/devices/video/NV2AConstDump.cpp"
  "${CXBXR_ROOT_DIR}/src/devices/video/nv2a_debug.cpp"
  "${CXBXR_ROOT_DIR}/src/devices/video/nv2a_psh.cpp"
  "${CXBXR_ROOT_DIR}/src/devices/video/nv2a_shaders.cpp"
@@ -466,10 +468,12 @@ add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/projects/cxbxr-ldr")
 
 add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/projects/cxbxr-emu")
 
+add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/projects/nv2a-pfifo-verify")
+
 set(cxbxr_INSTALL_files "COPYING" "README.md")
 
 # Cxbx-Reloaded project with third-party libraries
-set_target_properties(cxbx cxbxr-ldr cxbxr-emu misc-batch SDL2 subhook libXbSymbolDatabase libtommath libtomcrypt imgui libusb
+set_target_properties(cxbx cxbxr-ldr cxbxr-emu nv2a-pfifo-verify misc-batch SDL2 subhook libXbSymbolDatabase libtommath libtomcrypt imgui libusb
  PROPERTIES FOLDER Cxbx-Reloaded
 )
 

@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <atomic>
+#include <cstdint>
 
 // ── tunables ──────────────────────────────────────────────────────────────────
 // Seconds between log lines per category (reduce for more granular data)
@@ -27,6 +28,18 @@
 #endif
 // Maximum number of Xbox threads to track for CPU time accounting
 #define PERF_MAX_XBOX_THREADS 32
+// Fixed-size label buffer for Xbox thread attribution in perf_trace.log
+#define PERF_MAX_XBOX_THREAD_LABEL 96
+// Number of hottest Xbox threads to print in suspect-frame and window summaries
+#define PERF_REPORT_TOP_XBOX_THREADS 3
+// Number of unique vertex shader keys to track for VS_KickDrain attribution
+#define PERF_MAX_VS_KICKDRAIN_KEYS 32
+// Number of hottest VS_KickDrain shader keys to print in suspect-frame and window summaries
+#define PERF_REPORT_TOP_VS_KICKDRAIN_KEYS 3
+// Number of PFIFO non-constant methods to track as kick-drain blockers
+#define PERF_MAX_VS_KICKDRAIN_METHODS 16
+// Number of hottest PFIFO non-constant blocker methods to print in window summaries
+#define PERF_REPORT_TOP_VS_KICKDRAIN_METHODS 4
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Category IDs — add new ones here and mirror in PerfTrace.cpp's g_catNames[]
@@ -49,13 +62,25 @@ enum PerfCat : int {
     PERF_CAT_VS_DECL         = 15, // CxbxUpdateHostVertexDeclaration only
     PERF_CAT_VS_CONST        = 16, // CxbxUpdateHostVertexShaderConstants only
     PERF_CAT_VIEWPORT        = 17, // CxbxUpdateHostViewport only
-    PERF_CAT_GET_BACKBUFFER  = 18, // GetHostSurface for backbuffer in swap path
+    PERF_CAT_GET_BACKBUFFER  = 18, // Host GetBackBuffer call in swap path
     PERF_CAT_FRAME_SLEEP     = 19, // SleepPrecise frame limiter inside Swap
     PERF_CAT_ENDSCENE        = 20, // EndScene + GPU flush before Present
     PERF_CAT_EMU_X86         = 21, // EmuX86_DecodeException VEH handler (privileged instrs)
     PERF_CAT_KE_WAIT         = 22, // KeWaitForSingleObject / KeWaitForMultipleObjects
     PERF_CAT_KE_DELAY        = 23, // KeDelayExecutionThread
-    PERF_CAT_COUNT           = 24,
+    PERF_CAT_VS_KICKDRAIN    = 24, // KickOff + PFIFO drain inside VS_CONST
+    PERF_CAT_VS_UPLOAD       = 25, // Snapshot + compare + SetVertexShaderConstantF
+    PERF_CAT_XCPU_RUN        = 26, // Xbox CPU emulation (EmuX86_Opcode handlers)
+    PERF_CAT_VS_BONE_SYNC    = 27, // Bone-only PFIFO parse + constant overlay inside VS_CONST
+    PERF_CAT_VS_BONE_UPLOAD  = 28, // Bone-only constant snapshot + compare + upload work
+    PERF_CAT_COUNT           = 29,
+};
+
+enum PerfVSKickDrainReason : uint32_t {
+    PERF_VS_KICKDRAIN_REASON_UNRELIABLE_PARSE = 1u << 0,
+    PERF_VS_KICKDRAIN_REASON_MORE_PENDING     = 1u << 1,
+    PERF_VS_KICKDRAIN_REASON_NON_CONSTANT     = 1u << 2,
+    PERF_VS_KICKDRAIN_REASON_PARSED_CONSTANTS = 1u << 3,
 };
 
 // ── internal state (defined in PerfTrace.h to keep it header-only) ───────────
@@ -89,21 +114,65 @@ struct State {
     // Xbox thread CPU time tracking (QueryThreadCycleTime, TSC-based)
     HANDLE xboxThreads[PERF_MAX_XBOX_THREADS];        // duplicated native Win32 handles
     ULONGLONG xboxThreadCycleStart[PERF_MAX_XBOX_THREADS]; // cumulative TSC cycles at last sample
+    DWORD xboxThreadIds[PERF_MAX_XBOX_THREADS];       // Xbox-visible thread IDs / handles
+    DWORD xboxNativeThreadIds[PERF_MAX_XBOX_THREADS]; // native Win32 thread IDs
+    const void* xboxThreadSystemRoutine[PERF_MAX_XBOX_THREADS];
+    const void* xboxThreadStartRoutine[PERF_MAX_XBOX_THREADS];
+    char xboxThreadLabels[PERF_MAX_XBOX_THREADS][PERF_MAX_XBOX_THREAD_LABEL];
+    double xcpuThreadMs[PERF_MAX_XBOX_THREADS];       // current frame CPU time per Xbox thread
+    double xcpuThreadWindowMs[PERF_MAX_XBOX_THREADS]; // accumulated CPU time in current report window
+    double xcpuThreadMaxFrameMs[PERF_MAX_XBOX_THREADS]; // hottest single-frame CPU time in window
+    long long xboxThreadKeWaitFrameTicks[PERF_MAX_XBOX_THREADS];
+    long long xboxThreadKeWaitWindowTicks[PERF_MAX_XBOX_THREADS];
+    long long xboxThreadKeWaitWindowMaxFrameTicks[PERF_MAX_XBOX_THREADS];
+    long long xboxThreadKeDelayFrameTicks[PERF_MAX_XBOX_THREADS];
+    long long xboxThreadKeDelayWindowTicks[PERF_MAX_XBOX_THREADS];
+    long long xboxThreadKeDelayWindowMaxFrameTicks[PERF_MAX_XBOX_THREADS];
     ULONGLONG xcpuCyclesPerFrame;  // last frame: total Xbox-thread TSC cycles (converted to ms using cpuGhz)
     double cpuGhz;        // measured CPU frequency (GHz) used to convert TSC cycles -> ms
     int xboxThreadCount;  // number of registered Xbox threads (written atomically)
     double xcpuMs;        // last frame: total Xbox-thread CPU time in ms
+    uint64_t vsKickDrainKeys[PERF_MAX_VS_KICKDRAIN_KEYS];
+    uint32_t vsKickDrainHandles[PERF_MAX_VS_KICKDRAIN_KEYS];
+    uint64_t vsKickDrainCacheHashes[PERF_MAX_VS_KICKDRAIN_KEYS];
+    long long vsKickDrainFrameTicks[PERF_MAX_VS_KICKDRAIN_KEYS];
+    long long vsKickDrainWindowTicks[PERF_MAX_VS_KICKDRAIN_KEYS];
+    long long vsKickDrainWindowMaxFrameTicks[PERF_MAX_VS_KICKDRAIN_KEYS];
+    uint32_t vsKickDrainUnreliableCount[PERF_MAX_VS_KICKDRAIN_KEYS];
+    uint32_t vsKickDrainMorePendingCount[PERF_MAX_VS_KICKDRAIN_KEYS];
+    uint32_t vsKickDrainNonConstantCount[PERF_MAX_VS_KICKDRAIN_KEYS];
+    uint32_t vsKickDrainParsedConstantsCount[PERF_MAX_VS_KICKDRAIN_KEYS];
+    uint32_t vsKickDrainBlockerMethods[PERF_MAX_VS_KICKDRAIN_METHODS];
+    uint32_t vsKickDrainBlockerMethodCounts[PERF_MAX_VS_KICKDRAIN_METHODS];
+    uint32_t pfifoPendingDepth;
+    uint32_t pfifoPendingHighWater;
+    uint32_t pfifoPendingOverflowLastSeen;
+    uint32_t pfifoPendingOverflowWindowCount;
     // Render thread tracking: host thread ID of the thread that calls D3DDevice_Swap
     DWORD renderThreadId; // set each frame in OnSwapBegin from GetCurrentThreadId()
     // Per-frame render-thread exclusive stats for KE_WAIT and KE_DELAY
     CatStats frameRt[2]; // [0]=KE_WAIT, [1]=KE_DELAY, render thread only
 };
 
+inline void AccumulateTicks(State& s, PerfCat cat, long long elapsed)
+{
+    s.frame[cat].totalTicks += elapsed;
+    s.frame[cat].calls++;
+    if (elapsed > s.frame[cat].maxTicks) s.frame[cat].maxTicks = elapsed;
+
+    s.cats[cat].totalTicks += elapsed;
+    s.cats[cat].calls++;
+    if (elapsed > s.cats[cat].maxTicks) s.cats[cat].maxTicks = elapsed;
+}
+
 extern State g_state;
 extern const char* g_catNames[PERF_CAT_COUNT];
 
 void Init(const char* logPath);
-void RegisterXboxThread(HANDLE h); // duplicate h and track its CPU time per-frame
+void RegisterXboxThread(HANDLE h, DWORD xboxThreadId, DWORD nativeThreadId, const void* systemRoutine, const void* startRoutine); // duplicate h and track its CPU time per-frame
+void RecordVSKickDrain(uint64_t shaderKey, uint32_t shaderHandle, uint64_t shaderCacheHash, long long elapsedTicks, uint32_t reasonMask);
+void RecordVSKickDrainBlockerMethod(uint32_t method);
+void RecordPFIFOPending(uint32_t currentDepth, uint32_t highWater, uint32_t overflowCount);
 void Report();          // called by PerfTrace_OnSwap every N seconds
 void OnSwapBegin();     // resets per-frame accumulators, bumps frame counter
 void OnSwapEnd();       // accumulates frame totals into window totals, maybe Report
@@ -126,17 +195,27 @@ struct PerfScopeGuard {
         long long elapsed = end.QuadPart - start.QuadPart;
 
         auto& s = PerfTraceInternal::g_state;
-        // per-frame
-        s.frame[cat].totalTicks += elapsed;
-        s.frame[cat].calls++;
-        if (elapsed > s.frame[cat].maxTicks) s.frame[cat].maxTicks = elapsed;
-        // window
-        s.cats[cat].totalTicks += elapsed;
-        s.cats[cat].calls++;
-        if (elapsed > s.cats[cat].maxTicks) s.cats[cat].maxTicks = elapsed;
-        // render-thread exclusive tracking for kewait/kedelay
-        if ((cat == PERF_CAT_KE_WAIT || cat == PERF_CAT_KE_DELAY) && s.renderThreadId != 0) {
-            if (GetCurrentThreadId() == s.renderThreadId) {
+        PerfTraceInternal::AccumulateTicks(s, cat, elapsed);
+        if (cat == PERF_CAT_KE_WAIT || cat == PERF_CAT_KE_DELAY) {
+            DWORD currentThreadId = GetCurrentThreadId();
+
+            for (int i = 0; i < s.xboxThreadCount; i++) {
+                if (s.xboxNativeThreadIds[i] != currentThreadId) {
+                    continue;
+                }
+
+                if (cat == PERF_CAT_KE_WAIT) {
+                    s.xboxThreadKeWaitFrameTicks[i] += elapsed;
+                    s.xboxThreadKeWaitWindowTicks[i] += elapsed;
+                } else {
+                    s.xboxThreadKeDelayFrameTicks[i] += elapsed;
+                    s.xboxThreadKeDelayWindowTicks[i] += elapsed;
+                }
+                break;
+            }
+
+            // render-thread exclusive tracking for kewait/kedelay
+            if (s.renderThreadId != 0 && currentThreadId == s.renderThreadId) {
                 int rtIdx = (cat == PERF_CAT_KE_WAIT) ? 0 : 1;
                 s.frameRt[rtIdx].totalTicks += elapsed;
                 s.frameRt[rtIdx].calls++;
@@ -170,8 +249,20 @@ inline void PerfTrace_OnSwapEnd() {
 // Register a native Win32 thread handle to have its CPU time tracked per-frame.
 // Safe to call from any thread; a duplicate of h is stored internally.
 // Typically called once per Xbox thread from PsCreateSystemThreadEx.
-inline void PerfTrace_RegisterXboxThread(HANDLE h) {
-    if (g_PerfTraceEnabled) PerfTraceInternal::RegisterXboxThread(h);
+inline void PerfTrace_RegisterXboxThread(HANDLE h, DWORD xboxThreadId, DWORD nativeThreadId, const void* systemRoutine, const void* startRoutine) {
+    if (g_PerfTraceEnabled) PerfTraceInternal::RegisterXboxThread(h, xboxThreadId, nativeThreadId, systemRoutine, startRoutine);
+}
+
+inline void PerfTrace_RecordVSKickDrain(uint64_t shaderKey, uint32_t shaderHandle, uint64_t shaderCacheHash, long long elapsedTicks, uint32_t reasonMask) {
+    if (g_PerfTraceEnabled) PerfTraceInternal::RecordVSKickDrain(shaderKey, shaderHandle, shaderCacheHash, elapsedTicks, reasonMask);
+}
+
+inline void PerfTrace_RecordVSKickDrainBlockerMethod(uint32_t method) {
+    if (g_PerfTraceEnabled) PerfTraceInternal::RecordVSKickDrainBlockerMethod(method);
+}
+
+inline void PerfTrace_RecordPFIFOPending(uint32_t currentDepth, uint32_t highWater, uint32_t overflowCount) {
+    if (g_PerfTraceEnabled) PerfTraceInternal::RecordPFIFOPending(currentDepth, highWater, overflowCount);
 }
 
 #endif // PERFTRACE_H

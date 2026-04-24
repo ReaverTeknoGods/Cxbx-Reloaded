@@ -65,6 +65,8 @@ static bool IsValidShaderBytecode(uint32_t magic)
 }
 
 static std::string g_ShaderCacheDir;
+
+const std::string& GetShaderCacheDir() { return g_ShaderCacheDir; }
 // GPU/driver fingerprint supplied from Direct3D9.cpp during device creation.
 // Used to detect stale cache entries from a different GPU or driver version.
 static std::string g_AdapterFingerprint;
@@ -459,7 +461,7 @@ static void PreloadShaderCache()
 // Async shader compilation (Dolphin-style)
 // ============================================================================
 
-// Precompiled fallback pixel shader (simple white output)
+// Precompiled fallback pixel shader (fully transparent output)
 static ID3DBlob* g_FallbackPSBlob = nullptr;
 static bool g_FallbacksInitialized = false;
 
@@ -468,9 +470,12 @@ static void EnsureFallbackShaders()
 	if (g_FallbacksInitialized) return;
 	g_FallbacksInitialized = true;
 
-	// Minimal pixel shader: output white (only PS uses async fallback)
+	// Minimal pixel shader: output fully transparent black so pending async
+	// shaders don't pollute the screen with white while compiling.
+	// With alpha blending enabled this is invisible; without blending the
+	// pixels are black (preferable to white which washes out the scene).
 	const char* psSrc =
-		"float4 main() : COLOR0 { return float4(1,1,1,1); }\n";
+		"float4 main() : COLOR0 { return float4(0,0,0,0); }\n";
 	D3DCompile(psSrc, strlen(psSrc), nullptr, nullptr, nullptr,
 		"main", "ps_3_0", D3DCOMPILE_OPTIMIZATION_LEVEL0, 0, &g_FallbackPSBlob, nullptr);
 
@@ -558,7 +563,8 @@ extern HRESULT EmuCompileShader
 	const char* shader_profile,
 	ID3DBlob** ppHostShader,
 	const char* pSourceName,
-	bool asyncAllowed
+	bool asyncAllowed,
+	uint64_t* pActiveCacheHashOut
 )
 {
 	const std::string originalHlsl = hlsl_str;
@@ -580,6 +586,9 @@ extern HRESULT EmuCompileShader
 			std::string repInput = hlsl_str + "|" + shader_profile + "|repl";
 			activeCacheHash = ComputeHash(repInput.c_str(), repInput.size());
 		}
+	}
+	if (pActiveCacheHashOut) {
+		*pActiveCacheHashOut = activeCacheHash;
 	}
 
 	// 1. Fast-path: check the in-memory cache using the active key after replacement

@@ -2127,8 +2127,11 @@ void pgraph_handle_method(NV2AState *d,
 
 			assert(const_load < NV2A_VERTEXSHADER_CONSTANTS);
 			// VertexShaderConstant *vsh_constant = &pg->vsh_constants[const_load];
-			pg->vsh_constants_dirty[const_load] |=
-				(parameter != pg->vsh_constants[const_load][slot%4]);
+			if (parameter != pg->vsh_constants[const_load][slot%4]) {
+				pg->vsh_constants_dirty[const_load] = true;
+				extern bool g_VshConstantsDirtyAny;
+				g_VshConstantsDirtyAny = true;
+			}
 			pg->vsh_constants[const_load][slot%4] = parameter;
 
 			if (slot % 4 == 3) {

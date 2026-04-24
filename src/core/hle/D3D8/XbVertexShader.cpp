@@ -66,6 +66,9 @@ extern XboxRenderStateConverter XboxRenderStates; // Declared in Direct3D9.cpp
 
 VertexShaderMode g_Xbox_VertexShaderMode = VertexShaderMode::FixedFunction;
 bool g_UseFixedFunctionVertexShader = true;
+bool g_ActiveXboxVertexShaderUsesIndexedBoneConstants = false;
+uint64_t g_ActiveXboxVertexShaderKey = 0;
+uint64_t g_ActiveXboxVertexShaderCacheHash = 0;
 
                 xbox::dword_xt g_Xbox_VertexShader_Handle = 0;
 #ifdef CXBX_USE_GLOBAL_VERTEXSHADER_POINTER // TODO : Would this be more accurate / simpler?
@@ -1180,9 +1183,13 @@ void CxbxUpdateHostVertexShader()
 
 	IDirect3DVertexShader* pNewShader = nullptr;
 	if (g_Xbox_VertexShaderMode == VertexShaderMode::FixedFunction) {
+		g_ActiveXboxVertexShaderKey = 0;
+		g_ActiveXboxVertexShaderCacheHash = 0;
 		pNewShader = fixedFunctionShader;
 	}
 	else if (g_Xbox_VertexShaderMode == VertexShaderMode::Passthrough && g_bUsePassthroughHLSL) {
+		g_ActiveXboxVertexShaderKey = 0;
+		g_ActiveXboxVertexShaderCacheHash = 0;
 		pNewShader = passthroughShader;
 	}
 	else {
@@ -1191,7 +1198,17 @@ void CxbxUpdateHostVertexShader()
 		// Create a vertex shader from the tokens
 		DWORD shaderSize;
 		auto VertexShaderKey = g_VertexShaderCache.CreateShader(pTokens, &shaderSize);
+		g_ActiveXboxVertexShaderKey = VertexShaderKey;
+		g_ActiveXboxVertexShaderUsesIndexedBoneConstants =
+			g_VertexShaderCache.UsesIndexedBoneConstants(VertexShaderKey);
 		pNewShader = g_VertexShaderCache.GetShader(VertexShaderKey);
+		g_ActiveXboxVertexShaderCacheHash = g_VertexShaderCache.GetShaderCacheHash(VertexShaderKey);
+	}
+
+	if (g_Xbox_VertexShaderMode != VertexShaderMode::ShaderProgram) {
+		g_ActiveXboxVertexShaderKey = 0;
+		g_ActiveXboxVertexShaderCacheHash = 0;
+		g_ActiveXboxVertexShaderUsesIndexedBoneConstants = false;
 	}
 
 	if (pNewShader != s_lastSetShader) {
@@ -1600,9 +1617,16 @@ void CxbxImpl_DeleteVertexShader(DWORD Handle)
 
 // TODO : Remove SetVertexShaderConstant implementation and the patch once
 // CxbxUpdateHostVertexShaderConstants is reliable (ie. : when we're able to flush the NV2A push buffer)
+// Declared in Direct3D9.cpp, set when any vertex shader constant is dirtied
+extern bool g_VshConstantsDirtyAny;
+extern bool g_VshConstantsDirtyHLE;
+
 void CxbxImpl_SetVertexShaderConstant(INT Register, PVOID pConstantData, DWORD ConstantCount)
 {
 	LOG_INIT; // Allows use of DEBUG_D3DRESULT
+
+	g_VshConstantsDirtyAny = true;
+	g_VshConstantsDirtyHLE = true;
 
 	// Xbox vertex shader constants range from -96 to 95
 	// The host does not support negative, so we adjust to 0..191

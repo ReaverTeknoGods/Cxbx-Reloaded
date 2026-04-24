@@ -96,9 +96,23 @@ DEVICE_WRITE32(USER)
 
 		if (channel_id == cur_channel_id) {
 			switch (addr & 0xFFFF) {
-			case NV_USER_DMA_PUT:
+			case NV_USER_DMA_PUT: {
+				extern bool g_XboxPushBufferSubmissionPending;
+				extern void nv2a_pfifo_notify_dma_put_write(uint32_t oldValue, uint32_t newValue,
+					uint32_t dmaGet, uint32_t dmaState, uint32_t dmaSubroutine);
+				uint32_t oldValue = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT];
+				if (oldValue != value) {
+					g_XboxPushBufferSubmissionPending = true;
+					nv2a_pfifo_notify_dma_put_write(
+						oldValue,
+						value,
+						d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET],
+						d->pfifo.regs[NV_PFIFO_CACHE1_DMA_STATE],
+						d->pfifo.regs[NV_PFIFO_CACHE1_DMA_SUBROUTINE]);
+				}
 				d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT] = value;
 				break;
+			}
 			case NV_USER_DMA_GET:
 				d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET] = value;
 				break;

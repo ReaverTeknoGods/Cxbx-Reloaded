@@ -174,8 +174,17 @@ TextureArgs ExecuteTextureStage(
 	// Sample the texture
 	float4 t;
 	int type = TextureSampleType[i];
-	if (type == SAMPLE_NONE)
-		t = 1; // Test case JSRF
+	if (type == SAMPLE_NONE) {
+		// No texture bound: use the identity value for the stage's operation type
+		// Additive ops need 0 (x + 0 = x), multiplicative/select ops need 1 (x * 1 = x)
+		// Test case: JSRF needs 1 (MODULATE passthrough), Ollie King needs 0 (ADD no-op)
+		if (s.COLOROP == X_D3DTOP_ADD || s.COLOROP == X_D3DTOP_ADDSIGNED ||
+			s.COLOROP == X_D3DTOP_ADDSIGNED2X || s.COLOROP == X_D3DTOP_SUBTRACT ||
+			s.COLOROP == X_D3DTOP_ADDSMOOTH)
+			t = 0;
+		else
+			t = 1;
+	}
 	else if (type == SAMPLE_2D)
 		t = tex2D(samplers[i], TexCoords[i].xy + offset.xy);
 	else if (type == SAMPLE_3D)

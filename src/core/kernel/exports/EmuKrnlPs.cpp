@@ -389,8 +389,8 @@ XBSYSAPI EXPORTNUM(255) xbox::ntstatus_xt NTAPI xbox::PsCreateSystemThreadEx
 		iPCSTProxyParam->Ethread = eThread;
 		iPCSTProxyParam->TlsDataSize = TlsDataSize;
 
-		unsigned int ThreadId;
-		HANDLE handle = reinterpret_cast<HANDLE>(_beginthreadex(NULL, hKernelStackSize, PCSTProxy, iPCSTProxyParam, CREATE_SUSPENDED, &ThreadId));
+		unsigned int nativeThreadId;
+		HANDLE handle = reinterpret_cast<HANDLE>(_beginthreadex(NULL, hKernelStackSize, PCSTProxy, iPCSTProxyParam, CREATE_SUSPENDED, &nativeThreadId));
 		if (handle == zeroptr) {
 			delete iPCSTProxyParam;
 			ObpClose(eThread->UniqueThread);
@@ -406,7 +406,12 @@ XBSYSAPI EXPORTNUM(255) xbox::ntstatus_xt NTAPI xbox::PsCreateSystemThreadEx
 		KeQuerySystemTime(&eThread->CreateTime);
 		RegisterXboxObject(eThread, handle);
 		// Register the native thread handle so PerfTrace can account for its CPU time per-frame.
-		PerfTrace_RegisterXboxThread(handle);
+		PerfTrace_RegisterXboxThread(
+			reinterpret_cast<::HANDLE>(handle),
+			static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(eThread->UniqueThread)),
+			static_cast<DWORD>(nativeThreadId),
+			reinterpret_cast<const void*>(SystemRoutine),
+			reinterpret_cast<const void*>(StartRoutine));
 
 		eThread->Tcb.Priority = GetThreadPriority(handle);
 		g_AffinityPolicy->SetAffinityXbox(handle);
@@ -428,7 +433,7 @@ XBSYSAPI EXPORTNUM(255) xbox::ntstatus_xt NTAPI xbox::PsCreateSystemThreadEx
 
 		// Log ThreadID identical to how GetCurrentThreadID() is rendered :
 		EmuLog(LOG_LEVEL::DEBUG, "Created Xbox proxy thread. Handle : 0x%X, ThreadId : [0x%.4X], Native Handle : 0x%X, Native ThreadId : [0x%.4X]",
-			*ThreadHandle, eThread->UniqueThread, handle, ThreadId);
+			*ThreadHandle, eThread->UniqueThread, handle, nativeThreadId);
 	}
 
 	RETURN(X_STATUS_SUCCESS);

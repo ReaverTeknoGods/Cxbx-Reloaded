@@ -27,9 +27,12 @@
 #define LOG_PREFIX CXBXR_MODULE::D3D8
 
 #include "common\util\hasher.h" // For ComputeHash
+#include "devices\video\NV2AConstDump.h"
 #include <string>
 #include <condition_variable>
 #include <stack>
+#include <cstdio>
+#include <cmath>
 
 
 #include <core\kernel\exports\xboxkrnl.h>
@@ -87,6 +90,9 @@
 #include <wrl/client.h>
 
 using namespace Microsoft::WRL;
+
+extern void nv2a_const_diag_new_frame();
+extern void nv2a_const_diag_next_draw();
 
 XboxRenderStateConverter XboxRenderStates;
 XboxTextureStateConverter XboxTextureStates;
@@ -932,6 +938,32 @@ typedef struct _resource_info_t {
 typedef std::unordered_map<resource_key_t, resource_info_t, resource_key_hash> resource_cache_t;
 resource_cache_t g_Cxbx_Cached_Direct3DResources;
 resource_cache_t g_Cxbx_Cached_PaletizedTextures;
+
+// Render-target-to-texture aliasing resolution map.
+// Xbox NV2A uses unified memory: the same physical address can be a render target surface
+// AND a texture sampler source. The host D3D9 resource cache keys include the resource type
+// (SURFACE vs TEXTURE), so these map to separate host resources. When the game renders to
+// a surface then reads the same address as a texture, the TEXTURE host resource is stale.
+// This map stores the host backing texture (via GetContainer on the RT surface) for each
+// RT Data address, so CxbxUpdateHostTextures can use the correct, GPU-rendered texture.
+static std::unordered_map<xbox::addr_xt, Microsoft::WRL::ComPtr<IDirect3DBaseTexture>> g_RTDataToHostTexture;
+// Generation counter incremented every time g_RTDataToHostTexture is modified.
+// CxbxUpdateHostTextures uses this to invalidate its per-stage fast-path cache.
+static uint32_t g_RTAliasGeneration = 0;
+
+// 1x1 transparent (RGBA=0,0,0,0) texture used as default for unbound texture stages.
+// In D3D9, an unbound sampler returns (1,1,1,1) = white. On Xbox NV2A, it returns (0,0,0,0).
+// Binding this texture to all stages by default prevents white artifacts from the mismatch.
+static IDirect3DTexture9* g_pDefaultTransparentTexture = nullptr;
+
+// Resolve texture for "self-sampling" workaround.
+// D3D9 cannot sample from a texture that's also the current render target.
+// On Xbox NV2A with unified memory, this works. When we detect this case,
+// we StretchRect the RT content to this resolve texture and bind it instead.
+static IDirect3DTexture9* g_pRTResolveTexture = nullptr;
+static IDirect3DSurface9* g_pRTResolveSurface = nullptr;
+static UINT g_RTResolveWidth = 0;
+static UINT g_RTResolveHeight = 0;
 
 // Pool of D3DPOOL_SYSTEMMEM staging surfaces reused across CreateHostResource calls.
 // Keyed by (width | (height << 16)) ^ (format * 0x9e3779b9) to avoid per-upload driver allocation.
@@ -2289,6 +2321,24 @@ static void CreateDefaultD3D9Device
     }
 
     DrawInitialBlackScreen();
+
+    // Create a 1x1 transparent texture for use as default on unbound texture stages.
+    // D3D9 returns (1,1,1,1) white for unbound samplers; Xbox NV2A returns (0,0,0,0).
+    {
+        hr = g_pD3DDevice->CreateTexture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
+            &g_pDefaultTransparentTexture, nullptr);
+        if (SUCCEEDED(hr)) {
+            D3DLOCKED_RECT lr;
+            if (SUCCEEDED(g_pDefaultTransparentTexture->LockRect(0, &lr, nullptr, 0))) {
+                *(DWORD*)lr.pBits = 0x00000000; // ARGB = fully transparent black
+                g_pDefaultTransparentTexture->UnlockRect(0);
+            }
+            // Bind to all texture stages as default
+            for (int i = 0; i < 4; i++) {
+                g_pD3DDevice->SetTexture(i, g_pDefaultTransparentTexture);
+            }
+        }
+    }
 
     // Set up cache
     g_VertexShaderCache.ResetD3DDevice(g_pD3DDevice);
@@ -5304,6 +5354,7 @@ xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap)
 	LOG_FUNC_ONE_ARG(Flags);
 	PerfTrace_OnSwapBegin(); // prints previous frame, resets accumulators, starts swap timer
 	RenderTrace_OnSwapBegin();
+	nv2a_const_diag_new_frame();
 
 	// Handle swap flags
 	// We don't maintain a swap chain, and draw everything to backbuffer 0
@@ -5346,9 +5397,13 @@ xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap)
 	const bool tracedHadOverlay = (g_OverlayProxy.Surface.Common != 0);
 	HRESULT tracedBlitResult = S_FALSE;
 	HRESULT getBackBufferResult = S_FALSE;
-	HRESULT hRet = g_pD3DDevice->GetBackBuffer(
-		0, // iSwapChain
-		0, D3DBACKBUFFER_TYPE_MONO, &pCurrentHostBackBuffer);
+	HRESULT hRet = D3D_OK;
+	{
+		PERF_SCOPE(PERF_CAT_GET_BACKBUFFER);
+		hRet = g_pD3DDevice->GetBackBuffer(
+			0, // iSwapChain
+			0, D3DBACKBUFFER_TYPE_MONO, &pCurrentHostBackBuffer);
+	}
 	getBackBufferResult = hRet;
 
 	DEBUG_D3DRESULT(hRet, "g_pD3DDevice->GetBackBuffer - Unable to get backbuffer surface!");
@@ -5589,7 +5644,10 @@ xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap)
 		tracedBlitResult,
 		tracedHadOverlay);
 
-	g_pD3DDevice->EndScene();
+	{
+		PERF_SCOPE(PERF_CAT_ENDSCENE);
+		g_pD3DDevice->EndScene();
+	}
 
 	{
 		PERF_SCOPE(PERF_CAT_PRESENT);
@@ -5635,7 +5693,10 @@ xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap)
         auto frameMs = (1000.0 / targetRefreshRate) * multiplier;
         auto targetDuration = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double, std::milli>(frameMs));
         auto targetTimestamp = frameStartTime + targetDuration;
-        SleepPrecise(targetTimestamp);
+		{
+			PERF_SCOPE(PERF_CAT_FRAME_SLEEP);
+			SleepPrecise(targetTimestamp);
+		}
     }
 
     frameStartTime = std::chrono::steady_clock::now();
@@ -6994,6 +7055,19 @@ xbox::void_xt __fastcall xbox::EMUPATCH(D3DDevice_SetRenderState_Simple)
     g_FFNonTransformDirty = true;
 }
 
+// Flag: set when DMA_PUT advances and there may be unprocessed Xbox push-buffer work.
+// Cleared only after CxbxUpdateHostVertexShaderConstants performs the proven PFIFO drain.
+bool g_XboxPushBufferSubmissionPending = true;
+
+// Flag: set when push-buffer work was already submitted earlier in
+// UpdateNativeD3DResources. This lets PFIFO run in parallel while the CPU
+// updates the rest of the host state.
+static bool g_XboxPushBufferPrimed = false;
+
+// Flag: set when ANY vertex shader constant is dirtied (HLE or LLE path).
+// When clear, the snapshot+upload block can be skipped entirely.
+extern bool g_VshConstantsDirtyAny;
+
 void CxbxImpl_SetTransform
 (
     xbox::X_D3DTRANSFORMSTATETYPE State,
@@ -8338,6 +8412,8 @@ static CxbxRenderTraceDiffuseColorBounds CxbxRenderTraceComputeDiffuseColorBound
 	return bounds;
 }
 
+static inline void CxbxPrepareHostDrawVertexShaderConstants();
+
 // Requires assigned pXboxIndexData
 // Called by D3DDevice_DrawIndexedVertices and EmuExecutePushBufferRaw (twice)
 void CxbxDrawIndexed(CxbxDrawContext &DrawContext)
@@ -8377,6 +8453,7 @@ void CxbxDrawIndexed(CxbxDrawContext &DrawContext)
 
 	// See https://docs.microsoft.com/en-us/windows/win32/direct3d9/rendering-from-vertex-and-index-buffers
 	// for an explanation on the function of the BaseVertexIndex, MinVertexIndex, NumVertices and StartIndex arguments.
+	CxbxPrepareHostDrawVertexShaderConstants();
 	HRESULT hRet = g_pD3DDevice->DrawIndexedPrimitive(
 		/* PrimitiveType = */EmuXB2PC_D3DPrimitiveType(DrawContext.XboxPrimitiveType),
 		/* BaseVertexIndex, = */-CacheEntry.LowIndex, // Base vertex index has been accounted for in the stream conversion, now we need to "un-offset" the index buffer
@@ -8432,6 +8509,7 @@ void CxbxDrawPrimitiveUP(CxbxDrawContext &DrawContext)
 		UINT PrimitiveCount = DrawContext.dwHostPrimitiveCount * TRIANGLES_PER_QUAD;
 
 		// Draw indexed triangles instead of quads
+		CxbxPrepareHostDrawVertexShaderConstants();
 		HRESULT hRet = g_pD3DDevice->DrawIndexedPrimitiveUP(
 			/*PrimitiveType=*/D3DPT_TRIANGLELIST,
 			/*MinVertexIndex=*/0, // Always 0 for converted quadlist data
@@ -8502,6 +8580,7 @@ void CxbxDrawPrimitiveUP(CxbxDrawContext &DrawContext)
 	}
 	else {
 		// Primitives other than X_D3DPT_QUADLIST can be drawn using one DrawPrimitiveUP call :
+		CxbxPrepareHostDrawVertexShaderConstants();
 		HRESULT hRet = g_pD3DDevice->DrawPrimitiveUP(
 			EmuXB2PC_D3DPrimitiveType(DrawContext.XboxPrimitiveType),
 			DrawContext.dwHostPrimitiveCount,
@@ -8577,6 +8656,44 @@ void CxbxDrawPrimitiveUP(CxbxDrawContext &DrawContext)
 	}
 }
 
+// Resolve the current render target to a separate texture so it can be sampled.
+// D3D9 forbids sampling from a texture that's also the active RT. Xbox NV2A allows it.
+// Returns the resolve texture (valid only until the next call), or nullptr on failure.
+static IDirect3DBaseTexture* ResolveCurrentRTForSampling()
+{
+	IDirect3DSurface9* pCurrentRT = nullptr;
+	HRESULT hr = g_pD3DDevice->GetRenderTarget(0, &pCurrentRT);
+	if (FAILED(hr) || !pCurrentRT) return nullptr;
+
+	D3DSURFACE_DESC rtDesc;
+	pCurrentRT->GetDesc(&rtDesc);
+
+	// (Re)create the resolve texture if dimensions changed
+	if (!g_pRTResolveTexture || g_RTResolveWidth != rtDesc.Width || g_RTResolveHeight != rtDesc.Height) {
+		if (g_pRTResolveSurface) { g_pRTResolveSurface->Release(); g_pRTResolveSurface = nullptr; }
+		if (g_pRTResolveTexture) { g_pRTResolveTexture->Release(); g_pRTResolveTexture = nullptr; }
+
+		hr = g_pD3DDevice->CreateTexture(rtDesc.Width, rtDesc.Height, 1,
+			D3DUSAGE_RENDERTARGET, rtDesc.Format, D3DPOOL_DEFAULT,
+			&g_pRTResolveTexture, nullptr);
+		if (SUCCEEDED(hr)) {
+			g_pRTResolveTexture->GetSurfaceLevel(0, &g_pRTResolveSurface);
+			g_RTResolveWidth = rtDesc.Width;
+			g_RTResolveHeight = rtDesc.Height;
+		} else {
+			pCurrentRT->Release();
+			return nullptr;
+		}
+	}
+
+	// Copy RT content to the resolve texture
+	hr = g_pD3DDevice->StretchRect(pCurrentRT, nullptr, g_pRTResolveSurface, nullptr, D3DTEXF_NONE);
+	pCurrentRT->Release();
+	if (FAILED(hr)) return nullptr;
+
+	return g_pRTResolveTexture;
+}
+
 IDirect3DBaseTexture* CxbxConvertXboxSurfaceToHostTexture(xbox::X_D3DBaseTexture* pBaseTexture)
 {
 	LOG_INIT; // Allows use of DEBUG_D3DRESULT
@@ -8611,6 +8728,18 @@ void CxbxUpdateHostTextures()
 	static xbox::X_D3DBaseTexture* s_lastXboxTexture[xbox::X_D3DTS_STAGECOUNT] = {};
 	static xbox::addr_xt s_lastXboxTextureData[xbox::X_D3DTS_STAGECOUNT] = {};
 	static bool s_haveTracedTextureState[xbox::X_D3DTS_STAGECOUNT] = {};
+	static uint32_t s_lastRTAliasGeneration = 0;
+
+	// When the RT alias map is updated (new render target registered), invalidate all
+	// cached texture bindings so they re-evaluate through the RT aliasing path.
+	if (s_lastRTAliasGeneration != g_RTAliasGeneration) {
+		s_lastRTAliasGeneration = g_RTAliasGeneration;
+		for (int i = 0; i < xbox::X_D3DTS_STAGECOUNT; i++) {
+			s_lastXboxTexture[i] = nullptr;
+			s_lastXboxTextureData[i] = 0;
+			s_lastHostTexture[i] = nullptr;
+		}
+	}
 
 	auto recordTextureBinding = [&](int stage, xbox::X_D3DBaseTexture* pXboxBaseTexture, xbox::addr_xt xboxData, IDirect3DBaseTexture* pHostBaseTexture) {
 		if (!g_RenderTraceEnabled || stage >= 2) {
@@ -8693,6 +8822,27 @@ void CxbxUpdateHostTextures()
 			switch (XboxResourceType) {
 			case X_D3DCOMMON_TYPE_TEXTURE:
 				pHostBaseTexture = GetHostBaseTexture(pXboxBaseTexture, /*D3DUsage=*/0, stage);
+				// Resolve render-target-to-texture aliasing: if this texture's Data address
+				// was used as a render target surface, use the RT's backing texture instead.
+				// This handles Xbox unified memory where the same physical address can be
+				// both an RT surface and a texture sampler source (e.g. post-processing effects).
+				if (xboxData != 0) {
+					auto rtIt = g_RTDataToHostTexture.find(xboxData);
+					if (rtIt != g_RTDataToHostTexture.end() && rtIt->second.Get() != nullptr) {
+						pHostBaseTexture = rtIt->second.Get();
+					}
+				}
+				// D3D9 cannot sample from a texture that's also the current render target.
+				// Xbox NV2A can (unified memory). Detect and resolve by copying RT to a
+				// separate texture. Check if the texture we're about to bind is the current
+				// RT's backing texture, OR if the Xbox Data address matches the current RT.
+				if (pHostBaseTexture != nullptr && g_pXbox_RenderTarget != xbox::zeroptr
+					&& xboxData != 0 && xboxData == (xbox::addr_xt)g_pXbox_RenderTarget->Data) {
+					auto pResolved = ResolveCurrentRTForSampling();
+					if (pResolved) {
+						pHostBaseTexture = pResolved;
+					}
+				}
 				break;
 			case X_D3DCOMMON_TYPE_SURFACE:
 				// Surfaces can be set in the texture stages, instead of textures
@@ -8708,7 +8858,7 @@ void CxbxUpdateHostTextures()
 			}
 		}
 
-		HRESULT hRet = g_pD3DDevice->SetTexture(stage, pHostBaseTexture);
+		HRESULT hRet = g_pD3DDevice->SetTexture(stage, pHostBaseTexture ? pHostBaseTexture : (IDirect3DBaseTexture*)g_pDefaultTransparentTexture);
 		DEBUG_D3DRESULT(hRet, "g_pD3DDevice->SetTexture");
 		recordTextureBinding(stage, pXboxBaseTexture, xboxData, pHostBaseTexture);
 		s_lastHostTexture[stage] = pHostBaseTexture;
@@ -8837,14 +8987,123 @@ void CxbxUpdateDirtyVertexShaderConstants(const float* constants, bool* dirty) {
 
 	// Send the final batch
 	if (batchStartIndex != -1) {
-		int count = X_D3DVS_CONSTREG_COUNT - batchStartIndex + 1;
+		int count = X_D3DVS_CONSTREG_COUNT - batchStartIndex;
 		g_pD3DDevice->SetVertexShaderConstantF(batchStartIndex, &constants[batchStartIndex * 4], count);
 	}
 }
 
 extern float* HLE_get_NV2A_vertex_constant_float4_ptr(unsigned const_index); // TMP glue
+extern bool g_ActiveXboxVertexShaderUsesIndexedBoneConstants;
+extern bool nv2a_pfifo_consume_pending_kicks(struct NV2AState *d, bool *outHasMorePending,
+	                                          bool *outReachedDrawBoundary,
+	                                          bool *outSawNonConstantMethods,
+	                                          bool *outParseStateReliable,
+	                                          uint32_t *outFirstNonConstantMethod);
+extern void nv2a_overlay_parsed_constants(float *local_constants);
+extern void nv2a_copy_parsed_constants(uint32_t *outConstants, uint8_t *outDirtyMask);
+extern void nv2a_pfifo_discard_pending_kicks();
+extern void nv2a_pfifo_get_pending_dma_debug(uint32_t *outCurrentDepth,
+	uint32_t *outHighWater,
+	uint32_t *outOverflowCount);
+extern void nv2a_const_diag_new_frame();
+extern void nv2a_const_diag_next_draw();
+extern int nv2a_const_diag_get_frame();
+extern int nv2a_const_diag_get_draw();
 // TODO : Once we're able to flush the NV2A push buffer
 // remove our patches on D3DDevice_SetVertexShaderConstant (and CxbxImpl_SetVertexShaderConstant)
+bool g_VshConstantsDirtyAny = true; // Start true to force first upload
+bool g_VshConstantsDirtyHLE = true; // Set ONLY by HLE paths (bypasses PFIFO suppression)
+
+static inline void CxbxRecordPFIFOPendingDebug()
+{
+	if (!g_PerfTraceEnabled) {
+		return;
+	}
+
+	uint32_t pendingDepth = 0;
+	uint32_t pendingHighWater = 0;
+	uint32_t pendingOverflowCount = 0;
+	nv2a_pfifo_get_pending_dma_debug(
+		&pendingDepth,
+		&pendingHighWater,
+		&pendingOverflowCount);
+	PerfTrace_RecordPFIFOPending(
+		pendingDepth,
+		pendingHighWater,
+		pendingOverflowCount);
+}
+
+// Flush the Xbox push buffer by calling CDevice_KickOff.
+// This advances NV_USER_DMA_PUT so PFIFO starts processing pending commands.
+// Safe to call multiple times (no-op if nothing new to flush).
+static bool CxbxKickOffXboxPushBuffer()
+{
+	enum KickOffType { KO_THISCALL_ECX = 0, KO_STDCALL_STACK = 1, KO_LTCG_EDX = 2, KO_LTCG_EAX = 3, KO_NONE = -1 };
+	static bool s_resolved = false;
+	static void* s_kickoff_addr = nullptr;
+	static KickOffType s_kickoff_type = KO_NONE;
+	static xbox::dword_xt* s_ppDevice = nullptr;
+
+	if (!s_resolved) {
+		s_resolved = true;
+		struct { const char* name; KickOffType type; } variants[] = {
+			{ "CDevice_KickOff",              KO_THISCALL_ECX },
+			{ "CDevice_KickOff_4",            KO_STDCALL_STACK },
+			{ "CDevice_KickOff_0__LTCG_edx1", KO_LTCG_EDX },
+			{ "CDevice_KickOff_0__LTCG_eax1", KO_LTCG_EAX },
+		};
+		for (auto& v : variants) {
+			s_kickoff_addr = GetXboxSymbolPointer(v.name);
+			if (s_kickoff_addr) {
+				s_kickoff_type = v.type;
+				EmuLog(LOG_LEVEL::DEBUG, "KickOff resolved: %s at 0x%08X (type %d)", v.name, (DWORD)s_kickoff_addr, (int)v.type);
+				break;
+			}
+		}
+		auto pDevGlobal = GetXboxSymbolPointer("D3D_g_pDevice");
+		if (pDevGlobal) {
+			s_ppDevice = (xbox::dword_xt*)pDevGlobal;
+		}
+	}
+
+	if (s_kickoff_addr && s_ppDevice && *s_ppDevice) {
+		auto d = g_NV2A->GetDeviceState();
+		uint32_t oldDmaPut = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT];
+		DWORD pDev = *s_ppDevice;
+		DWORD kickAddr = (DWORD)s_kickoff_addr;
+		switch (s_kickoff_type) {
+		case KO_THISCALL_ECX:
+			__asm {
+				mov ecx, pDev
+				call kickAddr
+			}
+			break;
+		case KO_STDCALL_STACK: {
+			typedef void (__stdcall *tKickOff)(DWORD);
+			((tKickOff)kickAddr)(pDev);
+			break;
+		}
+		case KO_LTCG_EDX:
+			__asm {
+				mov edx, pDev
+				call kickAddr
+			}
+			break;
+		case KO_LTCG_EAX:
+			__asm {
+				mov eax, pDev
+				call kickAddr
+			}
+			break;
+		default:
+			break;
+		}
+		return d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT] != oldDmaPut;
+	}
+
+	return false;
+}
+
 void CxbxUpdateHostVertexShaderConstants()
 {
 	// For Xbox vertex shader programs, the Xbox vertex shader constants
@@ -8864,21 +9123,200 @@ void CxbxUpdateHostVertexShaderConstants()
 	}
 	else {
 		// Write Xbox constants
-		auto pg = &(g_NV2A->GetDeviceState()->pgraph);
-		auto constant_floats = (float*)pg->vsh_constants;
+		auto d = g_NV2A->GetDeviceState();
+		auto pg = &(d->pgraph);
+		nv2a_const_diag_next_draw();
+		NV2AConstDumpRecord pendingConstDump = {};
+		bool needsPushBufferSync = g_XboxPushBufferSubmissionPending;
+		bool activeShaderNeedsIndexedBoneSync = g_ActiveXboxVertexShaderUsesIndexedBoneConstants;
+		bool parsedPendingConstants = false;
+		bool parsedPendingSawNonConstantMethods = false;
+		bool pendingParseStateReliable = true;
+		bool hasMorePendingPushBufferWork = false;
+		bool reachedCurrentDrawBoundary = false;
+		bool mustDrainPushBuffer = false;
+		bool captureConstDump = false;
+		bool kickoffSubmittedWork = false;
+		uint32_t kickDrainReasonMask = 0;
+		uint32_t firstNonConstantMethod = 0xFFFFFFFFu;
 
-		if (isXboxConstants) {
-			// Only need to overwrite what's changed
-			CxbxUpdateDirtyVertexShaderConstants(constant_floats, pg->vsh_constants_dirty);
-		}
-		else {
-			// We need to update everything
-			g_pD3DDevice->SetVertexShaderConstantF(0, constant_floats, X_D3DVS_CONSTREG_COUNT);
+		if (needsPushBufferSync) {
+			if (!activeShaderNeedsIndexedBoneSync) {
+				nv2a_pfifo_discard_pending_kicks();
+				g_XboxPushBufferSubmissionPending = false;
+			}
+			else {
+				PERF_SCOPE(PERF_CAT_VS_BONE_SYNC);
+				parsedPendingConstants = nv2a_pfifo_consume_pending_kicks(
+					d,
+					&hasMorePendingPushBufferWork,
+					&reachedCurrentDrawBoundary,
+					&parsedPendingSawNonConstantMethods,
+					&pendingParseStateReliable,
+					&firstNonConstantMethod);
+				g_XboxPushBufferSubmissionPending = hasMorePendingPushBufferWork;
+				mustDrainPushBuffer =
+					(!pendingParseStateReliable || parsedPendingConstants) && !reachedCurrentDrawBoundary;
+				if (mustDrainPushBuffer
+					&& pendingParseStateReliable
+					&& parsedPendingConstants
+					&& !hasMorePendingPushBufferWork
+					&& !parsedPendingSawNonConstantMethods) {
+					// Only skip the drain when the parser state is anchored to the
+					// exact DMA_GET position and the pending range is constants plus
+					// methods already mirrored synchronously by the HLE patches.
+					mustDrainPushBuffer = false;
+				}
+				if (mustDrainPushBuffer) {
+					if (!pendingParseStateReliable) {
+						kickDrainReasonMask |= PERF_VS_KICKDRAIN_REASON_UNRELIABLE_PARSE;
+					}
+					if (hasMorePendingPushBufferWork) {
+						kickDrainReasonMask |= PERF_VS_KICKDRAIN_REASON_MORE_PENDING;
+					}
+					if (parsedPendingSawNonConstantMethods) {
+						kickDrainReasonMask |= PERF_VS_KICKDRAIN_REASON_NON_CONSTANT;
+					}
+					if (parsedPendingConstants) {
+						kickDrainReasonMask |= PERF_VS_KICKDRAIN_REASON_PARSED_CONSTANTS;
+					}
+					if (parsedPendingSawNonConstantMethods && firstNonConstantMethod != 0xFFFFFFFFu) {
+						PerfTrace_RecordVSKickDrainBlockerMethod(firstNonConstantMethod);
+					}
+				}
+				if (parsedPendingConstants
+					&& mustDrainPushBuffer
+					&& pendingParseStateReliable
+					&& !hasMorePendingPushBufferWork
+					&& !reachedCurrentDrawBoundary
+					&& NV2AConstDumpCaptureEnabled()) {
+					pendingConstDump.frame_number = static_cast<uint32_t>(nv2a_const_diag_get_frame());
+					pendingConstDump.draw_number = static_cast<uint32_t>(nv2a_const_diag_get_draw());
+					pendingConstDump.flags = NV2A_CONST_DUMP_FLAG_PARSED_PENDING_CONSTANTS;
+					if (!g_XboxPushBufferPrimed) {
+						pendingConstDump.flags |= NV2A_CONST_DUMP_FLAG_PUSHBUFFER_NOT_PRIMED;
+					}
+					if (hasMorePendingPushBufferWork) {
+						pendingConstDump.flags |= NV2A_CONST_DUMP_FLAG_HAS_MORE_PENDING;
+					}
+					if (reachedCurrentDrawBoundary) {
+						pendingConstDump.flags |= NV2A_CONST_DUMP_FLAG_REACHED_DRAW_BOUNDARY;
+					}
+					if (parsedPendingSawNonConstantMethods) {
+						pendingConstDump.flags |= NV2A_CONST_DUMP_FLAG_SAW_NON_CONSTANT_METHODS;
+					}
+					nv2a_copy_parsed_constants(
+						pendingConstDump.parsed_constants.data(),
+						pendingConstDump.dirty_mask.data());
+					captureConstDump = true;
+				}
+			}
 		}
 
-		// We've written the Xbox constants
-		isXboxConstants = true;
-		g_FFRestInvalid = true; // GPU constants now hold Xbox data, not FF state
+		if (mustDrainPushBuffer) {
+			// Fall back to the proven drain when the pending DMA ranges cannot be
+			// matched cleanly to the current draw.
+			{
+				LARGE_INTEGER kickDrainStart = {};
+				if (g_PerfTraceEnabled) {
+					QueryPerformanceCounter(&kickDrainStart);
+				}
+				PERF_SCOPE(PERF_CAT_VS_KICKDRAIN);
+				if (!g_XboxPushBufferPrimed) {
+					kickoffSubmittedWork = CxbxKickOffXboxPushBuffer();
+				}
+
+				uint32_t *pf_regs = d->pfifo.regs;
+				while (pf_regs[NV_PFIFO_CACHE1_DMA_GET] != pf_regs[NV_PFIFO_CACHE1_DMA_PUT]
+					|| !(pf_regs[NV_PFIFO_CACHE1_STATUS] & NV_PFIFO_CACHE1_STATUS_LOW_MARK)) {
+					SwitchToThread();
+				}
+				if (g_PerfTraceEnabled) {
+					LARGE_INTEGER kickDrainEnd;
+					QueryPerformanceCounter(&kickDrainEnd);
+					PerfTrace_RecordVSKickDrain(
+						g_ActiveXboxVertexShaderKey,
+						static_cast<uint32_t>(g_Xbox_VertexShader_Handle),
+						g_ActiveXboxVertexShaderCacheHash,
+						kickDrainEnd.QuadPart - kickDrainStart.QuadPart,
+						kickDrainReasonMask);
+				}
+			}
+			nv2a_pfifo_discard_pending_kicks();
+			g_XboxPushBufferSubmissionPending = false;
+		}
+		if (captureConstDump) {
+			if (kickoffSubmittedWork) {
+				pendingConstDump.flags |= NV2A_CONST_DUMP_FLAG_KICKOFF_SUBMITTED_WORK;
+			}
+			qemu_mutex_lock(&pg->pgraph_lock);
+			memcpy(pendingConstDump.gold_constants.data(), pg->vsh_constants, sizeof(pg->vsh_constants));
+			qemu_mutex_unlock(&pg->pgraph_lock);
+			if (NV2AConstDumpFirstMismatchSlot(pendingConstDump) >= 0) {
+				NV2AConstDumpAppend(pendingConstDump);
+			}
+		}
+		g_XboxPushBufferPrimed = false;
+		CxbxRecordPFIFOPendingDebug();
+
+		auto uploadXboxVertexShaderConstants = [&]() {
+			g_VshConstantsDirtyAny = false;
+			g_VshConstantsDirtyHLE = false;
+
+			float local_constants[X_D3DVS_CONSTREG_COUNT * 4];
+			qemu_mutex_lock(&pg->pgraph_lock);
+			memcpy(local_constants, pg->vsh_constants, sizeof(local_constants));
+			memset(pg->vsh_constants_dirty, 0, sizeof(pg->vsh_constants_dirty));
+			qemu_mutex_unlock(&pg->pgraph_lock);
+				if (parsedPendingConstants && pendingParseStateReliable) {
+				PERF_SCOPE(PERF_CAT_VS_BONE_SYNC);
+				nv2a_overlay_parsed_constants(local_constants);
+			}
+
+			// Upload only constants that changed since the last upload.
+			{
+				static float s_lastUploaded[X_D3DVS_CONSTREG_COUNT * 4];
+				static bool s_cacheValid = false;
+				if (!isXboxConstants)
+					s_cacheValid = false;
+				if (!s_cacheValid) {
+					g_pD3DDevice->SetVertexShaderConstantF(0, local_constants, X_D3DVS_CONSTREG_COUNT);
+					memcpy(s_lastUploaded, local_constants, sizeof(s_lastUploaded));
+					s_cacheValid = true;
+				} else {
+					int batchStart = -1;
+					for (int i = 0; i <= X_D3DVS_CONSTREG_COUNT; i++) {
+						bool changed = (i < X_D3DVS_CONSTREG_COUNT) &&
+							memcmp(&local_constants[i * 4], &s_lastUploaded[i * 4], 4 * sizeof(float)) != 0;
+						if (changed && batchStart < 0) {
+							batchStart = i;
+						}
+						if (!changed && batchStart >= 0) {
+							int count = i - batchStart;
+							g_pD3DDevice->SetVertexShaderConstantF(batchStart, &local_constants[batchStart * 4], count);
+							memcpy(&s_lastUploaded[batchStart * 4], &local_constants[batchStart * 4], count * 4 * sizeof(float));
+							batchStart = -1;
+						}
+					}
+				}
+			}
+			// We've written the Xbox constants
+			isXboxConstants = true;
+			g_FFRestInvalid = true; // GPU constants now hold Xbox data, not FF state
+		};
+
+		// Upload only when constants changed, when pending DMA parsing found new
+		// constants for this draw, or when switching back to Xbox constants.
+		if (g_VshConstantsDirtyAny || g_VshConstantsDirtyHLE || parsedPendingConstants || !isXboxConstants) {
+			PERF_SCOPE(PERF_CAT_VS_UPLOAD);
+			if (activeShaderNeedsIndexedBoneSync) {
+				PERF_SCOPE(PERF_CAT_VS_BONE_UPLOAD);
+				uploadXboxVertexShaderConstants();
+			}
+			else {
+				uploadXboxVertexShaderConstants();
+			}
+		} // end drain + snapshot + upload block
 
 		// FIXME our viewport constants don't match Xbox values
 		// If we write them to pgraph constants, like we do with constants set by the title,
@@ -8902,6 +9340,11 @@ void CxbxUpdateHostVertexShaderConstants()
 		memcpy(s_lastFogStuff, fogStuff, sizeof(fogStuff));
 		g_pD3DDevice->SetVertexShaderConstantF(CXBX_D3DVS_CONSTREG_FOGINFO, fogStuff, 1);
 	}
+}
+
+static inline void CxbxPrepareHostDrawVertexShaderConstants()
+{
+	CxbxUpdateHostVertexShaderConstants();
 }
 
 void CxbxUpdateHostViewport() {
@@ -9025,14 +9468,24 @@ extern void CxbxUpdateHostVertexShader(); // TMP glue
 void CxbxUpdateNativeD3DResources()
 {
 	PERF_SCOPE(PERF_CAT_UPDATE_NATIVE);
+	g_XboxPushBufferPrimed = false;
+	bool usesXboxVertexConstants =
+		!(g_Xbox_VertexShaderMode == VertexShaderMode::FixedFunction && g_UseFixedFunctionVertexShader);
 	{
 		PERF_SCOPE(PERF_CAT_VTX_DECL);
 		{ PERF_SCOPE(PERF_CAT_VS_DECL); CxbxUpdateHostVertexDeclaration(); }
-		{ PERF_SCOPE(PERF_CAT_VS_CONST); CxbxUpdateHostVertexShaderConstants(); }
 		{ PERF_SCOPE(PERF_CAT_VIEWPORT); CxbxUpdateHostViewport(); }
 	}
 
 	CxbxUpdateHostVertexShader();
+	if (usesXboxVertexConstants && g_ActiveXboxVertexShaderUsesIndexedBoneConstants) {
+		bool hadPendingPushBufferWork = g_XboxPushBufferSubmissionPending;
+		bool kickoffSubmittedPushBufferWork = CxbxKickOffXboxPushBuffer();
+		g_XboxPushBufferSubmissionPending =
+			g_XboxPushBufferSubmissionPending || kickoffSubmittedPushBufferWork;
+		g_XboxPushBufferPrimed =
+			hadPendingPushBufferWork || kickoffSubmittedPushBufferWork;
+	}
 
 	// NOTE: Order is important here
     // Some Texture States depend on RenderState values (Point Sprites)
@@ -9046,7 +9499,6 @@ void CxbxUpdateNativeD3DResources()
     if (!g_DisablePixelShaders) {
         DxbxUpdateActivePixelShader();
     }
-
 
 /* TODO : Port these :
 	DxbxUpdateDeferredStates(); // BeginPush sample shows us that this must come *after* texture update!
@@ -9244,9 +9696,6 @@ __declspec(naked) xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_SetPixelShader_0
         ret
     }
 }
-
-// ******************************************************************
-// * patch: D3DDevice_SetPixelShader
 // ******************************************************************
 xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_SetPixelShader)
 (
@@ -9393,6 +9842,7 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_DrawVertices)
 			// See https://docs.microsoft.com/en-us/windows/win32/direct3d9/rendering-from-vertex-and-index-buffers
 			// for an explanation on the function of the BaseVertexIndex, MinVertexIndex, NumVertices and StartIndex arguments.
 			// Emulate drawing quads by drawing each quad with two indexed triangles :
+			CxbxPrepareHostDrawVertexShaderConstants();
 			HRESULT hRet = g_pD3DDevice->DrawIndexedPrimitive(
 				/*PrimitiveType=*/D3DPT_TRIANGLELIST,
 				/*BaseVertexIndex=*/0, // Base vertex index has been accounted for in the stream conversion
@@ -9408,6 +9858,7 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_DrawVertices)
 		}
 		else {
 			// if (StartVertex > 0) LOG_TEST_CASE("StartVertex > 0 (non-quad)"); // Verified test case : XDK Sample (PlayField)
+			CxbxPrepareHostDrawVertexShaderConstants();
 			HRESULT hRet = g_pD3DDevice->DrawPrimitive(
 				EmuXB2PC_D3DPrimitiveType(DrawContext.XboxPrimitiveType),
 				/*StartVertex=*/0, // Start vertex has been accounted for in the stream conversion
@@ -9601,6 +10052,7 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_DrawIndexedVerticesUP)
 			pHostIndexData = pXboxIndexData;
 		}
 
+		CxbxPrepareHostDrawVertexShaderConstants();
 		HRESULT hRet = g_pD3DDevice->DrawIndexedPrimitiveUP(
 			/*PrimitiveType=*/EmuXB2PC_D3DPrimitiveType(DrawContext.XboxPrimitiveType),
 			/*MinVertexIndex=*/DrawContext.LowIndex,
@@ -9880,6 +10332,26 @@ static void CxbxImpl_SetRenderTarget
 	CxbxImpl_SetViewport(&defaultViewport);
 
 	pHostRenderTarget = GetHostSurface(pRenderTarget, D3DUSAGE_RENDERTARGET);
+
+	// Track this render target's Data address for texture aliasing resolution.
+	// When the game later binds a TEXTURE at the same Data address, we can resolve
+	// to this RT's host backing texture instead of the stale TEXTURE cache entry.
+	if (pRenderTarget != xbox::zeroptr && pRenderTarget->Data != xbox::zero && pHostRenderTarget != nullptr) {
+		Microsoft::WRL::ComPtr<IDirect3DBaseTexture> pBackingTexture;
+		if (SUCCEEDED(pHostRenderTarget->GetContainer(IID_IDirect3DTexture9, (void**)pBackingTexture.GetAddressOf()))) {
+			auto dataAddr = (xbox::addr_xt)pRenderTarget->Data;
+			auto it = g_RTDataToHostTexture.find(dataAddr);
+			if (it == g_RTDataToHostTexture.end() || it->second.Get() != pBackingTexture.Get()) {
+				g_RTDataToHostTexture[dataAddr] = pBackingTexture;
+				g_RTAliasGeneration++;
+				EmuLog(LOG_LEVEL::DEBUG, "RT alias registered: Data=0x%08X hostTex=%p gen=%u (total=%zu)",
+					dataAddr, pBackingTexture.Get(), g_RTAliasGeneration, g_RTDataToHostTexture.size());
+			}
+		} else {
+			EmuLog(LOG_LEVEL::DEBUG, "RT alias FAILED GetContainer: Data=0x%08X hostSrf=%p",
+				(xbox::addr_xt)pRenderTarget->Data, pHostRenderTarget);
+		}
+	}
 
 	// The currenct depth stencil is always replaced by whats passed in here (even a null)
 	g_pXbox_DepthStencil = pNewZStencil;
@@ -10508,6 +10980,7 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(D3DDevice_DrawRectPatch)
 		LOG_FUNC_END;
 
 	CxbxUpdateNativeD3DResources();
+	CxbxPrepareHostDrawVertexShaderConstants();
 
 	HRESULT hRet = g_pD3DDevice->DrawRectPatch( Handle, pNumSegs, pRectPatchInfo );
 	DEBUG_D3DRESULT(hRet, "g_pD3DDevice->DrawRectPatch");
@@ -10532,6 +11005,7 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(D3DDevice_DrawTriPatch)
 		LOG_FUNC_END;
 
 	CxbxUpdateNativeD3DResources();
+	CxbxPrepareHostDrawVertexShaderConstants();
 
 	HRESULT hRet = g_pD3DDevice->DrawTriPatch(Handle, pNumSegs, pTriPatchInfo);
 	DEBUG_D3DRESULT(hRet, "g_pD3DDevice->DrawTriPatch");
