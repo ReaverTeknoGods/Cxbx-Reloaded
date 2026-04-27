@@ -33,6 +33,8 @@
 #include "core\hle\D3D8\Direct3D9/Direct3D9.h"
 #include "core\hle\JVS\JVS.h"
 #include "core\hle\DSOUND\DirectSound\DirectSound.hpp"
+#include "core\hle\Patches\ChihiroPatches.h"
+#include "devices\chihiro\JvsIo.h"
 #include "Patches.hpp"
 #include "Intercept.hpp"
 
@@ -518,16 +520,6 @@ inline void EmuInstallPatch(const std::string FunctionName, const xbox::addr_xt 
 	
 }
 
-// Write NOP bytes over a range of guest virtual addresses, bypassing write protection.
-static void EmuNopPatch(uintptr_t addr, size_t len)
-{
-	DWORD oldProtect;
-	if (VirtualProtect((void*)addr, len, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-		memset((void*)addr, 0x90, len);
-		VirtualProtect((void*)addr, len, oldProtect, &oldProtect);
-	}
-}
-
 void EmuInstallPatches()
 {
 	for (const auto& it : g_SymbolAddresses) {
@@ -537,16 +529,29 @@ void EmuInstallPatches()
 	LookupTrampolinesD3D();
 	LookupTrampolinesXAPI();
 
-	// Per-game byte patches keyed by XBE header hash
+	// Per-game byte patches
+	uint32_t imageSize = CxbxKrnl_Xbe->m_Header.dwSizeofImage;
 	uint64_t xbeHash = ComputeHash((void*)&CxbxKrnl_Xbe->m_Header, sizeof(Xbe::Header));
 
-	// Crazy Taxi (Chihiro) ctx_ac[r].xbe — hash f319c176ab55e589
-	// DSOUND:0011FDA5  jnz short loc_11FDA1  (75 FA)
-	// Patch to NOP so the sound init loop exits instead of spinning forever.
-	if (xbeHash == 0xf319c176ab55e589ULL) {
-		EmuNopPatch(0x0011FDA5, 2);
-		EmuNopPatch(0x0003CB81, 2);
+	printf("EmuInstallPatches: imageSize=0x%X hash=0x%016llX\n", imageSize, (unsigned long long)xbeHash);
+	{
+		FILE* f = fopen("C:\\temp\\golf_patches.log", "w");
+		if (f) { fprintf(f, "EmuInstallPatches: imageSize=0x%X hash=0x%016llX\n", imageSize, (unsigned long long)xbeHash);
+		fprintf(f, "IsGolfXbe=%d IsGundamXbe=%d IsWanganXbe=%d\n", IsGolfXbe(xbeHash), IsGundamXbe(xbeHash), IsWanganXbe(imageSize));
+		fclose(f); }
 	}
+
+	ApplyJvsWatchdogPatch(imageSize);
+
+	if (IsWanganXbe(imageSize)) {
+		g_jvs_game_type = ApplyWanganPatches(imageSize);
+	} else if (IsGundamXbe(xbeHash)) {
+		ApplyGundamPatches(imageSize);
+	} else if (IsGolfXbe(xbeHash)) {
+		ApplyGolfPatches(imageSize);
+	}
+
+	ApplyCrazyTaxiPatches(xbeHash, imageSize);
 }
 
 void* GetPatchedFunctionTrampoline(const std::string functionName)
