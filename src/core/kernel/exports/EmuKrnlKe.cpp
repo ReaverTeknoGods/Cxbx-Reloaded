@@ -84,6 +84,7 @@ namespace NtDll
 #include "Timer.h"
 #include "Util.h"
 #include "common/PerfTrace.h" // For PERF_SCOPE(PERF_CAT_KE_*)
+#include "common/BetaConfig.h"
 
 #pragma warning(disable:4005) // Ignore redefined status values
 #include <ntstatus.h>
@@ -2384,13 +2385,64 @@ XBSYSAPI EXPORTNUM(158) xbox::ntstatus_xt NTAPI xbox::KeWaitForMultipleObjects
 
 			WaitBlock->NextWaitBlock = &WaitBlockArray[0];
 			WaitBlock = &WaitBlockArray[0];
-			KiWaitListLock();
-			do {
-				ObjectMutant = (PKMUTANT)WaitBlock->Object;
-				InsertTailList(&ObjectMutant->Header.WaitListHead, &WaitBlock->WaitListEntry);
-				WaitBlock = WaitBlock->NextWaitBlock;
-			} while (WaitBlock != &WaitBlockArray[0]);
-			KiWaitListUnlock();
+			if (g_BetaConfig.wait_list_toctou_recheck) {
+				KiWaitListLock();
+				do {
+					ObjectMutant = (PKMUTANT)WaitBlock->Object;
+					InsertTailList(&ObjectMutant->Header.WaitListHead, &WaitBlock->WaitListEntry);
+					WaitBlock = WaitBlock->NextWaitBlock;
+				} while (WaitBlock != &WaitBlockArray[0]);
+				// Re-check signal state after InsertTailList (same TOCTOU race as KeWaitForSingleObject)
+				if (WaitType == WaitAny) {
+					for (ULONG ri = 0; ri < Count; ri++) {
+						PKMUTANT rm = (PKMUTANT)Object[ri];
+						if (rm->Header.Type == MutantObject) {
+							if ((rm->Header.SignalState > 0) || (Thread == rm->OwnerThread)) {
+								KiWaitSatisfyMutant(rm, Thread);
+								KiUnwaitThread(Thread, ri | Thread->WaitStatus, 0);
+								KiWaitListUnlock();
+								WaitStatus = Thread->WaitStatus;
+								goto NoWait;
+							}
+						} else if (rm->Header.SignalState > 0) {
+							KiWaitSatisfyOther(rm);
+							KiUnwaitThread(Thread, ri, 0);
+							KiWaitListUnlock();
+							WaitStatus = ri;
+							goto NoWait;
+						}
+					}
+				} else {
+					BOOLEAN allSignaled = TRUE;
+					for (ULONG ri = 0; ri < Count; ri++) {
+						PKMUTANT rm = (PKMUTANT)Object[ri];
+						if (rm->Header.Type == MutantObject) {
+							if ((rm->Header.SignalState <= 0) && (Thread != rm->OwnerThread)) {
+								allSignaled = FALSE;
+								break;
+							}
+						} else if (rm->Header.SignalState <= 0) {
+							allSignaled = FALSE;
+							break;
+						}
+					}
+					if (allSignaled) {
+						WaitBlock = &WaitBlockArray[0];
+						KiWaitSatisfyAll(WaitBlock);
+						KiUnwaitThread(Thread, Thread->WaitStatus, 0);
+						KiWaitListUnlock();
+						WaitStatus = Thread->WaitStatus;
+						goto NoWait;
+					}
+				}
+				KiWaitListUnlock();
+			} else {
+				do {
+					ObjectMutant = (PKMUTANT)WaitBlock->Object;
+					InsertTailList(&ObjectMutant->Header.WaitListHead, &WaitBlock->WaitListEntry);
+					WaitBlock = WaitBlock->NextWaitBlock;
+				} while (WaitBlock != &WaitBlockArray[0]);
+			}
 
 			/*
 			TODO: We can't implement this and the return values until we have our own thread scheduler
@@ -2608,10 +2660,33 @@ XBSYSAPI EXPORTNUM(159) xbox::ntstatus_xt NTAPI xbox::KeWaitForSingleObject
 				return WaitStatus;
 			} */
 
-			// Insert the WaitBlock
-			KiWaitListLock();
-			InsertTailList(&ObjectMutant->Header.WaitListHead, &WaitBlock->WaitListEntry);
-			KiWaitListUnlock();
+			// Insert the WaitBlock and re-check signal state atomically.
+			// KiLockDispatcherDatabase is just an IRQL raise (no mutual exclusion on host),
+			// so KeSetEvent can run between our SignalState check above and this InsertTailList.
+			// If that happens, the event is already signaled but no waiter was in the list,
+			// so KiWaitTest was a no-op — we'd wait forever. Re-check under WaitListLock.
+			if (g_BetaConfig.wait_list_toctou_recheck) {
+				KiWaitListLock();
+				InsertTailList(&ObjectMutant->Header.WaitListHead, &WaitBlock->WaitListEntry);
+				if (ObjectMutant->Header.Type == MutantObject) {
+					if ((ObjectMutant->Header.SignalState > 0) || (Thread == ObjectMutant->OwnerThread)) {
+						KiWaitSatisfyMutant(ObjectMutant, Thread);
+						KiUnwaitThread(Thread, (NTSTATUS)Thread->WaitStatus, 0);
+						KiWaitListUnlock();
+						WaitStatus = Thread->WaitStatus;
+						goto NoWait;
+					}
+				} else if (ObjectMutant->Header.SignalState > 0) {
+					KiWaitSatisfyOther(ObjectMutant);
+					KiUnwaitThread(Thread, X_STATUS_SUCCESS, 0);
+					KiWaitListUnlock();
+					WaitStatus = X_STATUS_SUCCESS;
+					goto NoWait;
+				}
+				KiWaitListUnlock();
+			} else {
+				InsertTailList(&ObjectMutant->Header.WaitListHead, &WaitBlock->WaitListEntry);
+			}
 
 			// TODO: Remove this after we have our own scheduler and the above is implemented
 			WaitStatus = WaitApc<false>([](PKTHREAD Thread) -> std::optional<ntstatus_xt> {

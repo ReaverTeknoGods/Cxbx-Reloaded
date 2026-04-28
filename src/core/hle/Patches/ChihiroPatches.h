@@ -41,7 +41,7 @@ void ApplyJvsWatchdogPatch(uint32_t imageSize);
 JvsGameType ApplyWanganPatches(uint32_t imageSize);
 
 // Apply MediaBoard networking and init patches for Gundam Battle Operating Simulator.
-void ApplyGundamPatches(uint32_t imageSize);
+void ApplyGundamPatches(uint64_t xbeHash, uint32_t imageSize);
 
 // Apply CRI Sofdec spin loop fix for Crazy Taxi High Roller.
 void ApplyCrazyTaxiPatches(uint64_t xbeHash, uint32_t imageSize);

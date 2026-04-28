@@ -28,6 +28,7 @@
 #ifndef TIMER_H
 #define TIMER_H
 
+#include <chrono>
 #include <atomic>
 #include <mutex>
 
@@ -46,6 +47,7 @@ extern int64_t HostQPCFrequency;
 void timer_init();
 uint64_t get_now();
 int64_t Timer_GetScaledPerformanceCounter(int64_t Period);
+void SleepPassive(std::chrono::microseconds duration);
 void SleepPrecise(std::chrono::steady_clock::time_point targetTime);
 
 #endif

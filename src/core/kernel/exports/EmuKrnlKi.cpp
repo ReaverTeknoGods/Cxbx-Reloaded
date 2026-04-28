@@ -87,6 +87,7 @@ the said software).
 #include "EmuKrnl.h" // for the list support functions
 #include "EmuKrnlKi.h"
 #include "EmuKrnlKe.h"
+#include "common/BetaConfig.h"
 
 #define MAX_TIMER_DPCS   16
 
@@ -101,6 +102,7 @@ xbox::KI_WAIT_LIST_LOCK KiWaitListMtx;
 xbox::KTIMER_TABLE_ENTRY KiTimerTableListHead[TIMER_TABLE_SIZE];
 xbox::LIST_ENTRY KiWaitInListHead;
 std::mutex xbox::KiApcListMtx;
+std::atomic<unsigned long> xbox::KiApcListMtxOwner{0};
 
 
 xbox::void_xt xbox::KiInitSystem()
@@ -191,7 +193,14 @@ xbox::void_xt xbox::KiClockIsr(ulonglong_xt TotalUs)
 
 	// Because this function must be fast to continuously update the kernel clocks, if somebody else is currently
 	// holding the lock, we won't wait and instead skip the check of the timers for this cycle
-	if (KiTimerMtx.Mtx.try_lock()) {
+	bool timerLocked;
+	if (g_BetaConfig.timer_try_lock) {
+		timerLocked = KiTimerMtx.Mtx.try_lock();
+	} else {
+		KiTimerMtx.Mtx.lock();
+		timerLocked = true;
+	}
+	if (timerLocked) {
 		KiTimerMtx.Acquired++;
 		// Check if a timer has expired
 		// On real hw, this is called every ms, so it only needs to check a single timer index. However, testing on the emulator shows that this can have a delay
@@ -899,10 +908,27 @@ static xbox::void_xt KiExecuteApc()
 			(Apc->NormalRoutine)(Apc->NormalContext, Apc->SystemArgument1, Apc->SystemArgument2);
 		}
 
-		xbox::KiApcListMtx.lock();
+		if (g_BetaConfig.apc_try_lock) {
+			if (!xbox::KiApcListMtx.try_lock()) {
+				// Can't re-lock, bail out. Remaining APCs will be processed later.
+				if constexpr (ApcMode == xbox::KernelMode) {
+					kThread->ApcState.KernelApcPending = TRUE;
+					kThread->ApcState.KernelApcInProgress = FALSE;
+				} else {
+					kThread->ApcState.UserApcPending = TRUE;
+				}
+				return;
+			}
+		} else {
+			xbox::KiApcListMtx.lock();
+		}
 	}
 
 	xbox::KiApcListMtx.unlock();
+
+	if constexpr (ApcMode == xbox::KernelMode) {
+		kThread->ApcState.KernelApcInProgress = FALSE;
+	}
 }
 
 xbox::void_xt xbox::KiExecuteKernelApc()
@@ -1084,7 +1110,20 @@ xbox::boolean_xt xbox::KiInsertQueueApc
 )
 {
 	PKTHREAD kThread = Apc->Thread;
-	KiApcListMtx.lock();
+	if (g_BetaConfig.apc_try_lock) {
+		if (!KiApcListMtx.try_lock()) {
+			// Spin briefly for the mutex (it should be held very briefly)
+			for (int i = 0; i < 1000; i++) {
+				std::this_thread::yield();
+				if (KiApcListMtx.try_lock()) goto locked;
+			}
+			// Fall back to blocking lock as a last resort
+			KiApcListMtx.lock();
+		}
+	} else {
+		KiApcListMtx.lock();
+	}
+	locked:
 	if (Apc->Inserted) {
 		KiApcListMtx.unlock();
 		return FALSE;

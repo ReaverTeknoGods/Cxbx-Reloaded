@@ -41,6 +41,8 @@
 #include "EmuKrnl.h" // for HalSystemInterrupts
 #include "EmuKrnlKi.h" // for KiLockDispatcherDatabase
 #include "core\kernel\init\CxbxKrnl.h"
+#include "common/BetaConfig.h"
+#include <climits>
 
 // prevent name collisions
 namespace NtDll
@@ -189,6 +191,15 @@ bool AddWaitObject(xbox::PKTHREAD kThread, xbox::PLARGE_INTEGER Timeout)
 	Timer->Header.WaitListHead.Flink = &WaitBlock->WaitListEntry;
 	Timer->Header.WaitListHead.Blink = &WaitBlock->WaitListEntry;
 	if (Timeout && Timeout->QuadPart) {
+		// Special case: INT64_MIN (0x8000000000000000) is used by some games (CRI library)
+		// as a KeDelayExecutionThread interval. The DueTime computation overflows
+		// (InterruptTime - INT64_MIN wraps to a huge unsigned value that never expires).
+		// When non-alertable, this creates an infinite hang. Treat it as immediate timeout.
+		if (g_BetaConfig.llong_min_timeout_fix && Timeout->QuadPart == LLONG_MIN) {
+			kThread->WaitBlockList = xbox::zeroptr;
+			xbox::KiTimerUnlock();
+			return false;
+		}
 		// Setup a timer so that KiTimerExpiration can discover the timeout and yield to us.
 		// Otherwise, we will only be able to discover the timeout when Windows decides to schedule us again, and testing shows that
 		// tends to happen much later than the due time

@@ -92,8 +92,24 @@ public:
     chihiro_bootid &GetBootId();
 private:
     uint32_t temp_0x4026 = 0;
-    uint8_t buffer_800000[512] = {};
-    uint8_t buffer_900000[512] = {};
+    uint32_t temp_0x408E = 0;
+    uint32_t temp_0x4080 = 0;
+    uint8_t buffer_800000[512] = {};   // 0x800000 read buffer (net response)
+    uint8_t buffer_800200[512] = {};   // 0x800200 write buffer (net command)
+    uint8_t buffer_900000[512] = {};   // 0x900000 read buffer (sys response) = MAME read_buffer
+    uint8_t buffer_900200[512] = {};   // 0x900200 write buffer (sys command) = MAME write_buffer
+
+    // Shadow response buffer: holds the last processed command response.
+    // Game clears buffer_900000 before kicking 0x4026, so we re-deliver
+    // the response from this shadow buffer on the kick or on read.
+    uint8_t m_shadowResponse[512] = {};
+    bool m_responsePending = false;
+
+    // Track how many commands have been processed. After initial handshake,
+    // proactively deliver STATUS responses when polled.
+    int m_commandsProcessed = 0;
+    bool m_statusInjected = false;
+    int m_statusInjectRead = 0;
 
     std::string m_MountPath;
     chihiro_bootid BootID = {};

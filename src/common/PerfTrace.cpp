@@ -2,8 +2,14 @@
 // * PerfTrace.cpp - Implementation for lightweight perf tracing
 // ******************************************************************
 #include "PerfTrace.h"
+#include <DbgHelp.h>
+#include <TlHelp32.h>
+#include <winternl.h>
 #include <cstdarg>
 #include <cstring>
+#include <string>
+
+#pragma comment(lib, "Dbghelp.lib")
 
 bool g_PerfTraceEnabled = true;
 
@@ -13,6 +19,649 @@ ULONG g_VtxCacheMisses = 0;
 namespace PerfTraceInternal {
 
 State g_state = {};
+
+static bool EnsureSymbolsInitialized(State& s)
+{
+    if (s.symbolsReady) {
+        return true;
+    }
+
+    BOOL initialized = SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+    if (!initialized && GetLastError() == ERROR_INVALID_PARAMETER) {
+        initialized = TRUE;
+        SymRefreshModuleList(GetCurrentProcess());
+    }
+
+    s.symbolsReady = initialized == TRUE;
+    return s.symbolsReady;
+}
+
+static int FindSampledThreadSlotById(const State& s, DWORD nativeThreadId)
+{
+    for (int i = 0; i < PERF_MAX_SAMPLED_THREADS; i++) {
+        if (s.sampledThreads[i].handle != nullptr && s.sampledThreads[i].nativeThreadId == nativeThreadId) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static int FindFreeSampledThreadSlot(const State& s)
+{
+    for (int i = 0; i < PERF_MAX_SAMPLED_THREADS; i++) {
+        if (s.sampledThreads[i].handle == nullptr) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static int FindXboxThreadIndexByNativeId(const State& s, DWORD nativeThreadId)
+{
+    for (int i = 0; i < s.xboxThreadCount; i++) {
+        if (s.xboxThreads[i] != nullptr && s.xboxNativeThreadIds[i] == nativeThreadId) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static std::string ResolveSamplePc(State& s, uintptr_t pc);
+
+static std::string FormatThreadRoutineLabel(State& s, const void* routine)
+{
+    if (routine == nullptr) {
+        return "0x0";
+    }
+
+    return ResolveSamplePc(s, reinterpret_cast<uintptr_t>(routine));
+}
+
+static bool QueryThreadStartPc(HANDLE threadHandle, uintptr_t* startPc)
+{
+    if (threadHandle == nullptr || startPc == nullptr) {
+        return false;
+    }
+
+    using NtQueryInformationThreadFn = NTSTATUS(NTAPI*)(HANDLE, THREADINFOCLASS, PVOID, ULONG, PULONG);
+    static NtQueryInformationThreadFn s_ntQueryInformationThread = []() -> NtQueryInformationThreadFn {
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (ntdll == nullptr) {
+            return nullptr;
+        }
+
+        return reinterpret_cast<NtQueryInformationThreadFn>(
+            GetProcAddress(ntdll, "NtQueryInformationThread"));
+    }();
+
+    if (s_ntQueryInformationThread == nullptr) {
+        return false;
+    }
+
+    PVOID startAddress = nullptr;
+    NTSTATUS status = s_ntQueryInformationThread(
+        threadHandle,
+        static_cast<THREADINFOCLASS>(9),
+        &startAddress,
+        static_cast<ULONG>(sizeof(startAddress)),
+        nullptr);
+    if (status < 0 || startAddress == nullptr) {
+        return false;
+    }
+
+    *startPc = reinterpret_cast<uintptr_t>(startAddress);
+    return true;
+}
+
+static bool TryFormatThreadDescription(HANDLE threadHandle, char* buffer, size_t bufferSize)
+{
+    if (threadHandle == nullptr || buffer == nullptr || bufferSize == 0) {
+        return false;
+    }
+
+    using GetThreadDescriptionFn = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+    static GetThreadDescriptionFn s_getThreadDescription = []() -> GetThreadDescriptionFn {
+        HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+        if (kernel32 == nullptr) {
+            return nullptr;
+        }
+
+        return reinterpret_cast<GetThreadDescriptionFn>(
+            GetProcAddress(kernel32, "GetThreadDescription"));
+    }();
+
+    if (s_getThreadDescription == nullptr) {
+        return false;
+    }
+
+    PWSTR description = nullptr;
+    HRESULT hr = s_getThreadDescription(threadHandle, &description);
+    if (FAILED(hr) || description == nullptr || description[0] == L'\0') {
+        if (description != nullptr) {
+            LocalFree(description);
+        }
+        return false;
+    }
+
+    char utf8[PERF_MAX_XBOX_THREAD_LABEL] = {};
+    int converted = WideCharToMultiByte(CP_UTF8, 0, description, -1, utf8, sizeof(utf8), nullptr, nullptr);
+    LocalFree(description);
+    if (converted <= 0 || utf8[0] == '\0') {
+        return false;
+    }
+
+    strncpy_s(buffer, bufferSize, utf8, _TRUNCATE);
+    return true;
+}
+
+static void FormatSampledThreadLabel(State& s, HANDLE threadHandle, DWORD nativeThreadId, char* buffer, size_t bufferSize)
+{
+    if (nativeThreadId == s.renderThreadId) {
+        _snprintf_s(buffer, bufferSize, _TRUNCATE, "render-thread nt=%04X", (unsigned int)(nativeThreadId & 0xFFFFu));
+        return;
+    }
+
+    int xboxIdx = FindXboxThreadIndexByNativeId(s, nativeThreadId);
+    if (xboxIdx >= 0 && s.xboxThreadLabels[xboxIdx][0] != '\0') {
+        strncpy_s(buffer, bufferSize, s.xboxThreadLabels[xboxIdx], _TRUNCATE);
+        return;
+    }
+
+    if (TryFormatThreadDescription(threadHandle, buffer, bufferSize)) {
+        return;
+    }
+
+    uintptr_t startPc = 0;
+    if (QueryThreadStartPc(threadHandle, &startPc)) {
+        std::string startLabel = ResolveSamplePc(s, startPc);
+        _snprintf_s(
+            buffer,
+            bufferSize,
+            _TRUNCATE,
+            "%s nt=%04X",
+            startLabel.c_str(),
+            (unsigned int)(nativeThreadId & 0xFFFFu));
+        return;
+    }
+
+    _snprintf_s(buffer, bufferSize, _TRUNCATE, "nt=%04X", (unsigned int)(nativeThreadId & 0xFFFFu));
+}
+
+static void ResetSampledThread(SampledThread& sampledThread)
+{
+    if (sampledThread.handle != nullptr) {
+        CloseHandle(sampledThread.handle);
+    }
+
+    memset(&sampledThread, 0, sizeof(sampledThread));
+}
+
+static void RefreshSampledThreads(State& s)
+{
+    bool seen[PERF_MAX_SAMPLED_THREADS] = {};
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    THREADENTRY32 entry = {};
+    entry.dwSize = sizeof(entry);
+    const DWORD processId = GetCurrentProcessId();
+    const DWORD samplerThreadId = GetCurrentThreadId();
+
+    if (Thread32First(snapshot, &entry)) {
+        do {
+            if (entry.th32OwnerProcessID != processId || entry.th32ThreadID == samplerThreadId) {
+                continue;
+            }
+
+            int slot = FindSampledThreadSlotById(s, entry.th32ThreadID);
+            if (slot < 0) {
+                slot = FindFreeSampledThreadSlot(s);
+                if (slot < 0) {
+                    continue;
+                }
+
+                HANDLE threadHandle = OpenThread(
+                    THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
+                    FALSE,
+                    entry.th32ThreadID);
+                if (threadHandle == nullptr) {
+                    continue;
+                }
+
+                ULONG64 cycles = 0;
+                QueryThreadCycleTime(threadHandle, &cycles);
+
+                s.sampledThreads[slot].handle = threadHandle;
+                s.sampledThreads[slot].nativeThreadId = entry.th32ThreadID;
+                s.sampledThreads[slot].cycleStart = cycles;
+                s.sampledThreads[slot].hits = 0;
+                memset(s.sampledThreads[slot].pcSamples, 0, sizeof(s.sampledThreads[slot].pcSamples));
+            }
+
+            FormatSampledThreadLabel(
+                s,
+                s.sampledThreads[slot].handle,
+                entry.th32ThreadID,
+                s.sampledThreads[slot].label,
+                sizeof(s.sampledThreads[slot].label));
+            seen[slot] = true;
+        } while (Thread32Next(snapshot, &entry));
+    }
+
+    CloseHandle(snapshot);
+
+    for (int i = 0; i < PERF_MAX_SAMPLED_THREADS; i++) {
+        if (s.sampledThreads[i].handle != nullptr && !seen[i]) {
+            ResetSampledThread(s.sampledThreads[i]);
+        }
+    }
+}
+
+static bool TryGetModuleNameForPc(uintptr_t pc, char* buffer, size_t bufferSize)
+{
+    if (buffer == nullptr || bufferSize == 0) {
+        return false;
+    }
+
+    buffer[0] = '\0';
+    HMODULE moduleHandle = nullptr;
+    if (!GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(pc),
+            &moduleHandle)
+        || moduleHandle == nullptr) {
+        return false;
+    }
+
+    char modulePath[MAX_PATH] = {};
+    if (GetModuleFileNameA(moduleHandle, modulePath, sizeof(modulePath)) == 0) {
+        return false;
+    }
+
+    const char* slash = strrchr(modulePath, '\\');
+    strncpy_s(buffer, bufferSize, slash ? slash + 1 : modulePath, _TRUNCATE);
+    return true;
+}
+
+static bool IsWindowsWaitHelperPc(uintptr_t pc)
+{
+    char moduleName[MAX_PATH] = {};
+    if (!TryGetModuleNameForPc(pc, moduleName, sizeof(moduleName))) {
+        return false;
+    }
+
+    return _stricmp(moduleName, "ntdll.dll") == 0
+        || _stricmp(moduleName, "kernelbase.dll") == 0
+        || _stricmp(moduleName, "kernel32.dll") == 0;
+}
+
+static bool CaptureThreadAttributionPc(State& s, HANDLE threadHandle, const CONTEXT& threadContext, uintptr_t leafPc, uintptr_t* pc)
+{
+    if (pc == nullptr) {
+        return false;
+    }
+
+    *pc = leafPc;
+    if (leafPc == 0 || !IsWindowsWaitHelperPc(leafPc) || !EnsureSymbolsInitialized(s)) {
+        return *pc != 0;
+    }
+
+    CONTEXT unwindContext = threadContext;
+    STACKFRAME64 frame = {};
+#if defined(_M_X64)
+    constexpr DWORD machineType = IMAGE_FILE_MACHINE_AMD64;
+    frame.AddrPC.Offset = static_cast<DWORD64>(unwindContext.Rip);
+    frame.AddrFrame.Offset = static_cast<DWORD64>(unwindContext.Rbp);
+    frame.AddrStack.Offset = static_cast<DWORD64>(unwindContext.Rsp);
+#else
+    constexpr DWORD machineType = IMAGE_FILE_MACHINE_I386;
+    frame.AddrPC.Offset = static_cast<DWORD64>(unwindContext.Eip);
+    frame.AddrFrame.Offset = static_cast<DWORD64>(unwindContext.Ebp);
+    frame.AddrStack.Offset = static_cast<DWORD64>(unwindContext.Esp);
+#endif
+    frame.AddrPC.Mode = AddrModeFlat;
+    frame.AddrFrame.Mode = AddrModeFlat;
+    frame.AddrStack.Mode = AddrModeFlat;
+
+    // When a thread is parked in host wait helpers, attribute the sample to the
+    // first non-Windows helper caller frame so the report points at owning code.
+    for (int depth = 0; depth < 4; depth++) {
+        if (!StackWalk64(
+                machineType,
+                GetCurrentProcess(),
+                threadHandle,
+                &frame,
+                &unwindContext,
+                nullptr,
+                SymFunctionTableAccess64,
+                SymGetModuleBase64,
+                nullptr)) {
+            break;
+        }
+
+        uintptr_t candidatePc = static_cast<uintptr_t>(frame.AddrPC.Offset);
+        if (candidatePc == 0 || candidatePc == leafPc) {
+            continue;
+        }
+        if (IsWindowsWaitHelperPc(candidatePc)) {
+            continue;
+        }
+
+        *pc = candidatePc;
+        break;
+    }
+
+    return *pc != 0;
+}
+
+static bool CaptureThreadPc(State& s, HANDLE threadHandle, uintptr_t* pc)
+{
+    if (threadHandle == nullptr || pc == nullptr) {
+        return false;
+    }
+
+    CONTEXT context = {};
+    context.ContextFlags = CONTEXT_FULL;
+
+    DWORD suspendCount = SuspendThread(threadHandle);
+    if (suspendCount == static_cast<DWORD>(-1)) {
+        return false;
+    }
+
+    BOOL gotContext = GetThreadContext(threadHandle, &context);
+    bool captured = false;
+    if (!gotContext) {
+        ResumeThread(threadHandle);
+        return false;
+    }
+
+    uintptr_t leafPc = 0;
+#if defined(_M_X64)
+    leafPc = static_cast<uintptr_t>(context.Rip);
+#else
+    leafPc = static_cast<uintptr_t>(context.Eip);
+#endif
+    if (leafPc != 0) {
+        captured = CaptureThreadAttributionPc(s, threadHandle, context, leafPc, pc);
+    }
+
+    ResumeThread(threadHandle);
+    return captured;
+}
+
+static void RecordProcessPcSample(State& s, uintptr_t pc, ULONGLONG cycles)
+{
+    if (pc == 0) {
+        return;
+    }
+
+    s.processPcSampleTotal++;
+    s.processPcSampleTotalCycles += cycles;
+    for (int i = 0; i < PERF_MAX_PC_SAMPLES; i++) {
+        if (s.processPcSamples[i].pc == pc) {
+            s.processPcSamples[i].hits++;
+            s.processPcSamples[i].cycles += cycles;
+            return;
+        }
+    }
+
+    for (int i = 0; i < PERF_MAX_PC_SAMPLES; i++) {
+        if (s.processPcSamples[i].pc == 0) {
+            s.processPcSamples[i].pc = pc;
+            s.processPcSamples[i].hits = 1;
+            s.processPcSamples[i].cycles = cycles;
+            return;
+        }
+    }
+}
+
+static void RecordThreadPcSample(SampledThread& sampledThread, uintptr_t pc, ULONGLONG cycles)
+{
+    if (pc == 0) {
+        return;
+    }
+
+    for (int i = 0; i < PERF_MAX_THREAD_PC_SAMPLES; i++) {
+        if (sampledThread.pcSamples[i].pc == pc) {
+            sampledThread.pcSamples[i].hits++;
+            sampledThread.pcSamples[i].cycles += cycles;
+            return;
+        }
+    }
+
+    for (int i = 0; i < PERF_MAX_THREAD_PC_SAMPLES; i++) {
+        if (sampledThread.pcSamples[i].pc == 0) {
+            sampledThread.pcSamples[i].pc = pc;
+            sampledThread.pcSamples[i].hits = 1;
+            sampledThread.pcSamples[i].cycles = cycles;
+            return;
+        }
+    }
+}
+
+static void RecordXboxThreadPcSample(State& s, int xboxThreadIdx, uintptr_t pc, ULONGLONG cycles)
+{
+    if (xboxThreadIdx < 0 || xboxThreadIdx >= PERF_MAX_XBOX_THREADS || pc == 0) {
+        return;
+    }
+
+    s.xboxThreadSampleHits[xboxThreadIdx]++;
+    s.xboxThreadSampleCycles[xboxThreadIdx] += cycles;
+    auto* samples = s.xboxThreadPcSamples[xboxThreadIdx];
+    for (int i = 0; i < PERF_MAX_THREAD_PC_SAMPLES; i++) {
+        if (samples[i].pc == pc) {
+            samples[i].hits++;
+            samples[i].cycles += cycles;
+            return;
+        }
+    }
+
+    for (int i = 0; i < PERF_MAX_THREAD_PC_SAMPLES; i++) {
+        if (samples[i].pc == 0) {
+            samples[i].pc = pc;
+            samples[i].hits = 1;
+            samples[i].cycles = cycles;
+            return;
+        }
+    }
+}
+
+static std::string ResolveSamplePc(State& s, uintptr_t pc)
+{
+    char buffer[512] = {};
+    HMODULE moduleHandle = nullptr;
+
+    if (GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(pc),
+            &moduleHandle)
+        && moduleHandle != nullptr) {
+        char modulePath[MAX_PATH] = {};
+        GetModuleFileNameA(moduleHandle, modulePath, sizeof(modulePath));
+        const char* slash = strrchr(modulePath, '\\');
+        const char* moduleName = slash ? slash + 1 : modulePath;
+        DWORD64 moduleOffset = static_cast<DWORD64>(pc) - reinterpret_cast<DWORD64>(moduleHandle);
+
+        if (EnsureSymbolsInitialized(s)) {
+            BYTE symBuffer[sizeof(SYMBOL_INFO) + 256] = {};
+            PSYMBOL_INFO symbol = reinterpret_cast<PSYMBOL_INFO>(symBuffer);
+            symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+            symbol->MaxNameLen = 255;
+            DWORD64 symbolDisplacement = 0;
+
+            if (SymFromAddr(GetCurrentProcess(), static_cast<DWORD64>(pc), &symbolDisplacement, symbol) && symbol->Name[0] != '\0') {
+                _snprintf_s(
+                    buffer,
+                    sizeof(buffer),
+                    _TRUNCATE,
+                    "%s!%s+0x%llX",
+                    moduleName,
+                    symbol->Name,
+                    static_cast<unsigned long long>(symbolDisplacement));
+                return buffer;
+            }
+        }
+
+        _snprintf_s(
+            buffer,
+            sizeof(buffer),
+            _TRUNCATE,
+            "%s+0x%llX",
+            moduleName,
+            static_cast<unsigned long long>(moduleOffset));
+        return buffer;
+    }
+
+    _snprintf_s(buffer, sizeof(buffer), _TRUNCATE, "0x%p", reinterpret_cast<void*>(pc));
+    return buffer;
+}
+
+static void FindTopSampledThreadIndices(const SampledThread* threads, int topIdx[PERF_REPORT_TOP_SAMPLED_THREADS])
+{
+    for (int i = 0; i < PERF_REPORT_TOP_SAMPLED_THREADS; i++) {
+        topIdx[i] = -1;
+    }
+
+    for (int idx = 0; idx < PERF_MAX_SAMPLED_THREADS; idx++) {
+        if (threads[idx].handle == nullptr || threads[idx].cycles == 0) {
+            continue;
+        }
+
+        for (int slot = 0; slot < PERF_REPORT_TOP_SAMPLED_THREADS; slot++) {
+            if (topIdx[slot] < 0 || threads[idx].cycles > threads[topIdx[slot]].cycles) {
+                for (int move = PERF_REPORT_TOP_SAMPLED_THREADS - 1; move > slot; move--) {
+                    topIdx[move] = topIdx[move - 1];
+                }
+                topIdx[slot] = idx;
+                break;
+            }
+        }
+    }
+}
+
+static void FindTopPcSampleIndices(const PcSample* samples, int topIdx[PERF_REPORT_TOP_PC_SAMPLES])
+{
+    for (int i = 0; i < PERF_REPORT_TOP_PC_SAMPLES; i++) {
+        topIdx[i] = -1;
+    }
+
+    for (int idx = 0; idx < PERF_MAX_PC_SAMPLES; idx++) {
+        if (samples[idx].pc == 0 || samples[idx].cycles == 0) {
+            continue;
+        }
+
+        for (int slot = 0; slot < PERF_REPORT_TOP_PC_SAMPLES; slot++) {
+            if (topIdx[slot] < 0 || samples[idx].cycles > samples[topIdx[slot]].cycles) {
+                for (int move = PERF_REPORT_TOP_PC_SAMPLES - 1; move > slot; move--) {
+                    topIdx[move] = topIdx[move - 1];
+                }
+                topIdx[slot] = idx;
+                break;
+            }
+        }
+    }
+}
+
+static void FindTopThreadPcSampleIndices(const SampledThread::ThreadPcSample* samples, int topIdx[PERF_REPORT_TOP_THREAD_PC_SAMPLES])
+{
+    for (int i = 0; i < PERF_REPORT_TOP_THREAD_PC_SAMPLES; i++) {
+        topIdx[i] = -1;
+    }
+
+    for (int idx = 0; idx < PERF_MAX_THREAD_PC_SAMPLES; idx++) {
+        if (samples[idx].pc == 0 || samples[idx].cycles == 0) {
+            continue;
+        }
+
+        for (int slot = 0; slot < PERF_REPORT_TOP_THREAD_PC_SAMPLES; slot++) {
+            if (topIdx[slot] < 0 || samples[idx].cycles > samples[topIdx[slot]].cycles) {
+                for (int move = PERF_REPORT_TOP_THREAD_PC_SAMPLES - 1; move > slot; move--) {
+                    topIdx[move] = topIdx[move - 1];
+                }
+                topIdx[slot] = idx;
+                break;
+            }
+        }
+    }
+}
+
+static DWORD WINAPI SampleProfilerThreadProc(LPVOID)
+{
+    auto& s = g_state;
+
+    while (true) {
+        Sleep(PERF_SAMPLER_INTERVAL_MS);
+        if (!g_PerfTraceEnabled || !s.initialized || !s.logFile || !s.sampleLockInitialized) {
+            continue;
+        }
+
+        EnterCriticalSection(&s.sampleLock);
+
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (s.sampleRefreshTick == 0 || (now.QuadPart - s.sampleRefreshTick) >= s.freq) {
+            RefreshSampledThreads(s);
+            s.sampleRefreshTick = now.QuadPart;
+        }
+
+        for (int i = 0; i < PERF_MAX_SAMPLED_THREADS; i++) {
+            auto& sampledThread = s.sampledThreads[i];
+            if (sampledThread.handle == nullptr) {
+                continue;
+            }
+
+            ULONG64 cycles = 0;
+            if (!QueryThreadCycleTime(sampledThread.handle, &cycles)) {
+                ResetSampledThread(sampledThread);
+                continue;
+            }
+
+            ULONG64 delta = cycles - sampledThread.cycleStart;
+            sampledThread.cycleStart = cycles;
+            if (delta == 0) {
+                continue;
+            }
+
+            uintptr_t pc = 0;
+            if (CaptureThreadPc(s, sampledThread.handle, &pc)) {
+                sampledThread.hits++;
+                sampledThread.cycles += delta;
+                RecordThreadPcSample(sampledThread, pc, delta);
+                RecordProcessPcSample(s, pc, delta);
+            }
+        }
+
+        for (int i = 0; i < s.xboxThreadCount; i++) {
+            HANDLE xboxThread = s.xboxThreads[i];
+            if (xboxThread == nullptr) {
+                continue;
+            }
+
+            ULONG64 cycles = 0;
+            if (!QueryThreadCycleTime(xboxThread, &cycles)) {
+                continue;
+            }
+
+            ULONG64 delta = cycles - s.xboxThreadSampleCycleStart[i];
+            s.xboxThreadSampleCycleStart[i] = cycles;
+            if (delta == 0) {
+                continue;
+            }
+
+            uintptr_t pc = 0;
+            if (CaptureThreadPc(s, xboxThread, &pc)) {
+                RecordXboxThreadPcSample(s, i, pc, delta);
+            }
+        }
+
+        LeaveCriticalSection(&s.sampleLock);
+    }
+}
 
 static void FindTopXboxThreadIndices(const double* values, int count, int topIdx[PERF_REPORT_TOP_XBOX_THREADS])
 {
@@ -47,6 +696,30 @@ static void FindTopXboxThreadTickIndices(const long long* values, int count, int
     for (int idx = 0; idx < count; idx++) {
         long long value = values[idx];
         if (value <= 0) {
+            continue;
+        }
+
+        for (int slot = 0; slot < PERF_REPORT_TOP_XBOX_THREADS; slot++) {
+            if (topIdx[slot] < 0 || value > values[topIdx[slot]]) {
+                for (int move = PERF_REPORT_TOP_XBOX_THREADS - 1; move > slot; move--) {
+                    topIdx[move] = topIdx[move - 1];
+                }
+                topIdx[slot] = idx;
+                break;
+            }
+        }
+    }
+}
+
+static void FindTopXboxThreadCountIndices(const uint32_t* values, int count, int topIdx[PERF_REPORT_TOP_XBOX_THREADS])
+{
+    for (int i = 0; i < PERF_REPORT_TOP_XBOX_THREADS; i++) {
+        topIdx[i] = -1;
+    }
+
+    for (int idx = 0; idx < count; idx++) {
+        uint32_t value = values[idx];
+        if (value == 0) {
             continue;
         }
 
@@ -208,7 +881,7 @@ void RegisterXboxThread(HANDLE h, DWORD xboxThreadId, DWORD nativeThreadId, cons
     // leaks at emulator exit, which is acceptable).
     HANDLE dup = INVALID_HANDLE_VALUE;
     DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &dup,
-                    THREAD_QUERY_INFORMATION, FALSE, 0);
+                    THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, 0);
     if (dup == INVALID_HANDLE_VALUE) {
         InterlockedDecrement((LONG*)&s.xboxThreadCount);
         return;
@@ -225,15 +898,18 @@ void RegisterXboxThread(HANDLE h, DWORD xboxThreadId, DWORD nativeThreadId, cons
     s.xboxNativeThreadIds[idx] = nativeThreadId;
     s.xboxThreadSystemRoutine[idx] = systemRoutine;
     s.xboxThreadStartRoutine[idx] = startRoutine;
+    s.xboxThreadSampleCycleStart[idx] = cycles;
+    std::string startLabel = FormatThreadRoutineLabel(s, startRoutine);
+    std::string systemLabel = FormatThreadRoutineLabel(s, systemRoutine);
     _snprintf_s(
         s.xboxThreadLabels[idx],
         PERF_MAX_XBOX_THREAD_LABEL,
         _TRUNCATE,
-        "xb=%04X nt=%04X sr=%p sys=%p",
+        "xb=%04X nt=%04X sr=%s sys=%s",
         (unsigned int)(xboxThreadId & 0xFFFFu),
         (unsigned int)(nativeThreadId & 0xFFFFu),
-        startRoutine,
-        systemRoutine);
+        startLabel.c_str(),
+        systemLabel.c_str());
 }
 
 void RecordVSKickDrain(uint64_t shaderKey, uint32_t shaderHandle, uint64_t shaderCacheHash, long long elapsedTicks, uint32_t reasonMask)
@@ -290,11 +966,76 @@ void RecordPFIFOPending(uint32_t currentDepth, uint32_t highWater, uint32_t over
     s.pfifoPendingOverflowLastSeen = overflowCount;
 }
 
+static void RecordThreadPoll(uint32_t* frameCounts, uint32_t* windowCounts)
+{
+    auto& s = g_state;
+    DWORD currentThreadId = GetCurrentThreadId();
+
+    for (int i = 0; i < s.xboxThreadCount; i++) {
+        if (s.xboxNativeThreadIds[i] != currentThreadId) {
+            continue;
+        }
+
+        frameCounts[i]++;
+        windowCounts[i]++;
+        break;
+    }
+}
+
+void RecordDelayPoll()
+{
+    auto& s = g_state;
+    RecordThreadPoll(s.xboxThreadDelayPollFrameCounts, s.xboxThreadDelayPollWindowCounts);
+}
+
+void RecordWaitPoll()
+{
+    auto& s = g_state;
+    RecordThreadPoll(s.xboxThreadWaitPollFrameCounts, s.xboxThreadWaitPollWindowCounts);
+}
+
 void Init(const char* logPath)
 {
     auto& s = g_state;
     if (s.initialized) return;
+
+    // System-thread proxies can register before PerfTrace_Init runs. Preserve
+    // that registration data so xcpu accounting survives initialization.
+    HANDLE preservedXboxThreads[PERF_MAX_XBOX_THREADS] = {};
+    ULONGLONG preservedXboxThreadCycleStart[PERF_MAX_XBOX_THREADS] = {};
+    DWORD preservedXboxThreadIds[PERF_MAX_XBOX_THREADS] = {};
+    DWORD preservedXboxNativeThreadIds[PERF_MAX_XBOX_THREADS] = {};
+    const void* preservedXboxThreadSystemRoutine[PERF_MAX_XBOX_THREADS] = {};
+    const void* preservedXboxThreadStartRoutine[PERF_MAX_XBOX_THREADS] = {};
+    char preservedXboxThreadLabels[PERF_MAX_XBOX_THREADS][PERF_MAX_XBOX_THREAD_LABEL] = {};
+    ULONGLONG preservedXboxThreadSampleCycleStart[PERF_MAX_XBOX_THREADS] = {};
+    int preservedXboxThreadCount = s.xboxThreadCount;
+    if (preservedXboxThreadCount < 0) {
+        preservedXboxThreadCount = 0;
+    }
+    if (preservedXboxThreadCount > PERF_MAX_XBOX_THREADS) {
+        preservedXboxThreadCount = PERF_MAX_XBOX_THREADS;
+    }
+
+    memcpy(preservedXboxThreads, s.xboxThreads, sizeof(preservedXboxThreads));
+    memcpy(preservedXboxThreadCycleStart, s.xboxThreadCycleStart, sizeof(preservedXboxThreadCycleStart));
+    memcpy(preservedXboxThreadIds, s.xboxThreadIds, sizeof(preservedXboxThreadIds));
+    memcpy(preservedXboxNativeThreadIds, s.xboxNativeThreadIds, sizeof(preservedXboxNativeThreadIds));
+    memcpy(preservedXboxThreadSystemRoutine, s.xboxThreadSystemRoutine, sizeof(preservedXboxThreadSystemRoutine));
+    memcpy(preservedXboxThreadStartRoutine, s.xboxThreadStartRoutine, sizeof(preservedXboxThreadStartRoutine));
+    memcpy(preservedXboxThreadLabels, s.xboxThreadLabels, sizeof(preservedXboxThreadLabels));
+    memcpy(preservedXboxThreadSampleCycleStart, s.xboxThreadSampleCycleStart, sizeof(preservedXboxThreadSampleCycleStart));
+
     memset(&s, 0, sizeof(s));
+    s.xboxThreadCount = preservedXboxThreadCount;
+    memcpy(s.xboxThreads, preservedXboxThreads, sizeof(s.xboxThreads));
+    memcpy(s.xboxThreadCycleStart, preservedXboxThreadCycleStart, sizeof(s.xboxThreadCycleStart));
+    memcpy(s.xboxThreadIds, preservedXboxThreadIds, sizeof(s.xboxThreadIds));
+    memcpy(s.xboxNativeThreadIds, preservedXboxNativeThreadIds, sizeof(s.xboxNativeThreadIds));
+    memcpy(s.xboxThreadSystemRoutine, preservedXboxThreadSystemRoutine, sizeof(s.xboxThreadSystemRoutine));
+    memcpy(s.xboxThreadStartRoutine, preservedXboxThreadStartRoutine, sizeof(s.xboxThreadStartRoutine));
+    memcpy(s.xboxThreadLabels, preservedXboxThreadLabels, sizeof(s.xboxThreadLabels));
+    memcpy(s.xboxThreadSampleCycleStart, preservedXboxThreadSampleCycleStart, sizeof(s.xboxThreadSampleCycleStart));
 
     LARGE_INTEGER freq, now;
     QueryPerformanceFrequency(&freq);
@@ -309,12 +1050,21 @@ void Init(const char* logPath)
             "# Cxbx-Reloaded PerfTrace — report every %.0f s\n"
             "# columns: frame | ftime(ms) | fps(instant) | fps(~smooth) | xcpu(ms,xN threads) | swap | blit | pres | end | sleep | gbuf | native(xN) | tex | ps | vs | draw | vtx(hits/misses) | rsrc(xN) | cmp | rs | ts | vd[dc co bs kd bu up vp] | kewait kedelay | rkw(render-thread kewait) rkd(render-thread kedelay)\n"
             "# suspect frames may emit xthr lines with top Xbox CPU threads: xb=<guest id> nt=<native id> sr=<start routine> sys=<system routine>\n"
+            "# window summaries also emit SampleThread, SampleThreadPc, and PcHotspot lines from a %d ms process-wide PC sampler\n"
             "#\n",
-            (double)PERF_REPORT_INTERVAL_S);
+            (double)PERF_REPORT_INTERVAL_S,
+            PERF_SAMPLER_INTERVAL_MS);
         fflush(s.logFile);
         fprintf(stdout, "[PerfTrace] logging to %s\n", logPath);
     } else {
         fprintf(stderr, "[PerfTrace] ERROR: cannot open %s\n", logPath);
+    }
+
+    if (s.logFile) {
+        InitializeCriticalSection(&s.sampleLock);
+        s.sampleLockInitialized = true;
+        EnsureSymbolsInitialized(s);
+        s.samplerThread = CreateThread(nullptr, 0, SampleProfilerThreadProc, nullptr, 0, &s.samplerThreadId);
     }
 
     // Calibrate CPU frequency for TSC cycle -> ms conversion.
@@ -432,6 +1182,12 @@ void OnSwapBegin()
             }
             if (s.xboxThreadKeDelayFrameTicks[i] > s.xboxThreadKeDelayWindowMaxFrameTicks[i]) {
                 s.xboxThreadKeDelayWindowMaxFrameTicks[i] = s.xboxThreadKeDelayFrameTicks[i];
+            }
+            if (s.xboxThreadDelayPollFrameCounts[i] > s.xboxThreadDelayPollWindowMaxFrameCounts[i]) {
+                s.xboxThreadDelayPollWindowMaxFrameCounts[i] = s.xboxThreadDelayPollFrameCounts[i];
+            }
+            if (s.xboxThreadWaitPollFrameCounts[i] > s.xboxThreadWaitPollWindowMaxFrameCounts[i]) {
+                s.xboxThreadWaitPollWindowMaxFrameCounts[i] = s.xboxThreadWaitPollFrameCounts[i];
             }
         }
 
@@ -575,6 +1331,8 @@ void OnSwapBegin()
     memset(s.vsKickDrainFrameTicks, 0, sizeof(s.vsKickDrainFrameTicks));
     memset(s.xboxThreadKeWaitFrameTicks, 0, sizeof(s.xboxThreadKeWaitFrameTicks));
     memset(s.xboxThreadKeDelayFrameTicks, 0, sizeof(s.xboxThreadKeDelayFrameTicks));
+    memset(s.xboxThreadDelayPollFrameCounts, 0, sizeof(s.xboxThreadDelayPollFrameCounts));
+    memset(s.xboxThreadWaitPollFrameCounts, 0, sizeof(s.xboxThreadWaitPollFrameCounts));
     g_VtxCacheHits = 0;
     g_VtxCacheMisses = 0;
 
@@ -629,6 +1387,111 @@ void Report()
             s.xboxThreadLabels[idx]);
     }
 
+    if (s.sampleLockInitialized) {
+        EnterCriticalSection(&s.sampleLock);
+
+        for (int slot = 0; slot < PERF_REPORT_TOP_XBOX_THREADS; slot++) {
+            int idx = topIdx[slot];
+            if (idx < 0 || s.xboxThreadSampleCycles[idx] == 0) {
+                continue;
+            }
+
+            int topXboxPcIdx[PERF_REPORT_TOP_THREAD_PC_SAMPLES];
+            FindTopThreadPcSampleIndices(s.xboxThreadPcSamples[idx], topXboxPcIdx);
+            for (int pcSlot = 0; pcSlot < PERF_REPORT_TOP_THREAD_PC_SAMPLES; pcSlot++) {
+                int pcIdx = topXboxPcIdx[pcSlot];
+                if (pcIdx < 0) {
+                    continue;
+                }
+
+                const auto& pcSample = s.xboxThreadPcSamples[idx][pcIdx];
+                std::string resolvedPc = ResolveSamplePc(s, pcSample.pc);
+                fprintf(
+                    s.logFile,
+                    "    XcpuThreadPc[%d.%d] cpu=%6.2f ms  pct=%5.1f%%  hits=%6u  %s\n",
+                    slot,
+                    pcSlot,
+                    (double)pcSample.cycles / (s.cpuGhz * 1e6),
+                    (double)pcSample.cycles * 100.0 / (double)s.xboxThreadSampleCycles[idx],
+                    pcSample.hits,
+                    resolvedPc.c_str());
+            }
+        }
+
+        int topSampleThreadIdx[PERF_REPORT_TOP_SAMPLED_THREADS];
+        FindTopSampledThreadIndices(s.sampledThreads, topSampleThreadIdx);
+        for (int slot = 0; slot < PERF_REPORT_TOP_SAMPLED_THREADS; slot++) {
+            int idx = topSampleThreadIdx[slot];
+            if (idx < 0) {
+                continue;
+            }
+
+            fprintf(
+                s.logFile,
+                "  SampleThread[%d] cpu=%6.2f ms  hits=%6u  %s\n",
+                slot,
+                (double)s.sampledThreads[idx].cycles / (s.cpuGhz * 1e6),
+                s.sampledThreads[idx].hits,
+                s.sampledThreads[idx].label);
+
+            int topThreadPcIdx[PERF_REPORT_TOP_THREAD_PC_SAMPLES];
+            FindTopThreadPcSampleIndices(s.sampledThreads[idx].pcSamples, topThreadPcIdx);
+            for (int pcSlot = 0; pcSlot < PERF_REPORT_TOP_THREAD_PC_SAMPLES; pcSlot++) {
+                int pcIdx = topThreadPcIdx[pcSlot];
+                if (pcIdx < 0) {
+                    continue;
+                }
+
+                const auto& pcSample = s.sampledThreads[idx].pcSamples[pcIdx];
+                std::string resolvedPc = ResolveSamplePc(s, pcSample.pc);
+                fprintf(
+                    s.logFile,
+                    "    SampleThreadPc[%d.%d] cpu=%6.2f ms  pct=%5.1f%%  hits=%6u  %s\n",
+                    slot,
+                    pcSlot,
+                    (double)pcSample.cycles / (s.cpuGhz * 1e6),
+                    (double)pcSample.cycles * 100.0 / (double)s.sampledThreads[idx].cycles,
+                    pcSample.hits,
+                    resolvedPc.c_str());
+            }
+        }
+
+        if (s.processPcSampleTotalCycles > 0) {
+            int topPcIdx[PERF_REPORT_TOP_PC_SAMPLES];
+            FindTopPcSampleIndices(s.processPcSamples, topPcIdx);
+            for (int slot = 0; slot < PERF_REPORT_TOP_PC_SAMPLES; slot++) {
+                int idx = topPcIdx[slot];
+                if (idx < 0) {
+                    continue;
+                }
+
+                std::string resolvedPc = ResolveSamplePc(s, s.processPcSamples[idx].pc);
+                fprintf(
+                    s.logFile,
+                    "  PcHotspot[%d]   cpu=%6.2f ms  pct=%5.1f%%  hits=%6u  %s\n",
+                    slot,
+                    (double)s.processPcSamples[idx].cycles / (s.cpuGhz * 1e6),
+                    (double)s.processPcSamples[idx].cycles * 100.0 / (double)s.processPcSampleTotalCycles,
+                    s.processPcSamples[idx].hits,
+                    resolvedPc.c_str());
+            }
+        }
+
+        for (int i = 0; i < PERF_MAX_SAMPLED_THREADS; i++) {
+            s.sampledThreads[i].hits = 0;
+            s.sampledThreads[i].cycles = 0;
+            memset(s.sampledThreads[i].pcSamples, 0, sizeof(s.sampledThreads[i].pcSamples));
+        }
+        memset(s.xboxThreadSampleHits, 0, sizeof(s.xboxThreadSampleHits));
+        memset(s.xboxThreadSampleCycles, 0, sizeof(s.xboxThreadSampleCycles));
+        memset(s.xboxThreadPcSamples, 0, sizeof(s.xboxThreadPcSamples));
+        memset(s.processPcSamples, 0, sizeof(s.processPcSamples));
+        s.processPcSampleTotal = 0;
+        s.processPcSampleTotalCycles = 0;
+
+        LeaveCriticalSection(&s.sampleLock);
+    }
+
     int topWaitIdx[PERF_REPORT_TOP_XBOX_THREADS];
     FindTopXboxThreadTickIndices(s.xboxThreadKeWaitWindowTicks, nthr, topWaitIdx);
     for (int slot = 0; slot < PERF_REPORT_TOP_XBOX_THREADS; slot++) {
@@ -662,6 +1525,42 @@ void Report()
             (double)s.xboxThreadKeDelayWindowTicks[idx] / (double)s.freq * 1000.0 / framesInWindow,
             (double)s.xboxThreadKeDelayWindowMaxFrameTicks[idx] / (double)s.freq * 1000.0,
             (double)s.xboxThreadKeDelayWindowTicks[idx] / (double)s.freq * 1000.0,
+            s.xboxThreadLabels[idx]);
+    }
+
+    int topDelayPollIdx[PERF_REPORT_TOP_XBOX_THREADS];
+    FindTopXboxThreadCountIndices(s.xboxThreadDelayPollWindowCounts, nthr, topDelayPollIdx);
+    for (int slot = 0; slot < PERF_REPORT_TOP_XBOX_THREADS; slot++) {
+        int idx = topDelayPollIdx[slot];
+        if (idx < 0) {
+            continue;
+        }
+
+        fprintf(
+            s.logFile,
+            "  DelayPollThread[%d] avg/frame=%6.1f  max/frame=%6u  total=%8u  %s\n",
+            slot,
+            (double)s.xboxThreadDelayPollWindowCounts[idx] / framesInWindow,
+            s.xboxThreadDelayPollWindowMaxFrameCounts[idx],
+            s.xboxThreadDelayPollWindowCounts[idx],
+            s.xboxThreadLabels[idx]);
+    }
+
+    int topWaitPollIdx[PERF_REPORT_TOP_XBOX_THREADS];
+    FindTopXboxThreadCountIndices(s.xboxThreadWaitPollWindowCounts, nthr, topWaitPollIdx);
+    for (int slot = 0; slot < PERF_REPORT_TOP_XBOX_THREADS; slot++) {
+        int idx = topWaitPollIdx[slot];
+        if (idx < 0) {
+            continue;
+        }
+
+        fprintf(
+            s.logFile,
+            "  WaitPollThread[%d]  avg/frame=%6.1f  max/frame=%6u  total=%8u  %s\n",
+            slot,
+            (double)s.xboxThreadWaitPollWindowCounts[idx] / framesInWindow,
+            s.xboxThreadWaitPollWindowMaxFrameCounts[idx],
+            s.xboxThreadWaitPollWindowCounts[idx],
             s.xboxThreadLabels[idx]);
     }
 
@@ -725,6 +1624,10 @@ void Report()
     memset(s.xboxThreadKeWaitWindowMaxFrameTicks, 0, sizeof(s.xboxThreadKeWaitWindowMaxFrameTicks));
     memset(s.xboxThreadKeDelayWindowTicks, 0, sizeof(s.xboxThreadKeDelayWindowTicks));
     memset(s.xboxThreadKeDelayWindowMaxFrameTicks, 0, sizeof(s.xboxThreadKeDelayWindowMaxFrameTicks));
+    memset(s.xboxThreadDelayPollWindowCounts, 0, sizeof(s.xboxThreadDelayPollWindowCounts));
+    memset(s.xboxThreadDelayPollWindowMaxFrameCounts, 0, sizeof(s.xboxThreadDelayPollWindowMaxFrameCounts));
+    memset(s.xboxThreadWaitPollWindowCounts, 0, sizeof(s.xboxThreadWaitPollWindowCounts));
+    memset(s.xboxThreadWaitPollWindowMaxFrameCounts, 0, sizeof(s.xboxThreadWaitPollWindowMaxFrameCounts));
     memset(s.vsKickDrainKeys, 0, sizeof(s.vsKickDrainKeys));
     memset(s.vsKickDrainHandles, 0, sizeof(s.vsKickDrainHandles));
 	memset(s.vsKickDrainCacheHashes, 0, sizeof(s.vsKickDrainCacheHashes));

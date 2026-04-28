@@ -62,6 +62,7 @@
 #include "devices\LED.h" // For LED::Sequence
 #include "common\crypto\EmuSha.h" // For the SHA1 functions
 #include "common/Timer.h" // For Timer_Init
+#include "common/BetaConfig.h"
 #include "common\input\InputManager.h" // For the InputDeviceManager
 #include "core/kernel/support/NativeHandle.h"
 #include "common/win32/Util.h" // for WinError2Str
@@ -627,8 +628,10 @@ static bool CxbxrKrnlXbeSystemSelector(int BootFlags,
 
 		// Extract SEGABOOT_OLD.XBE and SEGABOOT.XBE from Media Rom
 		// We only do this if SEGABOOT_OLD and SEGABOOT.XBE are *not* already present
-		std::string chihiroSegaBootOld = g_MediaBoardBasePath + MediaBoardSegaBoot0;
-		std::string chihiroSegaBootNew = g_MediaBoardBasePath + MediaBoardSegaBoot1;
+		// Use per-game path when available so each title gets its own extracted SEGABOOT.
+		const std::string& segabootBase = g_GameMediaBoardPath.empty() ? g_MediaBoardBasePath : g_GameMediaBoardPath;
+		std::string chihiroSegaBootOld = segabootBase + MediaBoardSegaBoot0;
+		std::string chihiroSegaBootNew = segabootBase + MediaBoardSegaBoot1;
 		if (!std::filesystem::exists(chihiroSegaBootOld) || !std::filesystem::exists(chihiroSegaBootNew)) {
 			FILE* fpSegaBootOld = fopen(chihiroSegaBootOld.c_str(), "wb");
 			FILE* fpSegaBootNew = fopen(chihiroSegaBootNew.c_str(), "wb");
@@ -1107,6 +1110,8 @@ static void CxbxrKrnlInitHacks()
 
 	// Initialize timer subsystem
 	timer_init();
+	// Load beta feature toggles from beta.ini
+	BetaConfig_Load();
 	// for unicode conversions
 	setlocale(LC_ALL, "English");
 	// Initialize DPC global

@@ -26,9 +26,16 @@
 
 #include "PatchUtil.h"
 #include "ChihiroPatches.h"
+#include "common\xbox_types.h"
 #include "core\kernel\support\Emu.h"
 
 #include "devices\chihiro\JvsIo.h"
+
+#include <initializer_list>
+#include <map>
+#include <string>
+
+extern std::map<std::string, xbox::addr_xt> g_SymbolAddresses;
 
 // ── Hook functions ────────────────────────────────────────────────
 
@@ -116,10 +123,30 @@ static int __cdecl GundamGetStatHook(int handle) {
 }
 
 // ── XBE hash constants ───────────────────────────────────────────
+static constexpr uint64_t kGundamTestMenuHash = 0x955c9cb503f1520fULL; // gs_gtest.xbe
+static constexpr uint64_t kGundamMainGameHash = 0x6b43ff6b6398a88fULL; // gs.xbe
+
 static const uint64_t kGundamHashes[] = {
-	0x955c9cb503f1520fULL, // gs_gtest.xbe (Gundam BOS test menu)
-	0x6b43ff6b6398a88fULL, // gs.xbe       (Gundam BOS main game)
+	kGundamTestMenuHash,
+	kGundamMainGameHash,
 };
+
+static bool IsGundamTestMenuXbe(uint64_t xbeHash)
+{
+	return xbeHash == kGundamTestMenuHash;
+}
+
+static uintptr_t LookupSymbolAddress(std::initializer_list<const char*> symbolNames)
+{
+	for (const char* symbolName : symbolNames) {
+		auto it = g_SymbolAddresses.find(symbolName);
+		if (it != g_SymbolAddresses.end() && it->second != 0) {
+			return it->second;
+		}
+	}
+
+	return 0;
+}
 
 bool IsGundamXbe(uint64_t xbeHash)
 {
@@ -144,6 +171,69 @@ static int __cdecl GundamDimmUpdateSmartHook() {
 	// spins sub_98050 at max speed and pins core 0 at 100%.
 	Sleep(1);
 	return 0;
+}
+
+static void ApplyGundamTestMenuBootPatches(uint32_t imageSize)
+{
+	printf("GundamPatch: enabling test-menu boot profile\n");
+
+	// The service/test menu still needs the older DIMM startup bypass set.
+	// Keep these scoped to gs_gtest.xbe so the main game stays on the current profile.
+	{
+		static const uint8_t kErr5Pat[] = {
+			0xE8, 0xFF,0xFF,0xFF,0xFF,
+			0x80,0x78,0x10,0x01,
+			0x74,0x0A,
+			0xC7,0x05, 0xFF,0xFF,0xFF,0xFF,
+			0x05,0x00,0x00,0x00
+		};
+		uintptr_t err5VA = ScanXbe(kErr5Pat, sizeof(kErr5Pat), imageSize);
+		if (err5VA) {
+			static const uint8_t kJmp = 0xEB;
+			PatchXbeBytes(err5VA + 9, &kJmp, 1);
+			printf("GundamPatch[test-menu]: Error-5 bypass at 0x%08X\n", (unsigned)(err5VA + 9));
+		} else {
+			printf("GundamPatch[test-menu]: Error-5 pattern not found\n");
+		}
+	}
+
+	{
+		static const uint8_t kInitDonePat[] = {
+			0xA1, 0xFF,0xFF,0xFF,0xFF,
+			0xC3,
+			0xCC,0xCC,0xCC,0xCC
+		};
+		uintptr_t initDoneVA = ScanXbe(kInitDonePat, sizeof(kInitDonePat), imageSize);
+		if (initDoneVA) {
+			static const uint8_t kRet1[] = { 0xB8,0x01,0x00,0x00,0x00, 0xC3 };
+			PatchXbeBytes(initDoneVA, kRet1, sizeof(kRet1));
+			printf("GundamPatch[test-menu]: Init-done patched at 0x%08X\n", (unsigned)initDoneVA);
+		} else {
+			printf("GundamPatch[test-menu]: Init-done pattern not found\n");
+		}
+	}
+
+	// NOTE: GundamDimmInitHook is NOT applied for the test menu.
+	// The hook writes to hardcoded main-game absolute addresses (0x688540,
+	// 0x688CE4, 0x67ABF8, etc.) which are wrong for the test-menu XBE and
+	// corrupt its memory, causing a crash.  The working reference build never
+	// applied this hook to the test menu (its hardcoded pattern didn't match).
+
+	{
+		static const uint8_t kThreadGatePat[] = {
+			0x51, 0x8B, 0x0D, 0xFF,0xFF,0xFF,0xFF,
+			0x8D, 0x04, 0x24, 0x50, 0x51,
+			0xC7, 0x44, 0x24, 0x08, 0x03, 0x01, 0x00, 0x00
+		};
+		uintptr_t threadGateVA = ScanXbe(kThreadGatePat, sizeof(kThreadGatePat), imageSize);
+		if (threadGateVA) {
+			static const uint8_t kRetTrue[] = { 0xB8,0x01,0x00,0x00,0x00, 0xC3 };
+			PatchXbeBytes(threadGateVA, kRetTrue, sizeof(kRetTrue));
+			printf("GundamPatch[test-menu]: Thread-gate patched at 0x%08X\n", (unsigned)threadGateVA);
+		} else {
+			printf("GundamPatch[test-menu]: Thread-gate pattern not found\n");
+		}
+	}
 }
 
 // ── Patch toggle flags — set to 0 to disable individual patches ──
@@ -172,9 +262,13 @@ static int __cdecl GundamDimmUpdateSmartHook() {
 
 // ── Main patch entry point ───────────────────────────────────────
 
-void ApplyGundamPatches(uint32_t imageSize)
+void ApplyGundamPatches(uint64_t xbeHash, uint32_t imageSize)
 {
-	printf("GundamPatch: applying patches (imageSize=0x%X)\n", imageSize);
+	const bool isTestMenu = IsGundamTestMenuXbe(xbeHash);
+	printf("GundamPatch: applying patches (imageSize=0x%X, xbeHash=0x%016llX%s)\n",
+		imageSize,
+		(unsigned long long)xbeHash,
+		isTestMenu ? ", test-menu profile" : "");
 
 #if GP_LINKOK
 	// === LinkOK — JMP hook to GundamLinkOkHook ===
@@ -410,20 +504,24 @@ void ApplyGundamPatches(uint32_t imageSize)
 
 #if GP_BLOCK_RESOURCE
 	// === D3D_BlockOnResource NOP-stub ===
-	// D3D_BlockOnResource polls NV2A fence registers to wait for a resource to
-	// become available. In HLE mode, fences are not maintained so the poll
-	// never completes.  The symbol is detected but has no HLE patch registered.
-	// Stub with RET 4 (one DWORD arg: X_D3DResource* pResource, __stdcall).
-	{
-		const uintptr_t kBlockResVA = 0x000AF900; // from symbol cache
-		const uint8_t* probe = (const uint8_t*)kBlockResVA;
-		// Verify address contains valid code (not already patched or padding)
-		if (probe[0] != 0xC2 && probe[0] != 0xC3 && probe[0] != 0xCC) {
-			static const uint8_t kRet4[] = { 0xC2, 0x04, 0x00 }; // RET 4
-			PatchXbeBytes(kBlockResVA, kRet4, sizeof(kRet4));
-			printf("GundamPatch: D3D_BlockOnResource stubbed at 0x%08X\n", (unsigned)kBlockResVA);
+	// Not in the working reference — only apply for main game.
+	if (!isTestMenu) {
+		const uintptr_t blockResVA = LookupSymbolAddress({
+			"D3D_BlockOnResource",
+			"D3D_BlockOnResource_0__LTCG_eax1",
+			"D3D_BlockOnResource_0__LTCG_ecx1"
+		});
+		if (blockResVA != 0) {
+			const uint8_t* probe = (const uint8_t*)blockResVA;
+			if (probe[0] != 0xC2 && probe[0] != 0xC3 && probe[0] != 0xCC) {
+				static const uint8_t kRet4[] = { 0xC2, 0x04, 0x00 }; // RET 4
+				PatchXbeBytes(blockResVA, kRet4, sizeof(kRet4));
+				printf("GundamPatch: D3D_BlockOnResource stubbed at 0x%08X\n", (unsigned)blockResVA);
+			} else {
+				printf("GundamPatch: D3D_BlockOnResource prologue mismatch at 0x%08X\n", (unsigned)blockResVA);
+			}
 		} else {
-			printf("GundamPatch: D3D_BlockOnResource prologue mismatch at 0x%08X\n", (unsigned)kBlockResVA);
+			printf("GundamPatch: D3D_BlockOnResource symbol not found\n");
 		}
 	}
 #endif
@@ -433,31 +531,36 @@ void ApplyGundamPatches(uint32_t imageSize)
 
 #if GP_BLOCK_VBLANK
 	// === D3DDevice_BlockUntilVerticalBlank NOP-stub ===
-	// Busy-waits for VSync by polling NV2A PCRTC registers. The HLE patch for
-	// this function was commented out upstream (no implementation). Stub with RET.
-	// __stdcall, no params.
-	{
-		const uintptr_t kBlockVBlankVA = 0x000AB0D0; // from symbol cache
-		const uint8_t* probe = (const uint8_t*)kBlockVBlankVA;
-		if (probe[0] != 0xC2 && probe[0] != 0xC3) { // not already patched
-			static const uint8_t kRet = 0xC3;
-			PatchXbeBytes(kBlockVBlankVA, &kRet, 1);
-			printf("GundamPatch: D3DDevice_BlockUntilVerticalBlank stubbed at 0x%08X\n", (unsigned)kBlockVBlankVA);
+	// Not in the working reference — only apply for main game.
+	if (!isTestMenu) {
+		const uintptr_t blockVBlankVA = LookupSymbolAddress({ "D3DDevice_BlockUntilVerticalBlank" });
+		if (blockVBlankVA != 0) {
+			const uint8_t* probe = (const uint8_t*)blockVBlankVA;
+			if (probe[0] != 0xC2 && probe[0] != 0xC3) {
+				static const uint8_t kRet = 0xC3;
+				PatchXbeBytes(blockVBlankVA, &kRet, 1);
+				printf("GundamPatch: D3DDevice_BlockUntilVerticalBlank stubbed at 0x%08X\n", (unsigned)blockVBlankVA);
+			}
+		} else {
+			printf("GundamPatch: D3DDevice_BlockUntilVerticalBlank symbol not found\n");
 		}
 	}
 #endif
 
 #if GP_FLIP_PENDING
 	// === CMiniport_IsFlipPending NOP-stub ===
-	// Polls NV2A for pending display flips. In HLE mode, return 0 (not pending).
-	// __thiscall (ECX = this), no stack args. Stub with XOR EAX,EAX; RET.
-	{
-		const uintptr_t kFlipPendVA = 0x000B20A0; // from symbol cache
-		const uint8_t* probe = (const uint8_t*)kFlipPendVA;
-		if (probe[0] != 0x33 && probe[0] != 0xC2 && probe[0] != 0xC3) { // not already patched
-			static const uint8_t kRet0[] = { 0x33, 0xC0, 0xC3 }; // XOR EAX,EAX; RET
-			PatchXbeBytes(kFlipPendVA, kRet0, sizeof(kRet0));
-			printf("GundamPatch: CMiniport_IsFlipPending stubbed at 0x%08X\n", (unsigned)kFlipPendVA);
+	// Not in the working reference — only apply for main game.
+	if (!isTestMenu) {
+		const uintptr_t flipPendVA = LookupSymbolAddress({ "CMiniport_IsFlipPending" });
+		if (flipPendVA != 0) {
+			const uint8_t* probe = (const uint8_t*)flipPendVA;
+			if (probe[0] != 0x33 && probe[0] != 0xC2 && probe[0] != 0xC3) {
+				static const uint8_t kRet0[] = { 0x33, 0xC0, 0xC3 }; // XOR EAX,EAX; RET
+				PatchXbeBytes(flipPendVA, kRet0, sizeof(kRet0));
+				printf("GundamPatch: CMiniport_IsFlipPending stubbed at 0x%08X\n", (unsigned)flipPendVA);
+			}
+		} else {
+			printf("GundamPatch: CMiniport_IsFlipPending symbol not found\n");
 		}
 	}
 #endif
@@ -553,14 +656,18 @@ void ApplyGundamPatches(uint32_t imageSize)
 	// === Card reader state machine stub (sub_992F0 → XOR EAX,EAX; RET) ===
 	// 6-state machine with retry loops (up to 60 retries). Not needed for gameplay.
 	{
-		const uintptr_t sub992F0 = 0x000992F0;
-		const uint8_t* probe = (const uint8_t*)sub992F0;
-		if (probe[0] != 0xC3 && probe[0] != 0xCC) {
-			static const uint8_t kRet0[] = { 0x33, 0xC0, 0xC3 };
-			PatchXbeBytes(sub992F0, kRet0, sizeof(kRet0));
-			printf("GundamPatch: Card reader stubbed at 0x%08X\n", (unsigned)sub992F0);
+		if (isTestMenu) {
+			printf("GundamPatch: Card reader stub skipped for test-menu (main-XBE static offset)\n");
 		} else {
-			printf("GundamPatch: Card reader already patched at 0x%08X\n", (unsigned)sub992F0);
+			const uintptr_t sub992F0 = 0x000992F0;
+			const uint8_t* probe = (const uint8_t*)sub992F0;
+			if (probe[0] != 0xC3 && probe[0] != 0xCC) {
+				static const uint8_t kRet0[] = { 0x33, 0xC0, 0xC3 };
+				PatchXbeBytes(sub992F0, kRet0, sizeof(kRet0));
+				printf("GundamPatch: Card reader stubbed at 0x%08X\n", (unsigned)sub992F0);
+			} else {
+				printf("GundamPatch: Card reader already patched at 0x%08X\n", (unsigned)sub992F0);
+			}
 		}
 	}
 #endif

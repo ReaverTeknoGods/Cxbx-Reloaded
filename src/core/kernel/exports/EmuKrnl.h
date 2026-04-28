@@ -28,6 +28,8 @@
 #include "core\kernel\init\CxbxKrnl.h"
 #include "core\kernel\support\Emu.h"
 #include "core\kernel\support\EmuFS.h"
+#include "common\Timer.h"
+#include "common\BetaConfig.h"
 #include "EmuKrnlKi.h"
 #include <future>
 
@@ -110,6 +112,23 @@ void RestoreInterruptMode(bool value);
 void CallSoftwareInterrupt(const xbox::KIRQL SoftwareIrql);
 bool AddWaitObject(xbox::PKTHREAD kThread, xbox::PLARGE_INTEGER Timeout);
 
+template<bool host_wait>
+inline void WaitApcPollPause(uint32_t& consecutiveHostPolls)
+{
+	if constexpr (host_wait) {
+		if (++consecutiveHostPolls >= 256) {
+			consecutiveHostPolls = 0;
+			Sleep(1);
+		}
+		else {
+			std::this_thread::yield();
+		}
+	}
+	else {
+		std::this_thread::yield();
+	}
+}
+
 template<typename T>
 std::optional<xbox::ntstatus_xt> SatisfyWait(T &&Lambda, xbox::PKTHREAD kThread, xbox::boolean_xt Alertable, xbox::char_xt WaitMode)
 {
@@ -117,21 +136,40 @@ std::optional<xbox::ntstatus_xt> SatisfyWait(T &&Lambda, xbox::PKTHREAD kThread,
 		return ret;
 	}
 
-	xbox::KiApcListMtx.lock();
-	bool EmptyKernel = IsListEmpty(&kThread->ApcState.ApcListHead[xbox::KernelMode]);
-	bool EmptyUser = IsListEmpty(&kThread->ApcState.ApcListHead[xbox::UserMode]);
-	xbox::KiApcListMtx.unlock();
+	if (g_BetaConfig.satisfy_wait_apc_flags) {
+		// Use APC pending flags instead of locking KiApcListMtx to avoid deadlock
+		// when a natively-suspended thread holds the mutex
+		if (kThread->ApcState.KernelApcPending) {
+			xbox::KiExecuteKernelApc();
+		}
 
-	if (EmptyKernel == false) {
-		xbox::KiExecuteKernelApc();
-	}
+		if (kThread->ApcState.UserApcPending &&
+			(Alertable == TRUE) &&
+			(WaitMode == xbox::UserMode)) {
+			xbox::KiExecuteUserApc();
+			xbox::KiUnwaitThreadAndLock(kThread, X_STATUS_USER_APC, 0);
+			return kThread->WaitStatus;
+		}
+	} else {
+		// Old path: lock the APC list mutex and check directly
+		xbox::KiApcListMtx.lock();
+		if (!IsListEmpty(&kThread->ApcState.ApcListHead[xbox::KernelMode])) {
+			xbox::KiApcListMtx.unlock();
+			xbox::KiExecuteKernelApc();
+		} else {
+			xbox::KiApcListMtx.unlock();
+		}
 
-	if ((EmptyUser == false) &&
-		(Alertable == TRUE) &&
-		(WaitMode == xbox::UserMode)) {
-		xbox::KiExecuteUserApc();
-		xbox::KiUnwaitThreadAndLock(kThread, X_STATUS_USER_APC, 0);
-		return kThread->WaitStatus;
+		xbox::KiApcListMtx.lock();
+		if (!IsListEmpty(&kThread->ApcState.ApcListHead[xbox::UserMode]) &&
+			(Alertable == TRUE) &&
+			(WaitMode == xbox::UserMode)) {
+			xbox::KiApcListMtx.unlock();
+			xbox::KiExecuteUserApc();
+			xbox::KiUnwaitThreadAndLock(kThread, X_STATUS_USER_APC, 0);
+			return kThread->WaitStatus;
+		}
+		xbox::KiApcListMtx.unlock();
 	}
 
 	return std::nullopt;
@@ -144,6 +182,17 @@ xbox::ntstatus_xt WaitApc(T &&Lambda, xbox::PLARGE_INTEGER Timeout, xbox::boolea
 	// also interrupt the wait.
 
 	xbox::ntstatus_xt status;
+	uint32_t consecutiveHostPolls = 0;
+	uint32_t consecutiveGuestInfinitePolls = 0;
+	std::chrono::steady_clock::time_point relativeTimeoutTarget = std::chrono::steady_clock::time_point::min();
+	bool passiveRelativeWait = false;
+	if (Timeout != nullptr && Timeout->QuadPart < 0) {
+		auto relativeTimeoutDuration = std::chrono::nanoseconds((-Timeout->QuadPart) * 100LL);
+		if (relativeTimeoutDuration > std::chrono::milliseconds(2)) {
+			relativeTimeoutTarget = std::chrono::steady_clock::now() + relativeTimeoutDuration;
+			passiveRelativeWait = true;
+		}
+	}
 	if (Timeout == nullptr) {
 		// No timout specified, so this is an infinite wait until an alert, a user apc or the object(s) become(s) signalled
 		while (true) {
@@ -152,7 +201,17 @@ xbox::ntstatus_xt WaitApc(T &&Lambda, xbox::PLARGE_INTEGER Timeout, xbox::boolea
 				break;
 			}
 
-			std::this_thread::yield();
+			if constexpr (!host_wait) {
+				constexpr uint32_t guestInfinitePollSleepThreshold = 64;
+				constexpr auto guestInfinitePollSleepQuantum = std::chrono::microseconds(250);
+				if (++consecutiveGuestInfinitePolls >= guestInfinitePollSleepThreshold) {
+					consecutiveGuestInfinitePolls = 0;
+					SleepPassive(guestInfinitePollSleepQuantum);
+					continue;
+				}
+			}
+
+			WaitApcPollPause<host_wait>(consecutiveHostPolls);
 		}
 	}
 	else if (Timeout->QuadPart == 0) {
@@ -181,7 +240,22 @@ xbox::ntstatus_xt WaitApc(T &&Lambda, xbox::PLARGE_INTEGER Timeout, xbox::boolea
 				break;
 			}
 
-			std::this_thread::yield();
+			if (passiveRelativeWait) {
+				constexpr auto passiveWaitSleepQuantum = std::chrono::microseconds(250);
+				constexpr auto passiveWaitSpinWindow = std::chrono::microseconds(125);
+				auto now = std::chrono::steady_clock::now();
+				if (now + passiveWaitSpinWindow < relativeTimeoutTarget) {
+					auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(relativeTimeoutTarget - now - passiveWaitSpinWindow);
+					if (remaining > std::chrono::microseconds::zero()) {
+						auto sleepFor = std::min(remaining, passiveWaitSleepQuantum);
+						SleepPassive(sleepFor);
+						consecutiveHostPolls = 0;
+						continue;
+					}
+				}
+			}
+
+			WaitApcPollPause<host_wait>(consecutiveHostPolls);
 		}
 	}
 

@@ -54,9 +54,58 @@ typedef struct tagTHREADNAME_INFO
 } THREADNAME_INFO;
 #pragma pack(pop)  
 
+static void SetThreadDescriptionCompat(DWORD dwThreadID, const char* szThreadName)
+{
+	if (szThreadName == nullptr || szThreadName[0] == '\0') {
+		return;
+	}
+
+	using SetThreadDescriptionFn = HRESULT(WINAPI*)(HANDLE, PCWSTR);
+	static SetThreadDescriptionFn s_setThreadDescription = []() -> SetThreadDescriptionFn {
+		HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+		if (kernel32 == nullptr) {
+			return nullptr;
+		}
+
+		return reinterpret_cast<SetThreadDescriptionFn>(GetProcAddress(kernel32, "SetThreadDescription"));
+	}();
+
+	if (s_setThreadDescription == nullptr) {
+		return;
+	}
+
+	HANDLE threadHandle = nullptr;
+	bool closeHandle = false;
+	if (dwThreadID == GetCurrentThreadId()) {
+		threadHandle = GetCurrentThread();
+	} else {
+		threadHandle = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, dwThreadID);
+		if (threadHandle == nullptr) {
+			threadHandle = OpenThread(THREAD_SET_INFORMATION, FALSE, dwThreadID);
+		}
+		closeHandle = threadHandle != nullptr;
+	}
+
+	if (threadHandle == nullptr) {
+		return;
+	}
+
+	wchar_t wideName[128] = {};
+	int converted = MultiByteToWideChar(CP_ACP, 0, szThreadName, -1, wideName, ARRAYSIZE(wideName));
+	if (converted > 0) {
+		s_setThreadDescription(threadHandle, wideName);
+	}
+
+	if (closeHandle) {
+		CloseHandle(threadHandle);
+	}
+}
+
 #ifdef _MSC_VER
 void SetThreadName(DWORD dwThreadID, const char* szThreadName)
 {
+	SetThreadDescriptionCompat(dwThreadID, szThreadName);
+
 	if (!IsDebuggerPresent())
 		return;
 
@@ -79,7 +128,7 @@ void SetThreadName(DWORD dwThreadID, const char* szThreadName)
 #else
 void SetThreadName(DWORD dwThreadID, const char* szThreadName)
 {
-	// TODO: Use SetThreadDescription
+	SetThreadDescriptionCompat(dwThreadID, szThreadName);
 }
 #endif
 

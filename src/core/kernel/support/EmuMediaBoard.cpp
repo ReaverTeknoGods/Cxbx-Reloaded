@@ -127,7 +127,9 @@ static void EmuMediaBoardPartitionSetup(
 		partitionPath.HostDevicePath = HostPath->string();
 	}
 	else {
-		partitionPath.HostDevicePath = g_MediaBoardBasePath + PartitionPrefix + partitionX;
+		// Use per-game path when available so partition data is isolated per title
+		const std::string& base = g_GameMediaBoardPath.empty() ? g_MediaBoardBasePath : g_GameMediaBoardPath;
+		partitionPath.HostDevicePath = base + PartitionPrefix + partitionX;
 	}
 	std::string XboxDevicePartitionPath = DeviceMediaBoardPartitionPrefix + partitionX;
 	xbox::STRING xXboxDevicePartitionPath;

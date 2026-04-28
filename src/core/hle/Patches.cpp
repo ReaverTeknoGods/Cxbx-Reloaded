@@ -546,7 +546,7 @@ void EmuInstallPatches()
 	if (IsWanganXbe(imageSize)) {
 		g_jvs_game_type = ApplyWanganPatches(imageSize);
 	} else if (IsGundamXbe(xbeHash)) {
-		ApplyGundamPatches(imageSize);
+		ApplyGundamPatches(xbeHash, imageSize);
 	} else if (IsGolfXbe(xbeHash)) {
 		ApplyGolfPatches(imageSize);
 	}

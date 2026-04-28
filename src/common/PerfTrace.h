@@ -40,6 +40,20 @@
 #define PERF_MAX_VS_KICKDRAIN_METHODS 16
 // Number of hottest PFIFO non-constant blocker methods to print in window summaries
 #define PERF_REPORT_TOP_VS_KICKDRAIN_METHODS 4
+// Number of process threads tracked by the sampling profiler
+#define PERF_MAX_SAMPLED_THREADS 64
+// Number of hottest sampled threads to print in window summaries
+#define PERF_REPORT_TOP_SAMPLED_THREADS 5
+// Number of unique sampled PCs to retain per report window
+#define PERF_MAX_PC_SAMPLES 64
+// Number of hottest sampled PCs to print in window summaries
+#define PERF_REPORT_TOP_PC_SAMPLES 5
+// Number of unique sampled PCs to retain per sampled thread in a report window
+#define PERF_MAX_THREAD_PC_SAMPLES 16
+// Number of hottest sampled PCs to print for each top sampled thread
+#define PERF_REPORT_TOP_THREAD_PC_SAMPLES 3
+// Sampling interval for the process-wide PC sampler
+#define PERF_SAMPLER_INTERVAL_MS 2
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Category IDs — add new ones here and mirror in PerfTrace.cpp's g_catNames[]
@@ -98,6 +112,26 @@ struct CatStats {
     long long calls;
 };
 
+struct SampledThread {
+    HANDLE handle;
+    DWORD nativeThreadId;
+    ULONGLONG cycleStart;
+    uint32_t hits;
+    ULONGLONG cycles;
+    char label[PERF_MAX_XBOX_THREAD_LABEL];
+    struct ThreadPcSample {
+        uintptr_t pc;
+        uint32_t hits;
+        ULONGLONG cycles;
+    } pcSamples[PERF_MAX_THREAD_PC_SAMPLES];
+};
+
+struct PcSample {
+    uintptr_t pc;
+    uint32_t hits;
+    ULONGLONG cycles;
+};
+
 struct State {
     CatStats cats[PERF_CAT_COUNT];
     long long windowStartTick;
@@ -119,6 +153,10 @@ struct State {
     const void* xboxThreadSystemRoutine[PERF_MAX_XBOX_THREADS];
     const void* xboxThreadStartRoutine[PERF_MAX_XBOX_THREADS];
     char xboxThreadLabels[PERF_MAX_XBOX_THREADS][PERF_MAX_XBOX_THREAD_LABEL];
+    ULONGLONG xboxThreadSampleCycleStart[PERF_MAX_XBOX_THREADS];
+    uint32_t xboxThreadSampleHits[PERF_MAX_XBOX_THREADS];
+    ULONGLONG xboxThreadSampleCycles[PERF_MAX_XBOX_THREADS];
+    SampledThread::ThreadPcSample xboxThreadPcSamples[PERF_MAX_XBOX_THREADS][PERF_MAX_THREAD_PC_SAMPLES];
     double xcpuThreadMs[PERF_MAX_XBOX_THREADS];       // current frame CPU time per Xbox thread
     double xcpuThreadWindowMs[PERF_MAX_XBOX_THREADS]; // accumulated CPU time in current report window
     double xcpuThreadMaxFrameMs[PERF_MAX_XBOX_THREADS]; // hottest single-frame CPU time in window
@@ -128,6 +166,12 @@ struct State {
     long long xboxThreadKeDelayFrameTicks[PERF_MAX_XBOX_THREADS];
     long long xboxThreadKeDelayWindowTicks[PERF_MAX_XBOX_THREADS];
     long long xboxThreadKeDelayWindowMaxFrameTicks[PERF_MAX_XBOX_THREADS];
+    uint32_t xboxThreadDelayPollFrameCounts[PERF_MAX_XBOX_THREADS];
+    uint32_t xboxThreadDelayPollWindowCounts[PERF_MAX_XBOX_THREADS];
+    uint32_t xboxThreadDelayPollWindowMaxFrameCounts[PERF_MAX_XBOX_THREADS];
+    uint32_t xboxThreadWaitPollFrameCounts[PERF_MAX_XBOX_THREADS];
+    uint32_t xboxThreadWaitPollWindowCounts[PERF_MAX_XBOX_THREADS];
+    uint32_t xboxThreadWaitPollWindowMaxFrameCounts[PERF_MAX_XBOX_THREADS];
     ULONGLONG xcpuCyclesPerFrame;  // last frame: total Xbox-thread TSC cycles (converted to ms using cpuGhz)
     double cpuGhz;        // measured CPU frequency (GHz) used to convert TSC cycles -> ms
     int xboxThreadCount;  // number of registered Xbox threads (written atomically)
@@ -152,6 +196,16 @@ struct State {
     DWORD renderThreadId; // set each frame in OnSwapBegin from GetCurrentThreadId()
     // Per-frame render-thread exclusive stats for KE_WAIT and KE_DELAY
     CatStats frameRt[2]; // [0]=KE_WAIT, [1]=KE_DELAY, render thread only
+    SampledThread sampledThreads[PERF_MAX_SAMPLED_THREADS];
+    PcSample processPcSamples[PERF_MAX_PC_SAMPLES];
+    uint32_t processPcSampleTotal;
+    ULONGLONG processPcSampleTotalCycles;
+    HANDLE samplerThread;
+    DWORD samplerThreadId;
+    long long sampleRefreshTick;
+    CRITICAL_SECTION sampleLock;
+    bool sampleLockInitialized;
+    bool symbolsReady;
 };
 
 inline void AccumulateTicks(State& s, PerfCat cat, long long elapsed)
@@ -173,6 +227,8 @@ void RegisterXboxThread(HANDLE h, DWORD xboxThreadId, DWORD nativeThreadId, cons
 void RecordVSKickDrain(uint64_t shaderKey, uint32_t shaderHandle, uint64_t shaderCacheHash, long long elapsedTicks, uint32_t reasonMask);
 void RecordVSKickDrainBlockerMethod(uint32_t method);
 void RecordPFIFOPending(uint32_t currentDepth, uint32_t highWater, uint32_t overflowCount);
+void RecordDelayPoll();
+void RecordWaitPoll();
 void Report();          // called by PerfTrace_OnSwap every N seconds
 void OnSwapBegin();     // resets per-frame accumulators, bumps frame counter
 void OnSwapEnd();       // accumulates frame totals into window totals, maybe Report
@@ -263,6 +319,14 @@ inline void PerfTrace_RecordVSKickDrainBlockerMethod(uint32_t method) {
 
 inline void PerfTrace_RecordPFIFOPending(uint32_t currentDepth, uint32_t highWater, uint32_t overflowCount) {
     if (g_PerfTraceEnabled) PerfTraceInternal::RecordPFIFOPending(currentDepth, highWater, overflowCount);
+}
+
+inline void PerfTrace_RecordDelayPoll() {
+    if (g_PerfTraceEnabled) PerfTraceInternal::RecordDelayPoll();
+}
+
+inline void PerfTrace_RecordWaitPoll() {
+    if (g_PerfTraceEnabled) PerfTraceInternal::RecordWaitPoll();
 }
 
 #endif // PERFTRACE_H

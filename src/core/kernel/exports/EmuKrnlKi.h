@@ -27,6 +27,7 @@
 #pragma once
 
 #include <mutex>
+#include <atomic>
 
 // ReactOS uses a size of 512, but disassembling the kernel reveals it to be 32 instead
 #define TIMER_TABLE_SIZE 32
@@ -55,6 +56,7 @@ namespace xbox
 
 	// NOTE: since the apc list is per-thread, we could also create a different mutex for each kthread
 	extern std::mutex KiApcListMtx;
+	extern std::atomic<unsigned long> KiApcListMtxOwner;
 
 	void_xt KiInitSystem();
 

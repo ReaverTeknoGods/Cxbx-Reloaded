@@ -73,6 +73,7 @@
 #include "Timer.h"
 #include "common/PerfTrace.h"
 #include "common/RenderTrace.h"
+#include "common/BetaConfig.h"
 
 #include <imgui.h>
 #include <backends/imgui_impl_dx9.h>
@@ -2341,7 +2342,7 @@ static void CreateDefaultD3D9Device
 
     // Create a 1x1 transparent texture for use as default on unbound texture stages.
     // D3D9 returns (1,1,1,1) white for unbound samplers; Xbox NV2A returns (0,0,0,0).
-    {
+    if (g_BetaConfig.default_transparent_tex) {
         hr = g_pD3DDevice->CreateTexture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
             &g_pDefaultTransparentTexture, nullptr);
         if (SUCCEEDED(hr)) {
@@ -2471,7 +2472,8 @@ static void EmuVerifyResourceIsRegistered(xbox::X_D3DResource *pResource, DWORD 
 			return;
 		}
 
-		if ((D3DUsage & D3DUSAGE_RENDERTARGET) == 0
+		if (g_BetaConfig.rt_texture_alias &&
+			(D3DUsage & D3DUSAGE_RENDERTARGET) == 0
 			&& GetXboxCommonResourceType(pResource) == X_D3DCOMMON_TYPE_TEXTURE) {
 			InvalidateRTAliasForXboxData((xbox::addr_xt)pResource->Data, "texture-cache-refresh");
 		}
@@ -6281,21 +6283,31 @@ void CreateHostResource(xbox::X_D3DResource *pResource, DWORD D3DUsage, int iTex
 		// CreateOffscreenPlainSurface/Release cycles cause measurable CPU overhead).
 		ComPtr<IDirect3DSurface9> tempHostSurface;
 		if (XboxResourceType == xbox::X_D3DRTYPE_SURFACE) {
-			uint64_t stagingKey = ((uint64_t)(uint32_t)hostWidth)
-			                    | ((uint64_t)(uint32_t)hostHeight << 32)
-			                    ^ ((uint64_t)(uint32_t)PCFormat * 0x9e3779b97f4a7c15ULL);
-			auto& poolEntry = g_StagingSurfacePool[stagingKey];
-			if (!poolEntry) {
-				// First time (or surface was lost) — allocate and cache it.
+			if (g_BetaConfig.staging_surface_pool) {
+				uint64_t stagingKey = ((uint64_t)(uint32_t)hostWidth)
+				                    | ((uint64_t)(uint32_t)hostHeight << 32)
+				                    ^ ((uint64_t)(uint32_t)PCFormat * 0x9e3779b97f4a7c15ULL);
+				auto& poolEntry = g_StagingSurfacePool[stagingKey];
+				if (!poolEntry) {
+					// First time (or surface was lost) — allocate and cache it.
+					HRESULT hRet = g_pD3DDevice->CreateOffscreenPlainSurface(
+						hostWidth, hostHeight, PCFormat, D3DPOOL_SYSTEMMEM, poolEntry.GetAddressOf(), nullptr);
+					if (hRet != D3D_OK) {
+						EmuLog(LOG_LEVEL::WARNING, "CreateOffscreenPlainSurface %s failed!", ResourceTypeName);
+						g_StagingSurfacePool.erase(stagingKey);
+						return;
+					}
+				}
+				tempHostSurface = poolEntry; // shared ownership; poolEntry keeps it alive
+			} else {
+				// Non-pooled: create a fresh staging surface each time
 				HRESULT hRet = g_pD3DDevice->CreateOffscreenPlainSurface(
-					hostWidth, hostHeight, PCFormat, D3DPOOL_SYSTEMMEM, poolEntry.GetAddressOf(), nullptr);
+					hostWidth, hostHeight, PCFormat, D3DPOOL_SYSTEMMEM, tempHostSurface.GetAddressOf(), nullptr);
 				if (hRet != D3D_OK) {
 					EmuLog(LOG_LEVEL::WARNING, "CreateOffscreenPlainSurface %s failed!", ResourceTypeName);
-					g_StagingSurfacePool.erase(stagingKey);
 					return;
 				}
 			}
-			tempHostSurface = poolEntry; // shared ownership; poolEntry keeps it alive
 		}
 
 		DWORD dwCubeFaceOffset = 0;
@@ -8754,7 +8766,7 @@ void CxbxUpdateHostTextures()
 
 	// When the RT alias map is updated (new render target registered), invalidate all
 	// cached texture bindings so they re-evaluate through the RT aliasing path.
-	if (s_lastRTAliasGeneration != g_RTAliasGeneration) {
+	if (g_BetaConfig.texture_stage_cache && s_lastRTAliasGeneration != g_RTAliasGeneration) {
 		s_lastRTAliasGeneration = g_RTAliasGeneration;
 		for (int i = 0; i < xbox::X_D3DTS_STAGECOUNT; i++) {
 			s_lastXboxTexture[i] = nullptr;
@@ -8829,7 +8841,8 @@ void CxbxUpdateHostTextures()
 		// Fast path: if the Xbox texture pointer AND data address haven't changed, skip all work.
 		// We check Data too because SwitchTexture reuses the same pointer with different Data.
 		xbox::addr_xt xboxData = (pXboxBaseTexture != xbox::zeroptr) ? pXboxBaseTexture->Data : 0;
-		if (pXboxBaseTexture == s_lastXboxTexture[stage] && xboxData == s_lastXboxTextureData[stage]) {
+		if (g_BetaConfig.texture_stage_cache &&
+			pXboxBaseTexture == s_lastXboxTexture[stage] && xboxData == s_lastXboxTextureData[stage]) {
 			if (!s_haveTracedTextureState[stage]) {
 				recordTextureBinding(stage, pXboxBaseTexture, xboxData, s_lastHostTexture[stage]);
 			}
@@ -8848,7 +8861,7 @@ void CxbxUpdateHostTextures()
 				// was used as a render target surface, use the RT's backing texture instead.
 				// This handles Xbox unified memory where the same physical address can be
 				// both an RT surface and a texture sampler source (e.g. post-processing effects).
-				if (xboxData != 0) {
+				if (g_BetaConfig.rt_texture_alias && xboxData != 0) {
 					auto rtIt = g_RTDataToHostTexture.find(xboxData);
 					if (rtIt != g_RTDataToHostTexture.end() && rtIt->second.Get() != nullptr) {
 						pHostBaseTexture = rtIt->second.Get();
@@ -8858,7 +8871,8 @@ void CxbxUpdateHostTextures()
 				// Xbox NV2A can (unified memory). Detect and resolve by copying RT to a
 				// separate texture. Check if the texture we're about to bind is the current
 				// RT's backing texture, OR if the Xbox Data address matches the current RT.
-				if (pHostBaseTexture != nullptr && g_pXbox_RenderTarget != xbox::zeroptr
+				if (g_BetaConfig.rt_resolve_self_sampling &&
+					pHostBaseTexture != nullptr && g_pXbox_RenderTarget != xbox::zeroptr
 					&& xboxData != 0 && xboxData == (xbox::addr_xt)g_pXbox_RenderTarget->Data) {
 					auto pResolved = ResolveCurrentRTForSampling();
 					if (pResolved) {
@@ -8880,7 +8894,9 @@ void CxbxUpdateHostTextures()
 			}
 		}
 
-		HRESULT hRet = g_pD3DDevice->SetTexture(stage, pHostBaseTexture ? pHostBaseTexture : (IDirect3DBaseTexture*)g_pDefaultTransparentTexture);
+		IDirect3DBaseTexture* fallbackTex = (g_BetaConfig.default_transparent_tex && g_pDefaultTransparentTexture) ?
+			(IDirect3DBaseTexture*)g_pDefaultTransparentTexture : nullptr;
+		HRESULT hRet = g_pD3DDevice->SetTexture(stage, pHostBaseTexture ? pHostBaseTexture : fallbackTex);
 		DEBUG_D3DRESULT(hRet, "g_pD3DDevice->SetTexture");
 		recordTextureBinding(stage, pXboxBaseTexture, xboxData, pHostBaseTexture);
 		s_lastHostTexture[stage] = pHostBaseTexture;
@@ -9301,7 +9317,7 @@ void CxbxUpdateHostVertexShaderConstants()
 				static bool s_cacheValid = false;
 				if (!isXboxConstants)
 					s_cacheValid = false;
-				if (!s_cacheValid) {
+				if (!g_BetaConfig.vsh_constant_delta_upload || !s_cacheValid) {
 					g_pD3DDevice->SetVertexShaderConstantF(0, local_constants, X_D3DVS_CONSTREG_COUNT);
 					memcpy(s_lastUploaded, local_constants, sizeof(s_lastUploaded));
 					s_cacheValid = true;
@@ -10358,7 +10374,8 @@ static void CxbxImpl_SetRenderTarget
 	// Track this render target's Data address for texture aliasing resolution.
 	// When the game later binds a TEXTURE at the same Data address, we can resolve
 	// to this RT's host backing texture instead of the stale TEXTURE cache entry.
-	if (pRenderTarget != xbox::zeroptr && pRenderTarget->Data != xbox::zero && pHostRenderTarget != nullptr) {
+	if (g_BetaConfig.rt_texture_alias &&
+		pRenderTarget != xbox::zeroptr && pRenderTarget->Data != xbox::zero && pHostRenderTarget != nullptr) {
 		Microsoft::WRL::ComPtr<IDirect3DBaseTexture> pBackingTexture;
 		if (SUCCEEDED(pHostRenderTarget->GetContainer(IID_IDirect3DTexture9, (void**)pBackingTexture.GetAddressOf()))) {
 			auto dataAddr = (xbox::addr_xt)pRenderTarget->Data;

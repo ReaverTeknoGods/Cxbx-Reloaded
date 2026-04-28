@@ -32,6 +32,7 @@
 #include "EmuShared.h"
 #include "common\Logging.h"
 #include "common\FilePaths.hpp"
+#include "common\win32\Threads.h"
 #include "core\kernel\init\CxbxKrnl.h"
 #include "core\kernel\support\Emu.h"
 #include "core\hle\JVS\JVS.h"
@@ -149,6 +150,7 @@ extern void* g_jvs_view_ptr;
 
 void JvsInputThread()
 {
+	SetCurrentThreadName("Chihiro JVS Input");
 	g_AffinityPolicy->SetAffinityOther(GetCurrentThread());
 
 	while (true) {
@@ -681,6 +683,7 @@ static std::vector<std::vector<uint8_t>> g_YacReads;
 
 static void YacReaderThread()
 {
+	SetCurrentThreadName("Chihiro YAC Reader");
 	g_YacPipe = CreateFileA(
 		"\\\\.\\pipe\\YACardEmu",
 		GENERIC_READ | GENERIC_WRITE,

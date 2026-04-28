@@ -49,6 +49,7 @@ namespace NtDll
 #include "core/kernel/support/NativeHandle.h" // For Xbox objects to native handle and back
 #include "core\kernel\memory-manager\VMManager.h" // For g_VMManager
 #include "core\kernel\support\NativeHandle.h"
+#include "common/PerfTrace.h"
 #include "devices\Xbox.h"
 #include "CxbxDebugger.h"
 
@@ -2729,6 +2730,7 @@ XBSYSAPI EXPORTNUM(235) xbox::ntstatus_xt NTAPI xbox::NtWaitForMultipleObjectsEx
 			Alertable,
 			&ExpireTime);
 		if (Status == STATUS_TIMEOUT) {
+			PerfTrace_RecordWaitPoll();
 			return std::nullopt;
 		}
 		// If the wait was satisfied with the host, then also unwait the thread on the guest side, to be sure to remove WaitBlocks that might have been added

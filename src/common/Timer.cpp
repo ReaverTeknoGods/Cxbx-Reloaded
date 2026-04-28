@@ -38,10 +38,14 @@
 #include "core\kernel\support\EmuFS.h"
 #include "core\kernel\exports\EmuKrnlPs.hpp"
 #include "core\kernel\exports\EmuKrnl.h"
+#include "common/BetaConfig.h"
 #include "devices\Xbox.h"
 #include "devices\usb\OHCI.h"
 #include "core\hle\DSOUND\DirectSound\DirectSoundGlobal.hpp"
 
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 
 static std::atomic_uint64_t last_qpc; // last time when QPC was called
 static std::atomic_uint64_t exec_time; // total execution time in us since the emulation started
@@ -49,6 +53,51 @@ static uint64_t pit_last; // last time when the pit time was updated
 static uint64_t pit_last_qpc; // last QPC time of the pit
 // The frequency of the high resolution clock of the host, and the start time
 int64_t HostQPCFrequency, HostQPCStartTime;
+
+static HANDLE get_precise_sleep_timer()
+{
+	thread_local HANDLE precise_sleep_timer = []() -> HANDLE {
+		HANDLE timer = CreateWaitableTimerExW(
+			nullptr,
+			nullptr,
+			CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+			TIMER_MODIFY_STATE | SYNCHRONIZE);
+		if (timer == nullptr) {
+			timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+		}
+		return timer;
+	}();
+
+	return precise_sleep_timer;
+}
+
+void SleepPassive(std::chrono::microseconds duration)
+{
+	if (duration <= std::chrono::microseconds::zero()) {
+		return;
+	}
+
+	auto timer = get_precise_sleep_timer();
+	if (timer != nullptr) {
+		auto sleep100ns = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count() / 100;
+		if (sleep100ns > 0) {
+			LARGE_INTEGER dueTime;
+			dueTime.QuadPart = -sleep100ns;
+			if (SetWaitableTimer(timer, &dueTime, 0, nullptr, nullptr, FALSE)) {
+				WaitForSingleObject(timer, INFINITE);
+				return;
+			}
+		}
+	}
+
+	auto sleepMs = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+	if (sleepMs > 0) {
+		Sleep((DWORD)sleepMs);
+	}
+	else {
+		std::this_thread::yield();
+	}
+}
 
 
 void timer_init()
@@ -70,29 +119,47 @@ void timer_init()
 void SleepPrecise(std::chrono::steady_clock::time_point targetTime)
 {
 	using namespace std::chrono;
-	// If we don't need to wait, return right away
-
-	// TODO use waitable timers?
-	// TODO fetch the timer resolution to determine the sleep threshold?
-	// TODO adaptive wait? https://blat-blatnik.github.io/computerBear/making-accurate-sleep-function/
-
-	// Try to sleep for as much of the wait as we can
-	// to save CPU usage / power
-	// We expect sleep to overshoot, so give ourselves some extra time
-	// Note currently we ask Windows to give us 1ms timer resolution
-	constexpr auto sleepThreshold = 2ms; // Minimum remaining time before we attempt to use sleep
-
-	auto sleepFor = (targetTime - sleepThreshold) - steady_clock::now();
-	auto sleepMs = duration_cast<milliseconds>(sleepFor).count();
-
-	// Sleep if required
-	if (sleepMs >= 0) {
-		Sleep((DWORD)sleepMs);
+	auto now = steady_clock::now();
+	if (now >= targetTime) {
+		return;
 	}
 
-	// Spin wait
+	// Sleep with a waitable timer first, then only busy-wait for a short tail.
+	// This keeps frame pacing and KeDelayExecutionThread accurate without burning
+	// a fixed 2 ms of CPU every time we "sleep".
+	constexpr auto spinThreshold = 500us;
+	if (g_BetaConfig.precise_sleep_timer) {
+		auto timer = get_precise_sleep_timer();
+		if (timer != nullptr) {
+			auto sleepFor = targetTime - now - spinThreshold;
+			if (sleepFor > steady_clock::duration::zero()) {
+				auto sleep100ns = duration_cast<nanoseconds>(sleepFor).count() / 100;
+				if (sleep100ns > 0) {
+					LARGE_INTEGER dueTime;
+					dueTime.QuadPart = -sleep100ns;
+					if (SetWaitableTimer(timer, &dueTime, 0, nullptr, nullptr, FALSE)) {
+						WaitForSingleObject(timer, INFINITE);
+					}
+				}
+			}
+		} else {
+			auto sleepFor = (targetTime - spinThreshold) - now;
+			auto sleepMs = duration_cast<milliseconds>(sleepFor).count();
+			if (sleepMs > 0) {
+				Sleep((DWORD)sleepMs);
+			}
+		}
+	} else {
+		// Legacy path: plain Sleep
+		auto sleepFor = (targetTime - spinThreshold) - now;
+		auto sleepMs = duration_cast<milliseconds>(sleepFor).count();
+		if (sleepMs > 0) {
+			Sleep((DWORD)sleepMs);
+		}
+	}
+
 	while (steady_clock::now() < targetTime) {
-		;
+		YieldProcessor();
 	}
 }
 
@@ -115,6 +182,18 @@ static void update_non_periodic_events()
 {
 	// update dsound
 	dsound_worker();
+
+	// Periodically assert IRQ10 for Chihiro media board communication.
+	if (g_BetaConfig.periodic_irq10 && EmuInterruptList[10] && EmuInterruptList[10]->Connected) {
+		static uint64_t irq10_last = 0;
+		uint64_t now_qpc;
+		QueryPerformanceCounter((LARGE_INTEGER*)&now_qpc);
+		if (irq10_last == 0 || (now_qpc - irq10_last) * 1000 / HostQPCFrequency >= 16) {
+			irq10_last = now_qpc;
+			HalSystemInterrupts[10].Assert(false);
+			HalSystemInterrupts[10].Assert(true);
+		}
+	}
 
 	// check for hw interrupts
 	for (int i = 0; i < MAX_BUS_INTERRUPT_LEVEL; i++) {
@@ -151,6 +230,9 @@ static uint64_t get_next(uint64_t now)
 
 xbox::void_xt NTAPI system_events(xbox::PVOID arg)
 {
+	constexpr uint64_t system_event_sleep_quantum_us = 500;
+	constexpr uint64_t system_event_spin_window_us = 250;
+
 	// Testing shows that, if this thread has the same priority of the other xbox threads, it can take tens, even hundreds of ms to complete a single loop.
 	// So we increase its priority to above normal, so that it scheduled more often
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
@@ -168,6 +250,14 @@ xbox::void_xt NTAPI system_events(xbox::PVOID arg)
 			if (elapsed_us >= nearest_next) {
 				break;
 			}
+
+			uint64_t remaining_us = nearest_next - elapsed_us;
+			if (remaining_us > system_event_spin_window_us) {
+				const uint64_t sleep_us = std::min(remaining_us - system_event_spin_window_us, system_event_sleep_quantum_us);
+				SleepPassive(std::chrono::microseconds(sleep_us));
+				continue;
+			}
+
 			std::this_thread::yield();
 		}
 	}
