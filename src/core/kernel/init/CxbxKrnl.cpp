@@ -63,6 +63,7 @@
 #include "common\crypto\EmuSha.h" // For the SHA1 functions
 #include "common/Timer.h" // For Timer_Init
 #include "common/BetaConfig.h"
+#include "common/util/hasher.h" // For ComputeHash (used in game-specific beta overrides)
 #include "common\input\InputManager.h" // For the InputDeviceManager
 #include "core/kernel/support/NativeHandle.h"
 #include "common/win32/Util.h" // for WinError2Str
@@ -1112,6 +1113,9 @@ static void CxbxrKrnlInitHacks()
 	timer_init();
 	// Load beta feature toggles from beta.ini
 	BetaConfig_Load();
+
+	// Game-specific BetaConfig overrides can be applied here BEFORE CxbxInitWindow
+	// (D3D device creation caches BetaConfig values). Currently none needed.
 	// for unicode conversions
 	setlocale(LC_ALL, "English");
 	// Initialize DPC global

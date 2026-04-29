@@ -319,8 +319,9 @@ void MediaBoard::ComWrite(uint32_t offset, void* buffer, uint32_t length)
 
         switch (command) {
         case MB_CMD_DIMM_SIZE: { // 0x0001
-            *(uint32_t*)&outputBuffer[4] = 0x00f00000;
-            EmuLog(LOG_LEVEL::DEBUG, "  MB_CMD_DIMM_SIZE -> 0x00f00000");
+            uint32_t sz = g_BetaConfig.mb_dimm_size ? (512 * ONE_MB) : (1024 * ONE_MB);
+            *(uint32_t*)&outputBuffer[4] = sz;
+            EmuLog(LOG_LEVEL::DEBUG, "  MB_CMD_DIMM_SIZE -> %u MB", sz / ONE_MB);
             break;
         }
         case MB_CMD_STATUS: { // 0x0100
@@ -330,14 +331,13 @@ void MediaBoard::ComWrite(uint32_t offset, void* buffer, uint32_t length)
             break;
         }
         case MB_CMD_FIRMWARE_VERSION: { // 0x0101
-            *(uint16_t*)&outputBuffer[4] = 0x1234;
-            *(uint16_t*)&outputBuffer[6] = 0x4567;
-            EmuLog(LOG_LEVEL::DEBUG, "  MB_CMD_FIRMWARE_VERSION -> 12.34");
+            *(uint32_t*)&outputBuffer[4] = 0x0317;
+            EmuLog(LOG_LEVEL::DEBUG, "  MB_CMD_FIRMWARE_VERSION -> 0x0317");
             break;
         }
         case MB_CMD_SYSTEM_TYPE: { // 0x0102
-            *(uint32_t*)&outputBuffer[4] = 0;
-            EmuLog(LOG_LEVEL::DEBUG, "  MB_CMD_SYSTEM_TYPE -> 0");
+            *(uint32_t*)&outputBuffer[4] = MB_SYSTEM_TYPE_DEVELOPER | MB_SYSTEM_TYPE_GDROM;
+            EmuLog(LOG_LEVEL::DEBUG, "  MB_CMD_SYSTEM_TYPE -> DEVELOPER|GDROM");
             break;
         }
         case MB_CMD_SERIAL_NUMBER: { // 0x0103

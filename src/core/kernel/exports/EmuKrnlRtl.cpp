@@ -769,8 +769,7 @@ XBSYSAPI EXPORTNUM(277) xbox::void_xt NTAPI xbox::RtlEnterCriticalSection
     else {
         if(CriticalSection->OwningThread != thread) {
 			if (CriticalSection->OwningThread != nullptr) {
-				NTSTATUS result;
-				result = KeWaitForSingleObject(
+				NTSTATUS result = KeWaitForSingleObject(
 					(PVOID)CriticalSection,
 					(KWAIT_REASON)0,
 					(KPROCESSOR_MODE)0,

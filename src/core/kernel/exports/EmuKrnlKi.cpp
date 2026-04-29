@@ -570,7 +570,7 @@ xbox::void_xt NTAPI xbox::KiTimerExpiration
 {
 	ULARGE_INTEGER SystemTime, InterruptTime;
 	LARGE_INTEGER Interval;
-	LONG i;
+	LONG dpcIdx;
 	ULONG Timers, ActiveTimers, DpcCalls;
 	PLIST_ENTRY ListHead, NextEntry;
 	KIRQL OldIrql;
@@ -587,10 +587,19 @@ xbox::void_xt NTAPI xbox::KiTimerExpiration
 	dword_xt OldKeTickCount = PtrToLong(SystemArgument1);
 	dword_xt EndKeTickCount = PtrToLong(SystemArgument2);
 
+	/* Apply configurable tick range cap if set */
+	if (g_BetaConfig.timer_exp_max_ticks > 0) {
+		dword_xt maxTicks = (dword_xt)g_BetaConfig.timer_exp_max_ticks;
+		if (EndKeTickCount - OldKeTickCount > maxTicks) {
+			EndKeTickCount = OldKeTickCount + maxTicks;
+		}
+	}
+
 	/* Setup accounting data */
 	DpcCalls = 0;
 	Timers = 24;
 	ActiveTimers = 4;
+	ULONG totalExpired = 0;
 
 	/* Lock the Database */
 	KiTimerLock();
@@ -609,6 +618,21 @@ xbox::void_xt NTAPI xbox::KiTimerExpiration
 			/* Go to the next entry */
 			NextEntry = ListHead->Flink;
 
+			/* Pointer guard: validate list entry before dereferencing */
+			if (g_BetaConfig.timer_exp_pointer_guard) {
+				if ((uintptr_t)NextEntry < 0x10000u || (uintptr_t)NextEntry->Blink < 0x10000u) {
+					EmuLog(LOG_LEVEL::WARNING, "KiTimerExpiration: corrupt timer list entry at index %u (Flink=%p, Blink=%p) — skipping bucket",
+						Index, NextEntry, NextEntry ? NextEntry->Blink : nullptr);
+					break;
+				}
+			}
+
+			/* Check max expired cap */
+			if (g_BetaConfig.timer_exp_max_expired > 0 &&
+				totalExpired >= (ULONG)g_BetaConfig.timer_exp_max_expired) {
+				break;
+			}
+
 			/* Get the current timer and check its due time */
 			Timers--;
 			Timer = CONTAINING_RECORD(NextEntry, KTIMER, TimerListEntry);
@@ -617,6 +641,7 @@ xbox::void_xt NTAPI xbox::KiTimerExpiration
 			{
 				/* It's expired, remove it */
 				ActiveTimers--;
+				totalExpired++;
 				KiRemoveEntryTimer(Timer, Index);
 
 				/* Make it non-inserted and signal it */
@@ -663,15 +688,15 @@ xbox::void_xt NTAPI xbox::KiTimerExpiration
 					KiUnlockDispatcherDatabase(DISPATCH_LEVEL);
 
 					/* Start looping all DPC Entries */
-					for (i = 0; DpcCalls; DpcCalls--, i++)
+					for (dpcIdx = 0; DpcCalls; DpcCalls--, dpcIdx++)
 					{
 						/* Call the DPC */
-						EmuLog(LOG_LEVEL::DEBUG, "%s, calling DPC at 0x%.8X", __func__, DpcEntry[i].Routine);
+						EmuLog(LOG_LEVEL::DEBUG, "%s, calling DPC at 0x%.8X", __func__, DpcEntry[dpcIdx].Routine);
 
 						// Call the Deferred Procedure  :
-						DpcEntry[i].Routine(
-							DpcEntry[i].Dpc,
-							DpcEntry[i].Context,
+						DpcEntry[dpcIdx].Routine(
+							DpcEntry[dpcIdx].Dpc,
+							DpcEntry[dpcIdx].Context,
 							UlongToPtr(SystemTime.u.LowPart),
 							UlongToPtr(SystemTime.u.HighPart)
 						);
@@ -706,15 +731,15 @@ xbox::void_xt NTAPI xbox::KiTimerExpiration
 					KiUnlockDispatcherDatabase(DISPATCH_LEVEL);
 
 					/* Start looping all DPC Entries */
-					for (i = 0; DpcCalls; DpcCalls--, i++)
+					for (dpcIdx = 0; DpcCalls; DpcCalls--, dpcIdx++)
 					{
 						/* Call the DPC */
-						EmuLog(LOG_LEVEL::DEBUG, "%s, calling DPC at 0x%.8X", __func__, DpcEntry[i].Routine);
+						EmuLog(LOG_LEVEL::DEBUG, "%s, calling DPC at 0x%.8X", __func__, DpcEntry[dpcIdx].Routine);
 
 						// Call the Deferred Procedure  :
-						DpcEntry[i].Routine(
-							DpcEntry[i].Dpc,
-							DpcEntry[i].Context,
+						DpcEntry[dpcIdx].Routine(
+							DpcEntry[dpcIdx].Dpc,
+							DpcEntry[dpcIdx].Context,
 							UlongToPtr(SystemTime.u.LowPart),
 							UlongToPtr(SystemTime.u.HighPart)
 						);
@@ -732,6 +757,12 @@ xbox::void_xt NTAPI xbox::KiTimerExpiration
 				break;
 			}
 		}
+
+		/* Break outer loop if expired cap reached */
+		if (g_BetaConfig.timer_exp_max_expired > 0 &&
+			totalExpired >= (ULONG)g_BetaConfig.timer_exp_max_expired) {
+			break;
+		}
 	}
 
 	/* Verify the timer table, on a debug kernel only */
@@ -746,15 +777,15 @@ xbox::void_xt NTAPI xbox::KiTimerExpiration
 		KiUnlockDispatcherDatabase(DISPATCH_LEVEL);
 
 		/* Start looping all DPC Entries */
-		for (i = 0; DpcCalls; DpcCalls--, i++)
+		for (dpcIdx = 0; DpcCalls; DpcCalls--, dpcIdx++)
 		{
 			/* Call the DPC */
-			EmuLog(LOG_LEVEL::DEBUG, "%s, calling DPC at 0x%.8X", __func__, DpcEntry[i].Routine);
+			EmuLog(LOG_LEVEL::DEBUG, "%s, calling DPC at 0x%.8X", __func__, DpcEntry[dpcIdx].Routine);
 
 			// Call the Deferred Procedure  :
-			DpcEntry[i].Routine(
-				DpcEntry[i].Dpc,
-				DpcEntry[i].Context,
+			DpcEntry[dpcIdx].Routine(
+				DpcEntry[dpcIdx].Dpc,
+				DpcEntry[dpcIdx].Context,
 				UlongToPtr(SystemTime.u.LowPart),
 				UlongToPtr(SystemTime.u.HighPart)
 			);

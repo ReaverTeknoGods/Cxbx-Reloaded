@@ -332,6 +332,7 @@ file (GLOB CXBXR_SOURCE_EMU_IMPORT
 )
 file (GLOB CXBXR_SOURCE_EMU
  "${CXBXR_KRNL_CPP}"
+ "${CXBXR_ROOT_DIR}/src/common/BetaConfig.cpp"
  "${CXBXR_ROOT_DIR}/src/common/Timer.cpp"
  "${CXBXR_ROOT_DIR}/src/common/util/gloffscreen/glextensions.cpp"
  "${CXBXR_ROOT_DIR}/src/common/util/gloffscreen/gloffscreen_common.cpp"
@@ -371,6 +372,11 @@ file (GLOB CXBXR_SOURCE_EMU
  "${CXBXR_ROOT_DIR}/src/core/hle/Intercept.cpp"
  "${CXBXR_ROOT_DIR}/src/core/hle/JVS/JVS.cpp"
  "${CXBXR_ROOT_DIR}/src/core/hle/Patches.cpp"
+ "${CXBXR_ROOT_DIR}/src/core/hle/Patches/JvsWatchdogPatch.cpp"
+ "${CXBXR_ROOT_DIR}/src/core/hle/Patches/WanganPatches.cpp"
+ "${CXBXR_ROOT_DIR}/src/core/hle/Patches/GundamPatches.cpp"
+ "${CXBXR_ROOT_DIR}/src/core/hle/Patches/CrazyTaxiPatches.cpp"
+ "${CXBXR_ROOT_DIR}/src/core/hle/Patches/GolfPatches.cpp"
  "${CXBXR_ROOT_DIR}/src/core/hle/XACTENG/XactEng.cpp"
  "${CXBXR_ROOT_DIR}/src/core/hle/XGRAPHIC/XGraphic.cpp"
  "${CXBXR_ROOT_DIR}/src/core/kernel/exports/EmuKrnl.cpp"
