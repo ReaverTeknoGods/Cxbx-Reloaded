@@ -245,7 +245,8 @@ private:
 
 	bool BroadcastPacket;					// Set when the last command was a broadcast
 	uint8_t *pSense = nullptr;				// Pointer to Sense line
-	uint8_t DeviceId = 0;					// Device ID assigned by running title
+	uint8_t DeviceId = 1;					// Pre-assign ID 1 so games that skip discovery still work
+	                                        // Games that run F0_Reset + F1_SetDeviceId will reassign properly
 	std::vector<uint8_t> ResponseBuffer;	// Command Response
 
 	// Device info

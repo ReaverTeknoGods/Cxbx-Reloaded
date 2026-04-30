@@ -83,7 +83,7 @@ uint32_t MediaBoard::LpcRead(uint32_t addr, int size)
     case 0x40F4: result = g_BetaConfig.mb_dimm_size ? 0x0002 : 0x03;
                 desc = g_BetaConfig.mb_dimm_size ? "DIMM_SIZE(512MB)" : "DIMM_SIZE(1GB)";
                 break;
-    case 0x4026: result = 0;            desc = "HANDSHAKE(ack)";     break;
+    case 0x4026: result = temp_0x4026;  desc = "HANDSHAKE(echo)";    break;
     case 0x40F0: result = g_BetaConfig.mb_board_type ? 0x0001 : 0x0000;
                 desc = g_BetaConfig.mb_board_type ? "BOARD_TYPE(Type-3)" : "BOARD_TYPE(Type-1)";
                 break;
@@ -282,6 +282,14 @@ void MediaBoard::ComWrite(uint32_t offset, void* buffer, uint32_t length)
                     m_statusInjectRead = comWrite900000Diag;
                     MbLog("STATUS PERSIST: seq=%u phase=5 refilling buffer_900000 (first time)\n", nextSeq);
                 }
+                // Clear the handshake register so the game's poll loop
+                // (which checks bit 8 of 0x4026) sees bit 8 clear and proceeds.
+                temp_0x4026 = 0;
+                // Also copy to shadow and assert IRQ10 so the game's
+                // semaphore-wait unblocks and it reads the STATUS response.
+                memcpy(m_shadowResponse, buffer_900000, 512);
+                m_responsePending = true;
+                HalSystemInterrupts[10].Assert(true);
             }
         }
         return;

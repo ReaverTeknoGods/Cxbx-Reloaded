@@ -11,7 +11,7 @@
 
 #pragma comment(lib, "Dbghelp.lib")
 
-bool g_PerfTraceEnabled = true;
+bool g_PerfTraceEnabled = false;
 
 ULONG g_VtxCacheHits = 0;
 ULONG g_VtxCacheMisses = 0;
