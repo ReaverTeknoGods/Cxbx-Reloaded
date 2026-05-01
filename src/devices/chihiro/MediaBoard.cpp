@@ -33,14 +33,19 @@
 #include <string>
 
 // File-based media board command log (stdout may be buffered)
+// Set to 1 to enable logging to C:\temp\mb_log.txt
+#define MB_LOG_ENABLED 0
+
 static FILE* g_mbLog = nullptr;
 static void MbLog(const char* fmt, ...) {
+#if MB_LOG_ENABLED
     if (!g_mbLog) g_mbLog = fopen("C:\\temp\\mb_log.txt", "w");
     if (!g_mbLog) return;
     va_list ap; va_start(ap, fmt);
     vfprintf(g_mbLog, fmt, ap);
     va_end(ap);
     fflush(g_mbLog);
+#endif
 }
 
 #define _XBOXKRNL_DEFEXTRN_
