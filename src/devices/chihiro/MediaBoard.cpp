@@ -36,21 +36,32 @@
 #include <algorithm>
 #include <cctype>
 
-// File-based media board command log (stdout may be buffered)
-// Set to 1 to enable logging to C:\temp\mb_log.txt
+// Media board command log — set MB_LOG_ENABLED to 1 to enable
+// Writes to <ShaderCacheDir>/mb_log.txt
 #define MB_LOG_ENABLED 0
 
-static FILE* g_mbLog = nullptr;
-static void MbLog(const char* fmt, ...) {
 #if MB_LOG_ENABLED
-    if (!g_mbLog) g_mbLog = fopen("C:\\temp\\mb_log.txt", "w");
+const std::string& GetShaderCacheDir();
+static FILE* g_mbLog = nullptr;
+static bool  g_mbLogFailed = false;
+static void MbLog(const char* fmt, ...) {
+    if (!g_mbLog && !g_mbLogFailed) {
+        const std::string& cacheDir = GetShaderCacheDir();
+        if (!cacheDir.empty()) {
+            std::string logPath = cacheDir + "\\mb_log.txt";
+            g_mbLog = fopen(logPath.c_str(), "w");
+            if (!g_mbLog) g_mbLogFailed = true;
+        }
+    }
     if (!g_mbLog) return;
     va_list ap; va_start(ap, fmt);
     vfprintf(g_mbLog, fmt, ap);
     va_end(ap);
     fflush(g_mbLog);
-#endif
 }
+#else
+static void MbLog(const char*, ...) {}
+#endif
 
 #define _XBOXKRNL_DEFEXTRN_
 #define LOG_PREFIX CXBXR_MODULE::JVS // TODO: XBAM
@@ -201,15 +212,7 @@ void MediaBoard::LpcWrite(uint32_t addr, uint32_t value, int size)
     }
 
     if (addr == 0x4026) {
-        // Game writes here as part of baseboard handshake / "kick".
-        // If we have a pending response that the game may have cleared
-        // from buffer_900000, re-deliver it now (AFTER the game's clear).
         temp_0x4026 = value;
-        if (m_responsePending) {
-            memcpy(buffer_900000, m_shadowResponse, 512);
-            MbLog("LpcWrite [0x4026] re-delivered pending response, IRQ10\n");
-            HalSystemInterrupts[10].Assert(true);
-        }
         return;
     }
 
@@ -267,13 +270,6 @@ void MediaBoard::ComRead(uint32_t offset, void* buffer, uint32_t length)
 
     // MAME: read_sector(LBA 0x4800) → read_buffer (response)
     if (offset == 0x900000) {
-        // If a response is pending (game may have cleared buffer_900000),
-        // re-deliver it now before the game reads.
-        if (m_responsePending) {
-            memcpy(buffer_900000, m_shadowResponse, 512);
-            m_responsePending = false;
-        }
-
         memcpy(buffer, buffer_900000, length);
         static int comRead900000Diag = 0;
         comRead900000Diag++;
@@ -342,40 +338,6 @@ void MediaBoard::ComWrite(uint32_t offset, void* buffer, uint32_t length)
         }
         EmuLog(LOG_LEVEL::DEBUG, "ComWrite [0x900000] sys-cmd write length=%u", length);
         memcpy(buffer_900000, buffer, length);
-
-        // After init commands are done, the game clears read_buffer then
-        // kicks 0x4026 expecting the media board to push a STATUS response.
-        // Persistently refill the buffer with STATUS phase=5 after every
-        // clear so the game sees it regardless of read timing.
-        if (m_commandsProcessed >= 3) {
-            // Check if the game just wrote zeros (clear operation)
-            bool allZero = true;
-            uint8_t* b = (uint8_t*)buffer;
-            for (int i = 0; i < 16; i++) {
-                if (b[i] != 0) { allZero = false; break; }
-            }
-            if (allZero) {
-                uint16_t nextSeq = (uint16_t)(m_commandsProcessed + 1);
-                *(uint16_t*)&buffer_900000[0] = nextSeq;
-                buffer_900000[2] = 0x01;   // MAME ack
-                buffer_900000[3] = 0x80;   // MAME ack
-                *(uint32_t*)&buffer_900000[4] = 5;  // phase = READY
-                *(uint32_t*)&buffer_900000[8] = 0;  // completion = 0%
-                if (!m_statusInjected) {
-                    m_statusInjected = true;
-                    m_statusInjectRead = comWrite900000Diag;
-                    MbLog("STATUS PERSIST: seq=%u phase=5 refilling buffer_900000 (first time)\n", nextSeq);
-                }
-                // Clear the handshake register so the game's poll loop
-                // (which checks bit 8 of 0x4026) sees bit 8 clear and proceeds.
-                temp_0x4026 = 0;
-                // Also copy to shadow and assert IRQ10 so the game's
-                // semaphore-wait unblocks and it reads the STATUS response.
-                memcpy(m_shadowResponse, buffer_900000, 512);
-                m_responsePending = true;
-                HalSystemInterrupts[10].Assert(true);
-            }
-        }
         return;
     }
 
@@ -384,10 +346,8 @@ void MediaBoard::ComWrite(uint32_t offset, void* buffer, uint32_t length)
         memcpy(buffer_900200, buffer, length);
         
         uint8_t* inputBuffer  = (uint8_t*)buffer_900200;
-        // Write response to shadow buffer (NOT directly to buffer_900000)
-        // because the game may clear buffer_900000 before reading it.
-        uint8_t* outputBuffer = (uint8_t*)m_shadowResponse;
-        memset(m_shadowResponse, 0, sizeof(m_shadowResponse));
+        uint8_t* outputBuffer = (uint8_t*)buffer_900000;
+        memset(buffer_900000, 0, sizeof(buffer_900000));
 
         uint16_t seq     = *(uint16_t*)&inputBuffer[0];
         uint32_t command = *(uint16_t*)&inputBuffer[2];
@@ -511,10 +471,6 @@ void MediaBoard::ComWrite(uint32_t offset, void* buffer, uint32_t length)
         *(uint16_t*)&outputBuffer[0] = seq;  // echo sequence number
         outputBuffer[2] = 0x01;              // MAME hardcoded
         outputBuffer[3] = 0x80;              // MAME hardcoded
-
-        // Also write to buffer_900000 immediately (for games that read without kick)
-        memcpy(buffer_900000, m_shadowResponse, 512);
-        m_responsePending = true;
 
         MbLog("  RESP: seq=0x%04X ack=0x8001 data:", seq);
         for (int i = 0; i < 20; i++) MbLog(" %02X", outputBuffer[i]);
