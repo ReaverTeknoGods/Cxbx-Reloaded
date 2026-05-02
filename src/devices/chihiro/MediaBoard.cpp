@@ -349,8 +349,8 @@ void MediaBoard::ComWrite(uint32_t offset, void* buffer, uint32_t length)
             break;
         }
         case MB_CMD_SYSTEM_TYPE: { // 0x0102
-            *(uint32_t*)&outputBuffer[4] = MB_SYSTEM_TYPE_DEVELOPER | MB_SYSTEM_TYPE_GDROM;
-            EmuLog(LOG_LEVEL::DEBUG, "  MB_CMD_SYSTEM_TYPE -> DEVELOPER|GDROM");
+            *(uint32_t*)&outputBuffer[4] = 0;
+            EmuLog(LOG_LEVEL::DEBUG, "  0");
             break;
         }
         case MB_CMD_SERIAL_NUMBER: { // 0x0103
