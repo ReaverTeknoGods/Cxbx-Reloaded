@@ -28,9 +28,13 @@
 
 #include "MediaBoard.h"
 #include "common/BetaConfig.h"
+#include "common\util\hasher.h"
+#include "common\xbe\Xbe.h"
 #include <cstdio>
 #include <cstdarg>
 #include <string>
+#include <algorithm>
+#include <cctype>
 
 // File-based media board command log (stdout may be buffered)
 // Set to 1 to enable logging to C:\temp\mb_log.txt
@@ -55,6 +59,65 @@ static void MbLog(const char* fmt, ...) {
 #include <core\kernel\exports\xboxkrnl.h>
 #include "core\kernel\init\\CxbxKrnl.h"
 #include "core\kernel\exports\EmuKrnl.h" // for HalSystemInterrupts
+#include "devices\chihiro\JvsIo.h" // for g_jvs_game_type
+
+static std::string BootIdFieldToUpper(const char* data, size_t len)
+{
+    std::string s(data, len);
+    auto nulPos = s.find('\0');
+    if (nulPos != std::string::npos) {
+        s.resize(nulPos);
+    }
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::toupper(c));
+    });
+    return s;
+}
+
+static bool IsWanganBootId(const chihiro_bootid& bootId)
+{
+    const std::string gameId = BootIdFieldToUpper(bootId.gameId, sizeof(bootId.gameId));
+    const std::string gameName = BootIdFieldToUpper(bootId.gameName, sizeof(bootId.gameName));
+    const std::string gameExe = BootIdFieldToUpper(bootId.gameExecutable, sizeof(bootId.gameExecutable));
+    const std::string testExe = BootIdFieldToUpper(bootId.testExecutable, sizeof(bootId.testExecutable));
+
+    return gameName.find("WANGAN") != std::string::npos
+        || gameName.find("MAXIMUM TUNE") != std::string::npos
+        || gameId.find("WMMT") != std::string::npos
+        || gameExe.find("WANGAN") != std::string::npos
+        || gameExe.find("WMMT") != std::string::npos
+        || testExe.find("WANGAN") != std::string::npos
+        || testExe.find("WMMT") != std::string::npos;
+}
+
+enum class WanganVariant {
+    Other,
+    MT1Export,
+    MT1Japan,
+    MT2Export,
+    MT2Japan,
+};
+
+static WanganVariant GetWanganVariantFromXbeHash()
+{
+    const uint64_t xbeHash = ComputeHash((void*)&CxbxKrnl_Xbe->m_Header, sizeof(Xbe::Header));
+    switch (xbeHash) {
+    case 0x712f117b89129fa8ULL: // WMMT1 V307 Export
+    case 0x74e8c73f60cb6e00ULL: // WMMT1 V307 Test Export
+        return WanganVariant::MT1Export;
+    case 0xb468b41f0928e6b6ULL: // WMMT1 V307 Japan
+    case 0x2a409af4248a5588ULL: // WMMT1 V307 Test Japan
+        return WanganVariant::MT1Japan;
+    case 0x3e6304c00e6c2894ULL: // WMMT2 V322 Export
+    case 0x6d56294f90d4d222ULL: // WMMT2 V322 Test Export
+        return WanganVariant::MT2Export;
+    case 0xd6343c4e8811efaaULL: // WMMT2 V322 Japan
+    case 0xa6a443b1a36b3905ULL: // WMMT2 V322 Test Japan
+        return WanganVariant::MT2Japan;
+    default:
+        return WanganVariant::Other;
+    }
+}
 
 chihiro_bootid &MediaBoard::GetBootId()
 {
@@ -89,9 +152,25 @@ uint32_t MediaBoard::LpcRead(uint32_t addr, int size)
                 desc = g_BetaConfig.mb_dimm_size ? "DIMM_SIZE(512MB)" : "DIMM_SIZE(1GB)";
                 break;
     case 0x4026: result = temp_0x4026;  desc = "HANDSHAKE(echo)";    break;
-    case 0x40F0: result = g_BetaConfig.mb_board_type ? 0x0001 : 0x0000;
-                desc = g_BetaConfig.mb_board_type ? "BOARD_TYPE(Type-3)" : "BOARD_TYPE(Type-1)";
+    case 0x40F0: {
+                const WanganVariant variant = GetWanganVariantFromXbeHash();
+                const bool isWangan = (variant != WanganVariant::Other)
+                    || IsWanganBootId(BootID)
+                    || (g_jvs_game_type == JvsGameType::WanganMT1)
+                    || (g_jvs_game_type == JvsGameType::WanganMT2);
+                const bool requireType3 =
+                    (variant == WanganVariant::MT1Japan || variant == WanganVariant::MT2Export);
+
+                if (isWangan) {
+                    result = requireType3 ? 0x0001 : 0x0000;
+                    desc = requireType3 ? "BOARD_TYPE(Type-3,Wangan-variant)"
+                                        : "BOARD_TYPE(Type-1,Wangan-variant)";
+                } else {
+                    result = g_BetaConfig.mb_board_type ? 0x0001 : 0x0000;
+                    desc = g_BetaConfig.mb_board_type ? "BOARD_TYPE(Type-3)" : "BOARD_TYPE(Type-1)";
+                }
                 break;
+    }
     case 0x4084: result = 0;          desc = "UNK_4084";           break;
     default:
         MbLog("LpcRead UNKNOWN 0x%04X sz=%d\n", addr, size);
@@ -349,8 +428,18 @@ void MediaBoard::ComWrite(uint32_t offset, void* buffer, uint32_t length)
             break;
         }
         case MB_CMD_SYSTEM_TYPE: { // 0x0102
-            *(uint32_t*)&outputBuffer[4] = 0;
-            EmuLog(LOG_LEVEL::DEBUG, "  0");
+            const WanganVariant variant = GetWanganVariantFromXbeHash();
+            const bool requireDevGdrom =
+                (variant == WanganVariant::MT1Japan || variant == WanganVariant::MT2Export);
+
+            *(uint32_t*)&outputBuffer[4] = requireDevGdrom
+                ? (MB_SYSTEM_TYPE_DEVELOPER | MB_SYSTEM_TYPE_GDROM)
+                : 0;
+
+            EmuLog(LOG_LEVEL::DEBUG,
+                "  MB_CMD_SYSTEM_TYPE -> 0x%04X (variant=%d)",
+                (unsigned int)*(uint32_t*)&outputBuffer[4],
+                (int)variant);
             break;
         }
         case MB_CMD_SERIAL_NUMBER: { // 0x0103

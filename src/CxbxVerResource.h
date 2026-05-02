@@ -3,8 +3,8 @@
 #define CXBX_VERSION_MAJOR  1
 #define CXBX_VERSION_MINOR  0
 #define CXBX_VERSION_PATCH  0
-#define CXBX_VERSION_BUILD  13
+#define CXBX_VERSION_BUILD  14
 
-#define CXBX_VERSION_STR    "1.0.0.13"
+#define CXBX_VERSION_STR    "1.0.0.14"
 #define CXBX_COMPANY_STR    "TeknoParrot Gang Fork"
 #define CXBX_COPYRIGHT_STR  "Copyright (C) Cxbx-Reloaded Team"
