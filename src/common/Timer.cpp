@@ -39,6 +39,7 @@
 #include "core\kernel\exports\EmuKrnlPs.hpp"
 #include "core\kernel\exports\EmuKrnl.h"
 #include "common/BetaConfig.h"
+#include "common/win32/Threads.h"
 #include "devices\Xbox.h"
 #include "devices\usb\OHCI.h"
 #include "core\hle\DSOUND\DirectSound\DirectSoundGlobal.hpp"
@@ -49,6 +50,7 @@
 
 static std::atomic_uint64_t last_qpc; // last time when QPC was called
 static std::atomic_uint64_t exec_time; // total execution time in us since the emulation started
+static std::atomic_flag get_now_lock = ATOMIC_FLAG_INIT;
 static uint64_t pit_last; // last time when the pit time was updated
 static uint64_t pit_last_qpc; // last QPC time of the pit
 // The frequency of the high resolution clock of the host, and the start time
@@ -206,14 +208,36 @@ static void update_non_periodic_events()
 
 uint64_t get_now()
 {
-	LARGE_INTEGER now;
-	QueryPerformanceCounter(&now);
-	uint64_t elapsed_us = now.QuadPart - last_qpc;
-	last_qpc = now.QuadPart;
-	elapsed_us *= 1000000;
-	elapsed_us /= HostQPCFrequency;
-	exec_time += elapsed_us;
-	return exec_time;
+	if (g_BetaConfig.get_now_lock) {
+		// Spinlock to prevent concurrent callers from double-counting elapsed time.
+		// Almost always uncontended (system_events is the primary caller).
+		while (get_now_lock.test_and_set(std::memory_order_acquire)) {
+			YieldProcessor();
+		}
+
+		LARGE_INTEGER now;
+		QueryPerformanceCounter(&now);
+
+		uint64_t prev = last_qpc.load(std::memory_order_relaxed);
+		last_qpc.store(now.QuadPart, std::memory_order_relaxed);
+		uint64_t elapsed_us = now.QuadPart - prev;
+		elapsed_us *= 1000000;
+		elapsed_us /= HostQPCFrequency;
+		uint64_t result = exec_time.fetch_add(elapsed_us, std::memory_order_relaxed) + elapsed_us;
+
+		get_now_lock.clear(std::memory_order_release);
+		return result;
+	} else {
+		// Original unlocked path
+		LARGE_INTEGER now;
+		QueryPerformanceCounter(&now);
+		uint64_t elapsed_us = now.QuadPart - last_qpc;
+		last_qpc = now.QuadPart;
+		elapsed_us *= 1000000;
+		elapsed_us /= HostQPCFrequency;
+		exec_time += elapsed_us;
+		return exec_time;
+	}
 }
 
 static uint64_t get_next(uint64_t now)
@@ -233,9 +257,18 @@ xbox::void_xt NTAPI system_events(xbox::PVOID arg)
 	constexpr uint64_t system_event_sleep_quantum_us = 500;
 	constexpr uint64_t system_event_spin_window_us = 250;
 
+	// Optionally move system_events off the Xbox core to reduce contention
+	if (g_BetaConfig.system_events_other_affinity && g_AffinityPolicy) {
+		g_AffinityPolicy->SetAffinityOther();
+	}
+
 	// Testing shows that, if this thread has the same priority of the other xbox threads, it can take tens, even hundreds of ms to complete a single loop.
 	// So we increase its priority to above normal, so that it scheduled more often
-	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+	if (g_BetaConfig.system_events_normal_priority) {
+		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+	} else {
+		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+	}
 
 	// Always run this thread at dpc level to prevent it from ever executing APCs/DPCs
 	xbox::KeRaiseIrqlToDpcLevel();

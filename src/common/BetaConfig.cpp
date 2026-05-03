@@ -56,6 +56,10 @@ void BetaConfig_Load()
 	g_BetaConfig.precise_sleep_timer      = ReadIniInt(path, "precise_sleep_timer", 1);
 	g_BetaConfig.periodic_irq10           = ReadIniInt(path, "periodic_irq10", 1);
 	g_BetaConfig.llong_min_timeout_fix    = ReadIniInt(path, "llong_min_timeout_fix", 1);
+	g_BetaConfig.get_now_lock             = ReadIniInt(path, "get_now_lock", 1);
+	g_BetaConfig.atomic_interrupts        = ReadIniInt(path, "atomic_interrupts", 1);
+	g_BetaConfig.system_events_other_affinity = ReadIniInt(path, "system_events_other_affinity", 0);
+	g_BetaConfig.system_events_normal_priority = ReadIniInt(path, "system_events_normal_priority", 0);
 
 	// KiTimerExpiration safety
 	g_BetaConfig.timer_exp_pointer_guard  = ReadIniInt(path, "timer_exp_pointer_guard", 1);

@@ -60,12 +60,18 @@ inline std::atomic_bool g_bEnableAllInterrupts = true;
 class HalSystemInterrupt {
 public:
 	void Assert(bool state) {
-		// If the interrupt was marked as Asserted, and was previously not, set the pending flag too!
-		if (m_Asserted == 0 && state == 1) {
-			m_Pending = true;
+		if (g_BetaConfig.atomic_interrupts) {
+			bool wasAsserted = m_Asserted.load(std::memory_order_acquire);
+			if (!wasAsserted && state) {
+				m_Pending.store(true, std::memory_order_release);
+			}
+			m_Asserted.store(state, std::memory_order_release);
+		} else {
+			if (!m_Asserted && state) {
+				m_Pending = true;
+			}
+			m_Asserted = state;
 		}
-
-		m_Asserted = state;
 	};
 
 	void Enable() {
@@ -81,6 +87,9 @@ public:
 	}
 
 	bool IsPending() {
+		if (g_BetaConfig.atomic_interrupts) {
+			return m_Asserted.load(std::memory_order_acquire) && m_Pending.load(std::memory_order_acquire);
+		}
 		return m_Asserted && m_Pending;
 	}
 
@@ -92,17 +101,21 @@ public:
 		// If interrupt was level sensitive, we clear the pending flag, preventing the interrupt from being triggered 
 		// until it is deasserted then asserted again. Latched interrupts are triggered until the line is Deasserted!
 		if (m_InterruptMode == xbox::KINTERRUPT_MODE::LevelSensitive) {
-			m_Pending = false;
+			if (g_BetaConfig.atomic_interrupts) {
+				m_Pending.store(false, std::memory_order_release);
+			} else {
+				m_Pending = false;
+			}
 		}
 
 		xbox::boolean_xt(__stdcall *ServiceRoutine)(xbox::PKINTERRUPT, void*) = (xbox::boolean_xt(__stdcall *)(xbox::PKINTERRUPT, void*))Interrupt->ServiceRoutine;
 		xbox::boolean_xt result = ServiceRoutine(Interrupt, Interrupt->ServiceContext);
 	}
 private:
-	bool m_Asserted = false;
-	bool m_Enabled = false;
+	std::atomic<bool> m_Asserted = false;
+	std::atomic<bool> m_Enabled = false;
 	xbox::KINTERRUPT_MODE m_InterruptMode;
-	bool m_Pending = false;
+	std::atomic<bool> m_Pending = false;
 };
 
 extern HalSystemInterrupt HalSystemInterrupts[MAX_BUS_INTERRUPT_LEVEL + 1];

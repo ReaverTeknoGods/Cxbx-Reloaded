@@ -23,6 +23,10 @@ struct BetaConfig {
 	int precise_sleep_timer     = 1; // Use high-resolution waitable timer in SleepPrecise
 	int periodic_irq10          = 1; // Periodic IRQ10 assertion for Chihiro media board
 	int llong_min_timeout_fix   = 1; // Treat INT64_MIN timeout as immediate (CRI library fix)
+	int get_now_lock            = 1; // Spinlock in get_now() to prevent concurrent time double-count
+	int atomic_interrupts       = 1; // Use std::atomic for HalSystemInterrupt flags (thread safety)
+	int system_events_other_affinity = 0; // Move system_events off Xbox core to Other cores
+	int system_events_normal_priority = 0; // Lower system_events from ABOVE_NORMAL to NORMAL
 
 	// KiTimerExpiration safety guards
 	int timer_exp_pointer_guard  = 1; // Validate timer list pointers before dereferencing
