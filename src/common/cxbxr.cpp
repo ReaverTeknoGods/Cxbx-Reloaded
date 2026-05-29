@@ -92,6 +92,21 @@ bool HandleFirstLaunch()
 
 [[noreturn]] void CxbxrShutDown(bool is_reboot)
 {
+	// QoD debug: log shutdown reason using Win32 API (bypasses CRT)
+	{
+		HANDLE hFile = CreateFileA("C:\\temp\\qod_shutdown.log", GENERIC_WRITE, FILE_SHARE_READ,
+			NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+		if (hFile != INVALID_HANDLE_VALUE) {
+			char buf[256];
+			SYSTEMTIME st; GetLocalTime(&st);
+			int len = wsprintfA(buf, "[%02d:%02d:%02d.%03d] CxbxrShutDown(is_reboot=%d)\r\n",
+				st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, is_reboot ? 1 : 0);
+			DWORD written;
+			WriteFile(hFile, buf, len, &written, NULL);
+			CloseHandle(hFile);
+		}
+	}
+
 	if (!is_reboot) {
 		// Clear all kernel boot flags. These (together with the shared memory) persist until Cxbx-Reloaded is closed otherwise.
 		int BootFlags = 0;
@@ -145,6 +160,23 @@ bool HandleFirstLaunch()
 
 [[noreturn]] void CxbxrAbortEx(CXBXR_MODULE cxbxr_module, const char* szErrorMessage, ...)
 {
+	// QoD debug: log abort using Win32 API
+	{
+		char abortBuf[1024] = {0};
+		if (szErrorMessage) { va_list ap; va_start(ap, szErrorMessage); vsnprintf(abortBuf, sizeof(abortBuf)-1, szErrorMessage, ap); va_end(ap); }
+		HANDLE hFile = CreateFileA("C:\\temp\\qod_abort.log", GENERIC_WRITE, FILE_SHARE_READ,
+			NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+		if (hFile != INVALID_HANDLE_VALUE) {
+			char buf[2048];
+			SYSTEMTIME st; GetLocalTime(&st);
+			int len = wsprintfA(buf, "[%02d:%02d:%02d.%03d] CxbxrAbort: %s\r\n",
+				st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, abortBuf);
+			DWORD written;
+			WriteFile(hFile, buf, len, &written, NULL);
+			CloseHandle(hFile);
+		}
+	}
+
 	// print out error message (if exists)
 	if (szErrorMessage != NULL)
 	{

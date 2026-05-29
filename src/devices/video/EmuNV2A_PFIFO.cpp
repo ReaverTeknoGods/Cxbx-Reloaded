@@ -1300,9 +1300,103 @@ bool nv2a_pfifo_consume_pending_kicks(NV2AState *d, bool *outHasMorePending,
     return found;
 }
 
-void nv2a_pfifo_discard_pending_kicks()
+void nv2a_pfifo_discard_pending_kicks(NV2AState *d)
 {
 	memset(s_parsedSlotDirty, 0, sizeof(s_parsedSlotDirty));
+
+	// Before discarding, scan for SET_SEMAPHORE_OFFSET and
+	// BACK_END_WRITE_SEMAPHORE_RELEASE commands and execute them.
+	// Games (e.g. OutRun 2 SP) use GPU semaphore writes as fence counters;
+	// discarding these causes infinite spin-waits.
+	LONG read = s_pendingDmaPutRead;
+	LONG write = s_pendingDmaPutWrite;
+
+	if (read != write && d) {
+		auto pg = &d->pgraph;
+
+		// Map push buffer
+		uint32_t *pf_regs = d->pfifo.regs;
+		hwaddr dma_instance =
+			GET_MASK(pf_regs[NV_PFIFO_CACHE1_DMA_INSTANCE],
+			         NV_PFIFO_CACHE1_DMA_INSTANCE_ADDRESS_MASK) << 4;
+		hwaddr dma_len;
+		uint8_t *dma = (uint8_t*)nv_dma_map(d, dma_instance, &dma_len);
+
+		if (dma) {
+			while (read != write) {
+				PendingDmaPutRange range = s_pendingDmaPutRanges[read];
+				uint32_t dmaState = range.dma_state;
+				uint32_t dmaSubroutine = range.dma_subroutine;
+
+				uint32_t method_type =
+					GET_MASK(dmaState, NV_PFIFO_CACHE1_DMA_STATE_METHOD_TYPE);
+				uint32_t method =
+					GET_MASK(dmaState, NV_PFIFO_CACHE1_DMA_STATE_METHOD) << 2;
+				uint32_t method_count =
+					GET_MASK(dmaState, NV_PFIFO_CACHE1_DMA_STATE_METHOD_COUNT);
+				bool method_inc =
+					(method_type == NV_PFIFO_CACHE1_DMA_STATE_METHOD_TYPE_INC);
+
+				uint32_t sub_ret = dmaSubroutine & 0xfffffffc;
+				bool sub_active =
+					GET_MASK(dmaSubroutine, NV_PFIFO_CACHE1_DMA_SUBROUTINE_STATE) != 0;
+
+				uint32_t pos = range.start;
+				uint32_t end = range.end;
+
+				for (int budget = 65536; budget > 0 && pos != end; --budget) {
+					if (pos >= dma_len) break;
+
+					uint32_t word = *(uint32_t*)(dma + pos);
+					pos += 4;
+
+					if (method_count) {
+						if (method == NV097_SET_SEMAPHORE_OFFSET) {
+							pg->regs[NV_PGRAPH_SEMAPHOREOFFSET] = word;
+						}
+						else if (method == NV097_BACK_END_WRITE_SEMAPHORE_RELEASE) {
+							uint32_t semaphore_offset = pg->regs[NV_PGRAPH_SEMAPHOREOFFSET];
+							xbox::addr_xt semaphore_dma_len;
+							uint8_t *semaphore_data = (uint8_t*)nv_dma_map(d,
+								pg->dma_semaphore, &semaphore_dma_len);
+							if (semaphore_offset < semaphore_dma_len) {
+								stl_le_p((uint32_t*)(semaphore_data + semaphore_offset), word);
+							}
+						}
+						if (method_inc) method += 4;
+						method_count--;
+					} else {
+						if ((word & 0xe0000003) == 0x20000000) {
+							pos = word & 0x1fffffff;
+						} else if ((word & 3) == 1) {
+							pos = word & 0xfffffffc;
+						} else if ((word & 3) == 2) {
+							if (!sub_active) {
+								sub_ret = pos;
+								sub_active = true;
+								pos = word & 0xfffffffc;
+							}
+						} else if (word == 0x00020000) {
+							if (sub_active) {
+								pos = sub_ret;
+								sub_active = false;
+							}
+						} else if ((word & 0xe0030003) == 0) {
+							method       = word & 0x1FFC;
+							method_count = (word >> 18) & 0x7FF;
+							method_inc   = true;
+						} else if ((word & 0xe0030003) == 0x40000000) {
+							method       = word & 0x1FFC;
+							method_count = (word >> 18) & 0x7FF;
+							method_inc   = false;
+						}
+					}
+				}
+				read = (read + 1) % NV2A_MAX_PENDING_DMA_PUT_RANGES;
+			}
+		}
+	}
+
 	InterlockedExchange(&s_pendingDmaPutRead, s_pendingDmaPutWrite);
 }
 

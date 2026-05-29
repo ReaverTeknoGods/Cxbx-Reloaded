@@ -90,10 +90,33 @@ public:
 	void ComRead(uint32_t offset, void* buffer, uint32_t length);
 	void ComWrite(uint32_t offset, void* buffer, uint32_t length);
     chihiro_bootid &GetBootId();
+    const std::string& GetMountPath() const { return m_MountPath; }
 private:
     uint32_t temp_0x4026 = 0;
     uint32_t temp_0x408E = 0;
     uint32_t temp_0x4080 = 0;
+    uint32_t temp_0x4000 = 0;
+    uint32_t temp_0x4004 = 0;
+    uint32_t fpga_data_latch = 0;  // data written via 0xA0000020 command
+    uint32_t fpga_aux_reg = 0;     // value accessed via 0xA0001E60
+    uint32_t fpga_mailbox_packet[8] = {};
+    uint32_t fpga_mailbox_word_count = 0;
+    uint32_t fpga_mailbox_reply = 0;
+    uint32_t fpga_response_packet[8] = {};
+    uint32_t fpga_response_word_count = 0;
+    uint32_t fpga_response_read_index = 0;
+    // Sequential response buffer for reads from 0x84000020
+    uint32_t fpga_data_response[8] = {};
+    uint32_t fpga_data_response_count = 0;
+    uint32_t fpga_data_response_index = 0;
+    bool type3_status_ready = true;
+    // Satellite channel FPGA response (for 0x91000200 writes / 0x90000000 reads)
+    uint32_t sat_response[8] = {};
+    uint32_t sat_response_count = 0;
+    uint32_t sat_response_read_index = 0;
+    uint32_t sat_command[8] = {};
+    uint32_t sat_command_word_count = 0;
+    bool sat_command_active = false;
     uint8_t buffer_800000[512] = {};   // 0x800000 read buffer (net response)
     uint8_t buffer_800200[512] = {};   // 0x800200 write buffer (net command)
     uint8_t buffer_900000[512] = {};   // 0x900000 read buffer (sys response) = MAME read_buffer

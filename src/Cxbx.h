@@ -64,6 +64,9 @@ enum DebuggerState { debuggerOff, debuggerOn };
 /*! indicates emulation of a Chihiro system */
 extern bool g_bIsChihiro;
 
+/*! indicates Chihiro test mode reboot (launch testExecutable from boot.id) */
+extern bool g_bChihiroTestMode;
+
 /*! indicates emulation of a DevKit system */
 /* Note: Our DevKit emulation lacks the kernel debugging interface and virtual dvd-rom emulator card, so this is actually a Debug Kit */
 extern bool g_bIsDevKit;

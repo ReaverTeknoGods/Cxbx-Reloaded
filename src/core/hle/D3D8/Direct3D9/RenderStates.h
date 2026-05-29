@@ -55,6 +55,7 @@ private:
 
     bool XboxRenderStateValueChanged(uint32_t State);
 
+    void ApplyBlendFactor();
     void ApplySimpleRenderState(uint32_t State, uint32_t Value);
     void ApplyDeferredRenderState(uint32_t State, uint32_t Value);
     void ApplyComplexRenderState(uint32_t State, uint32_t Value);

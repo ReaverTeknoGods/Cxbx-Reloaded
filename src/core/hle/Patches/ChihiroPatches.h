@@ -32,6 +32,8 @@ bool IsWanganXbe(uint32_t imageSize);
 bool IsGundamXbe(uint64_t xbeHash);
 bool IsCrazyTaxiXbe(uint64_t xbeHash);
 bool IsGolfXbe(uint64_t xbeHash);
+bool IsGolf2006Xbe(uint64_t xbeHash);
+bool IsMahjongXbe(uint64_t xbeHash);
 
 // Apply JVS watchdog suppression (Error 11/12) for all Chihiro games.
 void ApplyJvsWatchdogPatch(uint32_t imageSize);
@@ -47,6 +49,29 @@ void ApplyGundamPatches(uint64_t xbeHash, uint32_t imageSize);
 void ApplyCrazyTaxiPatches(uint64_t xbeHash, uint32_t imageSize);
 
 // Apply MediaBoard/DIMM/D3D patches for Virtua Golf / Sega Golf Club.
-void ApplyGolfPatches(uint32_t imageSize);
+void ApplyGolfPatches(uint64_t xbeHash, uint32_t imageSize);
+
+// Apply MediaBoard/DIMM/D3D patches for Sega Golf Club 2006: Next Tours.
+void ApplyGolf2006Patches(uint64_t xbeHash, uint32_t imageSize);
+
+// Apply network patches for Sega Network Taisen Mahjong MJ2 / MJ3 / MJ3 Evolution.
+void ApplyMahjongPatches(uint64_t xbeHash, uint32_t imageSize);
+
+// Mahjong game type (set by ApplyMahjongPatches, read by D3D swap hook)
+// 0=none, 1=MJ2, 2=MJ3, 3=MJ3Evo
+extern int g_ChihiroMjGame;
+
+// Per-game Xbox backbuffer override (set by game patches, read by Direct3D_CreateDevice).
+// When non-zero, the Xbox presentation parameters are overridden to this size.
+extern uint32_t g_ChihiroBackbufferOverrideW;
+extern uint32_t g_ChihiroBackbufferOverrideH;
+
+// Apply patches for OutRun 2 / OutRun 2 SP.
+bool IsOutRun2Xbe(uint64_t xbeHash);
+void ApplyOutRun2Patches(uint64_t xbeHash, uint32_t imageSize);
+
+// Apply patches for Quest of D.
+bool IsQuestOfDXbe(uint64_t xbeHash);
+void ApplyQuestOfDPatches(uint64_t xbeHash, uint32_t imageSize);
 
 #endif // CHIHIRO_PATCHES_H

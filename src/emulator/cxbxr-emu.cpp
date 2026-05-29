@@ -200,6 +200,17 @@ DWORD WINAPI Emulate(unsigned int reserved_systems, blocks_reserved_t blocks_res
 
 	CxbxKrnlEmulate(reserved_systems, blocks_reserved);
 
+	// QoD debug: log normal exit
+	{
+		FILE* _f = fopen("C:\\temp\\qod_patches.log", "a");
+		if (_f) {
+			SYSTEMTIME _st; GetLocalTime(&_st);
+			fprintf(_f, "[%02d:%02d:%02d.%03d] QoD: *** CxbxKrnlEmulate returned - normal exit path ***\n",
+				_st.wHour, _st.wMinute, _st.wSecond, _st.wMilliseconds);
+			fclose(_f);
+		}
+	}
+
 	/*! cleanup shared memory */
 	EmuShared::Cleanup();
 

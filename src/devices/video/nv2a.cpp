@@ -1200,6 +1200,10 @@ void NV2ADevice::Init()
 
 	d->vram_ptr = (uint8_t*)PHYSICAL_MAP_BASE;
 	d->vram_size = g_SystemMaxMemory;
+	d->pmc.pending_interrupts = 0;
+	d->pmc.enabled_interrupts = NV_PMC_INTR_EN_0_HARDWARE;
+	d->pcrtc.pending_interrupts = 0;
+	d->pcrtc.enabled_interrupts = NV_PCRTC_INTR_EN_0_VBLANK;
 
 	d->pramdac.core_clock_coeff = 0x00011C01; /* 233MHz...? */
 	d->pramdac.core_clock_freq = 233333324;

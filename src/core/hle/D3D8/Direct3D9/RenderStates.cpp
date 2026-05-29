@@ -190,6 +190,28 @@ void XboxRenderStateConverter::Apply()
     }
 }
 
+static bool UsesConstantAlphaBlend(uint32_t blend)
+{
+    return blend == 0x8003 || blend == 0x8004;
+}
+
+uint32_t m_XboxSrcBlend = 0x001; //D3DBLEND_ONE;
+uint32_t m_XboxDestBlend = 0x000; // D3DBLEND_ZERO;
+uint32_t m_XboxBlendColor = 0xFFFFFFFF;
+
+void XboxRenderStateConverter::ApplyBlendFactor()
+{
+    DWORD value = m_XboxBlendColor;
+
+    if (UsesConstantAlphaBlend(m_XboxSrcBlend) ||
+        UsesConstantAlphaBlend(m_XboxDestBlend)) {
+        const DWORD a = (value >> 24) & 0xFF;
+        value = D3DCOLOR_ARGB(a, a, a, a);
+    }
+
+    g_pD3DDevice->SetRenderState(D3DRS_BLENDFACTOR, value);
+}
+
 void XboxRenderStateConverter::ApplySimpleRenderState(uint32_t State, uint32_t Value)
 {
 	auto RenderStateInfo = GetDxbxRenderStateInfo(State);
@@ -222,9 +244,20 @@ void XboxRenderStateConverter::ApplySimpleRenderState(uint32_t State, uint32_t V
             Value = EmuXB2PC_D3DBLENDOP(Value);
             break;
         case xbox::X_D3DRS_SRCBLEND:
-        case xbox::X_D3DRS_DESTBLEND:
+            m_XboxSrcBlend = Value;
             Value = EmuXB2PC_D3DBLEND(Value);
+            ApplyBlendFactor();
             break;
+        case xbox::X_D3DRS_DESTBLEND:
+            m_XboxDestBlend = Value;
+            Value = EmuXB2PC_D3DBLEND(Value);
+            ApplyBlendFactor();
+            break;
+
+        case xbox::X_D3DRS_BLENDCOLOR:
+            m_XboxBlendColor = Value;
+            ApplyBlendFactor();
+            return;
         case xbox::X_D3DRS_ZFUNC:
         case xbox::X_D3DRS_ALPHAFUNC:
         case xbox::X_D3DRS_STENCILFUNC:
@@ -236,7 +269,6 @@ void XboxRenderStateConverter::ApplySimpleRenderState(uint32_t State, uint32_t V
             break;
         case xbox::X_D3DRS_ALPHATESTENABLE:
         case xbox::X_D3DRS_ALPHABLENDENABLE:
-        case xbox::X_D3DRS_BLENDCOLOR:
         case xbox::X_D3DRS_ALPHAREF: case xbox::X_D3DRS_ZWRITEENABLE:
         case xbox::X_D3DRS_DITHERENABLE: case xbox::X_D3DRS_STENCILREF:
         case xbox::X_D3DRS_STENCILMASK: case xbox::X_D3DRS_STENCILWRITEMASK:

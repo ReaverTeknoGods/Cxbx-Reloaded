@@ -28,40 +28,31 @@
 
 #include "MediaBoard.h"
 #include "common/BetaConfig.h"
-#include "common\util\hasher.h"
-#include "common\xbe\Xbe.h"
 #include <cstdio>
 #include <cstdarg>
 #include <string>
-#include <algorithm>
-#include <cctype>
+#include <thread>
 
-// Media board command log — set MB_LOG_ENABLED to 1 to enable
-// Writes to <ShaderCacheDir>/mb_log.txt
-#define MB_LOG_ENABLED 0
+// Set by QuestOfDPatches when the game XBE (not SEGABOOT) is loaded.
+// Used to skip SEGABOOT-only logic (forced QuickReboot) in the game process.
+extern bool g_QodGamePatchesActive;
 
-#if MB_LOG_ENABLED
-const std::string& GetShaderCacheDir();
+// File-based media board command log (stdout may be buffered)
+// Set to 1 to enable logging to C:\temp\mb_log.txt
+#define MB_LOG_ENABLED 1
+
 static FILE* g_mbLog = nullptr;
-static bool  g_mbLogFailed = false;
+uint32_t s_type3TableBase = 0; // exported for state monitor
 static void MbLog(const char* fmt, ...) {
-    if (!g_mbLog && !g_mbLogFailed) {
-        const std::string& cacheDir = GetShaderCacheDir();
-        if (!cacheDir.empty()) {
-            std::string logPath = cacheDir + "\\mb_log.txt";
-            g_mbLog = fopen(logPath.c_str(), "w");
-            if (!g_mbLog) g_mbLogFailed = true;
-        }
-    }
+#if MB_LOG_ENABLED
+    if (!g_mbLog) g_mbLog = fopen("C:\\temp\\mb_log.txt", "w");
     if (!g_mbLog) return;
     va_list ap; va_start(ap, fmt);
     vfprintf(g_mbLog, fmt, ap);
     va_end(ap);
     fflush(g_mbLog);
-}
-#else
-static void MbLog(const char*, ...) {}
 #endif
+}
 
 #define _XBOXKRNL_DEFEXTRN_
 #define LOG_PREFIX CXBXR_MODULE::JVS // TODO: XBAM
@@ -70,65 +61,6 @@ static void MbLog(const char*, ...) {}
 #include <core\kernel\exports\xboxkrnl.h>
 #include "core\kernel\init\\CxbxKrnl.h"
 #include "core\kernel\exports\EmuKrnl.h" // for HalSystemInterrupts
-#include "devices\chihiro\JvsIo.h" // for g_jvs_game_type
-
-static std::string BootIdFieldToUpper(const char* data, size_t len)
-{
-    std::string s(data, len);
-    auto nulPos = s.find('\0');
-    if (nulPos != std::string::npos) {
-        s.resize(nulPos);
-    }
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return static_cast<char>(std::toupper(c));
-    });
-    return s;
-}
-
-static bool IsWanganBootId(const chihiro_bootid& bootId)
-{
-    const std::string gameId = BootIdFieldToUpper(bootId.gameId, sizeof(bootId.gameId));
-    const std::string gameName = BootIdFieldToUpper(bootId.gameName, sizeof(bootId.gameName));
-    const std::string gameExe = BootIdFieldToUpper(bootId.gameExecutable, sizeof(bootId.gameExecutable));
-    const std::string testExe = BootIdFieldToUpper(bootId.testExecutable, sizeof(bootId.testExecutable));
-
-    return gameName.find("WANGAN") != std::string::npos
-        || gameName.find("MAXIMUM TUNE") != std::string::npos
-        || gameId.find("WMMT") != std::string::npos
-        || gameExe.find("WANGAN") != std::string::npos
-        || gameExe.find("WMMT") != std::string::npos
-        || testExe.find("WANGAN") != std::string::npos
-        || testExe.find("WMMT") != std::string::npos;
-}
-
-enum class WanganVariant {
-    Other,
-    MT1Export,
-    MT1Japan,
-    MT2Export,
-    MT2Japan,
-};
-
-static WanganVariant GetWanganVariantFromXbeHash()
-{
-    const uint64_t xbeHash = ComputeHash((void*)&CxbxKrnl_Xbe->m_Header, sizeof(Xbe::Header));
-    switch (xbeHash) {
-    case 0x712f117b89129fa8ULL: // WMMT1 V307 Export
-    case 0x74e8c73f60cb6e00ULL: // WMMT1 V307 Test Export
-        return WanganVariant::MT1Export;
-    case 0xb468b41f0928e6b6ULL: // WMMT1 V307 Japan
-    case 0x2a409af4248a5588ULL: // WMMT1 V307 Test Japan
-        return WanganVariant::MT1Japan;
-    case 0x3e6304c00e6c2894ULL: // WMMT2 V322 Export
-    case 0x6d56294f90d4d222ULL: // WMMT2 V322 Test Export
-        return WanganVariant::MT2Export;
-    case 0xd6343c4e8811efaaULL: // WMMT2 V322 Japan
-    case 0xa6a443b1a36b3905ULL: // WMMT2 V322 Test Japan
-        return WanganVariant::MT2Japan;
-    default:
-        return WanganVariant::Other;
-    }
-}
 
 chihiro_bootid &MediaBoard::GetBootId()
 {
@@ -163,32 +95,79 @@ uint32_t MediaBoard::LpcRead(uint32_t addr, int size)
                 desc = g_BetaConfig.mb_dimm_size ? "DIMM_SIZE(512MB)" : "DIMM_SIZE(1GB)";
                 break;
     case 0x4026: result = temp_0x4026;  desc = "HANDSHAKE(echo)";    break;
-    case 0x40F0: {
-                const WanganVariant variant = GetWanganVariantFromXbeHash();
-                const bool isWangan = (variant != WanganVariant::Other)
-                    || IsWanganBootId(BootID)
-                    || (g_jvs_game_type == JvsGameType::WanganMT1)
-                    || (g_jvs_game_type == JvsGameType::WanganMT2);
-                const bool requireType3 =
-                    (variant == WanganVariant::MT1Japan || variant == WanganVariant::MT2Export);
-
-                if (isWangan) {
-                    result = requireType3 ? 0x0001 : 0x0000;
-                    desc = requireType3 ? "BOARD_TYPE(Type-3,Wangan-variant)"
-                                        : "BOARD_TYPE(Type-1,Wangan-variant)";
-                } else {
-                    result = g_BetaConfig.mb_board_type ? 0x0001 : 0x0000;
-                    desc = g_BetaConfig.mb_board_type ? "BOARD_TYPE(Type-3)" : "BOARD_TYPE(Type-1)";
-                }
+    case 0x40F0: result = g_BetaConfig.mb_board_type ? 0x0100 : 0x0000;
+                desc = g_BetaConfig.mb_board_type ? "BOARD_TYPE(Type-3)" : "BOARD_TYPE(Type-1)";
                 break;
-    }
     case 0x4084: result = 0;          desc = "UNK_4084";           break;
+    case 0x4000:
+        if (temp_0x4004 == 0xA0001E60) {
+            result = fpga_aux_reg;
+            desc = "FPGA_AUX";
+        } else if (temp_0x4004 == 0xA0000000 && fpga_data_latch == 0x84000000 && fpga_response_read_index < fpga_response_word_count) {
+            result = fpga_response_packet[fpga_response_read_index++];
+            desc = "FPGA_RESPONSE";
+            // After the last word is read, clear the response so subsequent
+            // ISR drains (after reset) don't re-process stale data.
+            if (fpga_response_read_index >= fpga_response_word_count) {
+                memset(fpga_response_packet, 0, sizeof(fpga_response_packet));
+                fpga_response_word_count = 0;
+                fpga_response_read_index = 0;
+            }
+        } else if (temp_0x4004 == 0xA0000000 && fpga_data_latch == 0x84000020 && fpga_data_response_index < fpga_data_response_count) {
+            result = fpga_data_response[fpga_data_response_index++];
+            desc = "FPGA_DATA_RESPONSE";
+            if (fpga_data_response_index >= fpga_data_response_count) {
+                memset(fpga_data_response, 0, sizeof(fpga_data_response));
+                fpga_data_response_count = 0;
+                fpga_data_response_index = 0;
+            }
+        } else if (temp_0x4004 == 0xA0000000 && fpga_data_latch == 0x84000020 && fpga_mailbox_reply != 0) {
+            result = fpga_mailbox_reply;
+            fpga_mailbox_reply = 0;
+            desc = "FPGA_MAILBOX_REPLY";
+        } else if (temp_0x4004 == 0xA0000000 && (fpga_data_latch == 0x84000000 || fpga_data_latch == 0x84000020 || fpga_data_latch == 0x84000040)) {
+            // No response data available — return 0 so HIWORD==0 terminates drain loops.
+            // Without this, stale temp_0x4000 (e.g. 0x84000000) would have HIWORD!=0
+            // causing the ROM's drain loop to spin forever.
+            // 0x84000040 is the commit register — must also return 0 when idle.
+            result = 0;
+            desc = "FPGA_EMPTY";
+        } else if ((temp_0x4004 == 0x90000000 || temp_0x4004 == 0x91000000) && sat_response_read_index < sat_response_count) {
+            // Satellite channel response read (data already prepared)
+            result = sat_response[sat_response_read_index++];
+            desc = "SAT_RESPONSE";
+            if (sat_response_read_index >= sat_response_count) {
+                memset(sat_response, 0, sizeof(sat_response));
+                sat_response_count = 0;
+                sat_response_read_index = 0;
+            }
+        } else if ((temp_0x4004 == 0x90000000 || temp_0x4004 == 0x91000000) && sat_command_active && sat_command_word_count >= 8) {
+            // Lazy response preparation: the drain reads 0 (no response),
+            // then sub_3EB60 writes the command and reads the response.
+            // We prepare the response NOW (on first response read after command).
+            uint32_t ticket = sat_command[0] & 0xFFFF;
+            MbLog("  SatResponse lazy prepare ticket=%u\n", ticket);
+            memset(sat_response, 0, sizeof(sat_response));
+            sat_response[0] = ticket | 0x00020000;
+            sat_response[1] = 1; // success
+            sat_response_count = 8;
+            sat_response_read_index = 0;
+            sat_command_active = false;
+            result = sat_response[sat_response_read_index++];
+            desc = "SAT_RESPONSE_LAZY";
+        } else {
+            result = temp_0x4000;
+            desc = "FPGA_DATA";
+        }
+        break;
+    case 0x4004: result = temp_0x4004; desc = "FPGA_CTRL";          break;
     default:
         MbLog("LpcRead UNKNOWN 0x%04X sz=%d\n", addr, size);
         EmuLog(LOG_LEVEL::WARNING, "LpcRead: Unknown addr 0x%04X size=%d", addr, size);
         return 0;
     }
 
+    // Show ALL reads for debugging
     MbLog("LpcRead [0x%04X] -> 0x%04X (%s)\n", addr, result, desc);
     return result;
 }
@@ -196,6 +175,7 @@ uint32_t MediaBoard::LpcRead(uint32_t addr, int size)
 void MediaBoard::LpcWrite(uint32_t addr, uint32_t value, int size)
 {
     static int write4026Count = 0;
+    // Temporarily show ALL writes for debugging
     if (addr == 0x4026) {
         write4026Count++;
         if (write4026Count <= 5 || (write4026Count % 10000) == 0)
@@ -212,7 +192,16 @@ void MediaBoard::LpcWrite(uint32_t addr, uint32_t value, int size)
     }
 
     if (addr == 0x4026) {
+        // Game writes here as part of baseboard handshake / "kick".
+        // If we have a pending response that the game may have cleared
+        // from buffer_900000, re-deliver it once.
         temp_0x4026 = value;
+        if (m_responsePending) {
+            memcpy(buffer_900000, m_shadowResponse, 512);
+            m_responsePending = false;
+            MbLog("LpcWrite [0x4026] re-delivered pending response, IRQ10\n");
+            HalSystemInterrupts[10].Assert(true);
+        }
         return;
     }
 
@@ -230,6 +219,368 @@ void MediaBoard::LpcWrite(uint32_t addr, uint32_t value, int size)
         // infinite cascade. Instead, periodic IRQ10 in Timer.cpp drives the
         // interrupt→ISR→DPC→semaphore chain at a steady rate.
         temp_0x4080 = value;
+        return;
+    }
+
+    if (addr == 0x4008) {
+        // FPGA reset/clear register
+        return;
+    }
+
+    if (addr == 0x4004) {
+        // FPGA control register
+        temp_0x4004 = value;
+        if (value == 0xA0000040) {
+            // Reset command — clear data, reset response read cursors.
+            // Fully clear fpga_data_response so stale data can't trap drain loops.
+            temp_0x4000 = 0;
+            fpga_data_latch = 0;
+            fpga_response_read_index = 0;
+            fpga_data_response_index = 0;
+            fpga_data_response_count = 0;
+        } else if (value == 0xA0000020) {
+            // Load data command — next write to 0x4000 sets data latch
+        } else if (value == 0xA0000000) {
+            // Execute/read command — several Type-3 BIOS probes only check bit 0.
+            // 0x80000140 expects bit 0 set, while 0x80000160 expects bit 0 clear.
+            uint32_t result = fpga_data_latch;
+            if (fpga_data_latch == 0x80000140) {
+                result = (result & ~1u) | (type3_status_ready ? 1u : 0u);
+            } else if (fpga_data_latch == 0x80000160) {
+                // Satellite link status: sub_3EFF0 case -87 checks bit 0.
+                // bit 0 = 0 → sub_3EFF0 sets up standalone DMA and returns 0 (SUCCESS)
+                // bit 0 = 1 → sub_3EFF0 returns 5 (FAILURE, satellite present but stuck)
+                // We want standalone mode (no satellite), so bit 0 must be 0.
+                result &= ~1u;
+            } else if (fpga_data_latch == 0x84000020) {
+                // For the execute-mode pre-load:
+                // If there's a pending data response, serve it from the buffer.
+                // Otherwise return 0 (idle, HIWORD=0).
+                if (fpga_data_response_index < fpga_data_response_count) {
+                    result = fpga_data_response[fpga_data_response_index];
+                } else {
+                    result = 0;
+                }
+            } else if (fpga_data_latch == 0x84000000 || fpga_data_latch == 0x84000040) {
+                // The Type-3 BIOS polls this window until the returned high word clears.
+                // Zero keeps the queue moving toward the media-board command path.
+                // 0x84000040 is the commit trigger register — reading it should return 0 (idle).
+                result = 0;
+            }
+            temp_0x4000 = result;
+        } else if (value == 0xA0001E60) {
+            // Preserve a small sideband register used by later Type-3 transfers.
+            temp_0x4000 = fpga_aux_reg;
+        }
+        return;
+    }
+
+    if (addr == 0x4000) {
+        // FPGA data register — store data
+        temp_0x4000 = value;
+        if (temp_0x4004 == 0xA0000020) {
+            fpga_data_latch = value;
+        } else if (temp_0x4004 == 0xA0001E60) {
+            fpga_aux_reg = value;
+        } else if ((temp_0x4004 & 0xFF000000) == 0x91000000) {
+            // Satellite channel FPGA write (sideband mode, address 0x91000xxx)
+            // Accumulate command words. First word with HIWORD!=0 starts a new command.
+            if ((value & 0xFFFF0000u) != 0 && !sat_command_active) {
+                memset(sat_command, 0, sizeof(sat_command));
+                sat_command[0] = value;
+                sat_command_word_count = 1;
+                sat_command_active = true;
+                MbLog("  SatCommand start id=0x%08X\n", value);
+            } else if (sat_command_active && sat_command_word_count < 8) {
+                sat_command[sat_command_word_count++] = value;
+                if (sat_command_word_count >= 8) {
+                    // Command complete — response will be prepared lazily on read
+                    MbLog("  SatCommand complete ticket=%u (response deferred)\n",
+                          sat_command[0] & 0xFFFF);
+                }
+            }
+        } else if (temp_0x4004 == 0xA0000000) {
+            if (fpga_data_latch == 0x80000140) {
+                type3_status_ready = (value & 1u) != 0;
+                MbLog("  Type3Ready set to %u via 0x80000140 write\n", type3_status_ready ? 1u : 0u);
+            } else if (fpga_data_latch == 0x84000020) {
+                if ((value & 0xFFFF0000u) != 0) {
+                    // Non-zero HIWORD = event_type header (start of new mailbox packet).
+                    // event_type 0x0001 = cmd, 0x0101 = version query, 0x0103 = status, etc.
+                    fpga_mailbox_packet[0] = value;
+                    fpga_mailbox_word_count = 1;
+                    fpga_mailbox_reply = 0;
+                    MbLog("  Type3Mailbox start id=0x%08X evtype=0x%04X\n", value, (value >> 16) & 0xFFFF);
+                } else if (fpga_mailbox_word_count != 0 && fpga_mailbox_word_count < 8) {
+                    fpga_mailbox_packet[fpga_mailbox_word_count++] = value;
+                }
+            } else if (fpga_data_latch == 0x84800000) {
+                MbLog("  Type3Init write = 0x%08X\n", value);
+            } else if (fpga_data_latch == 0x84000040) {
+                if (value == 1 && fpga_mailbox_packet[0] != 0) {
+                    const uint32_t channel = fpga_aux_reg == 0 ? 8 : fpga_aux_reg;
+                    const uint32_t requestId = fpga_mailbox_packet[0] & 0xFF;
+                    MbLog("  Type3Mailbox commit packet=0x%08X request=%u channel=%u words=%u\n",
+                        fpga_mailbox_packet[0], requestId, channel, fpga_mailbox_word_count);
+                    MbLog("  Type3Mailbox data:");
+                    for (int pi = 0; pi < 8; pi++) MbLog(" %08X", fpga_mailbox_packet[pi]);
+                    MbLog("\n");
+
+                    // The ROM checks HIWORD(response[0]) == 0 for "completed".
+                    // The 0x0001 prefix means "pending"; strip it so the response
+                    // signals completion. Return the request ID in the low word only.
+                    uint32_t completedId = fpga_mailbox_packet[0] & 0xFFFF;
+                    fpga_mailbox_reply = completedId;
+
+                    // Prepare the 8-DWORD response for reads from 0x84000000.
+                    // sub_3F510 (ISR, called synchronously by sub_3F6B0) reads
+                    // 8 DWORDs via sub_3EC40 into the entry at 698288 + 96*index.
+                    // Then checks HIWORD of DWORD[0] (v7[1]):
+                    //   - bit 15 set → calls sub_3E3C0 which CLEARS the entry!
+                    //   - bit 15 clear → entry stays for game thread to read
+                    // sub_40930 (game thread) checks:
+                    //   - sub_3E5B0: entry WORD[1] != 0 (response present)
+                    //   - WORD[1] == 0x8000 → error -3
+                    //   - otherwise → success, reads DWORD[1] as result
+                    // Use 0x0002: non-zero ✓, not 0x8000 ✓, bit 15 clear ✓
+                    // This lets the entry survive the ISR so the game thread reads it.
+                    memset(fpga_response_packet, 0, sizeof(fpga_response_packet));
+                    fpga_response_packet[0] = (fpga_mailbox_packet[0] & 0xFFFF) | 0x00020000;
+                    fpga_response_packet[1] = 1;  // completion status = success
+
+                    // Evtype-specific response data in DWORD[2..7]
+                    const uint16_t evtype = (uint16_t)(fpga_mailbox_packet[0] >> 16);
+                    switch (evtype) {
+                    case 0x0100: // NET_GetStatus — network status poll
+                        fpga_response_packet[2] = 3; // state: online/ready
+                        fpga_response_packet[3] = 0; // error: none
+                        fpga_response_packet[4] = 0x0A000001; // IP: 10.0.0.1
+                        fpga_response_packet[5] = 0xFFFFFF00; // subnet: 255.255.255.0
+                        fpga_response_packet[6] = 0x0A000001; // gateway: 10.0.0.1
+                        break;
+                    case 0x0101: // NET_GetVersion — firmware version
+                        fpga_response_packet[2] = 0x00020011; // version 2.17
+                        fpga_response_packet[3] = 0x00000001; // build 1
+                        break;
+                    case 0x0102: // NET_SetConfig — returns success
+                        fpga_response_packet[2] = 0; // success
+                        break;
+                    case 0x0103: // NET_GetConfig — config data
+                        fpga_response_packet[2] = 1; // config flags (network enabled)
+                        fpga_response_packet[3] = 1; // mode (DHCP)
+                        break;
+                    default:
+                        break;
+                    }
+
+                    fpga_response_word_count = 8;
+                    fpga_response_read_index = 0;
+
+                    // Do NOT populate fpga_data_response — the drain loop
+                    // (sub_3EEE0) will read fpga_mailbox_reply instead (set above).
+                    // fpga_mailbox_reply has HIWORD=0 so the drain exits on first read.
+                    // Populating fpga_data_response caused a race with the ISR thread
+                    // where the 0xA0000040 reset kept resetting the index, serving stale
+                    // data with HIWORD≠0 and trapping the drain in an infinite loop.
+                    memset(fpga_data_response, 0, sizeof(fpga_data_response));
+                    fpga_data_response_count = 0;
+                    fpga_data_response_index = 0;
+
+                    MbLog("  Type3Mailbox reply request=%u completedId=0x%08X\n", requestId, completedId);
+                    // Reset word count so next packet starts fresh
+                    fpga_mailbox_word_count = 0;
+
+                    // Search Xbox memory for the event entry with matching ticket.
+                    // The entry+32 area has: byte[0]=ticket, byte[1]=0, word[1]=STATUS,
+                    // dword[1]=cmd. Use cached table base from first find.
+                    // NOTE: The game XBE has SEGABOOT library code linked in, so
+                    // the same entry table structure exists in the game process.
+                    if (EmuInterruptList[10] && EmuInterruptList[10]->Connected) {
+                        const uint8_t ticket = (uint8_t)(requestId & 0xFF);
+                        static uint32_t s_tableBase32 = 0; // cached: first entry's +32 addr
+                        s_type3TableBase = s_tableBase32; // export for state monitor
+                        bool found = false;
+
+                        // If table base known, search 16 entries at 96-byte stride
+                        if (s_tableBase32 != 0) {
+                            for (int i = 0; i < 16; i++) {
+                                uint8_t* p = (uint8_t*)(uintptr_t)(s_tableBase32 + i * 96);
+                                if (p[0] == ticket && p[1] == 0) {
+                                    uint32_t* resp = (uint32_t*)(p - 32);
+                                    // Dump entry BEFORE write (first 3 times)
+                                    static int dumpCount = 0;
+                                    if (dumpCount < 3) {
+                                        MbLog("  Entry[%d] BEFORE write (96 bytes at 0x%08X):\n", i, (uint32_t)(uintptr_t)resp);
+                                        for (int d = 0; d < 96; d += 4) {
+                                            MbLog("    +%02d: 0x%08X\n", d, *(uint32_t*)(((uint8_t*)resp) + d));
+                                        }
+                                    }
+                                    for (int j = 0; j < 8; j++) resp[j] = fpga_response_packet[j];
+                                    if (dumpCount < 3) {
+                                        MbLog("  Entry[%d] AFTER write (96 bytes at 0x%08X):\n", i, (uint32_t)(uintptr_t)resp);
+                                        for (int d = 0; d < 96; d += 4) {
+                                            MbLog("    +%02d: 0x%08X\n", d, *(uint32_t*)(((uint8_t*)resp) + d));
+                                        }
+                                        dumpCount++;
+                                    }
+                                    MbLog("  Direct write entry[%d] at 0x%08X (ticket=%u resp=0x%08X)\n",
+                                          i, (uint32_t)(uintptr_t)resp, ticket, resp[0]);
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        // First time or table miss: full scan with strict pattern
+                        if (!found) {
+                            uint32_t intObjAddr = (uint32_t)(uintptr_t)EmuInterruptList[10]->ServiceContext;
+                            uint32_t scanStart = (intObjAddr > 0x60000) ? intObjAddr - 0x60000 : 0x10000;
+                            uint32_t scanEnd = intObjAddr + 0x10000;
+                            uint16_t status = (uint16_t)(fpga_mailbox_packet[0] >> 16); // HIWORD
+                            uint32_t cmd = fpga_mailbox_packet[1];
+                            for (uint32_t addr = scanStart; addr < scanEnd; addr += 4) {
+                                uint8_t* p = (uint8_t*)(uintptr_t)addr;
+                                if (p[0] == ticket && p[1] == 0 &&
+                                    *(uint16_t*)(p+2) == status &&
+                                    *(uint32_t*)(p+4) == cmd) {
+                                    // Calibrate table base: entry[i]+32 = addr, so base = addr - i*96
+                                    // Since we don't know i, assume this is entry 0 (first free slot)
+                                    // and verify by checking nearby entries
+                                    // For now just align to 96 from the found address
+                                    // Find entry index by checking if addr - n*96 is plausible
+                                    uint32_t testBase = addr;
+                                    // Walk backwards to find the real entry[0]
+                                    for (int n = 0; n < 16; n++) {
+                                        uint32_t candidate = addr - n * 96;
+                                        // Check if candidate-32..candidate+64 is in a reasonable range
+                                        testBase = candidate;
+                                        // Just use the first found position
+                                        break;
+                                    }
+                                    s_tableBase32 = testBase;
+                                    uint32_t* resp = (uint32_t*)(p - 32);
+                                    for (int j = 0; j < 8; j++) resp[j] = fpga_response_packet[j];
+                                    MbLog("  Scan+write at 0x%08X (ticket=%u resp=0x%08X base=0x%08X)\n",
+                                          addr, ticket, resp[0], s_tableBase32);
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!found) {
+                            MbLog("  WARNING: No entry for ticket=%u\n", ticket);
+                        }
+
+                        // After locating the entry table, prevent the satellite path
+                        // (sub_3D7C0) from creating a satellite channel. sub_3D7C0
+                        // creates channel 0xA9 when dword_A6DE8[3630] < 2 (count of
+                        // registered channels). Setting it to 2 makes sub_3D7C0
+                        // return 0 → state 3 goes directly to state 4 (READY).
+                        // Address: s_tableBase32 = &dword_A6DE8[14792]
+                        //   dword_A6DE8[3630] = s_tableBase32 - (14792-3630)*4
+                        if (s_tableBase32 != 0) {
+                            static bool channelCountPatched = false;
+                            if (!channelCountPatched) {
+                                uint32_t* pCount = (uint32_t*)(uintptr_t)(s_tableBase32 - (14792 - 3630) * 4);
+                                uint32_t oldCount = *pCount;
+                                if (oldCount < 2) {
+                                    *pCount = 2;
+                                    MbLog("  Patched channel count at 0x%08X: %u -> 2\n",
+                                          (uint32_t)(uintptr_t)pCount, oldCount);
+                                }
+                                channelCountPatched = true;
+                            }
+
+                            // Patch the boot struct so sub_44330 proceeds to
+                            // reboot into the game XBE. sub_44330 checks:
+                            //   *(WORD*)(bootStruct+24): 2 or 3 → GDROM mode → boot
+                            //   otherwise checks *(DWORD*)(bootStruct+28) != 0
+                            // For Type-3 both fields are 0 (never populated by
+                            // network boot), so sub_44330 returns without booting.
+                            // Set field+24 = 2 (GDROM mode) to unblock.
+                            // bootStruct = dword_A6DE8[3639] = sub_3DA60() = 698052
+                            static bool bootStructPatched = false;
+                            if (!bootStructPatched) {
+                                uint16_t* pBootMode = (uint16_t*)(uintptr_t)(s_tableBase32 - (14792 - 3639) * 4 + 24);
+                                uint16_t oldMode = *pBootMode;
+                                *pBootMode = 2; // GDROM mode
+                                MbLog("  Patched boot struct +24 at 0x%08X: %u -> 2 (GDROM mode)\n",
+                                      (uint32_t)(uintptr_t)pBootMode, oldMode);
+                                bootStructPatched = true;
+                            }
+                        }
+
+                        // State monitor + forced boot: sub_40500 fails for Type-3
+                        // (SEGABOOT ROM doesn't fully init the state machine).
+                        // After enough polls, force fb40=1 and netState=4 so that
+                        // sub_44400 runs and sub_44330 triggers the QuickReboot.
+                        if (s_tableBase32 != 0) {
+                            static int monitorCount = 0;
+                            uint32_t* pState = (uint32_t*)(uintptr_t)(s_tableBase32 - (14792 - 4144) * 4);
+                            uint32_t* pFB40 = (uint32_t*)(uintptr_t)(s_tableBase32 - (14792 - 4140) * 4);
+
+                            if ((monitorCount % 50) == 0) {
+                                uint16_t* pBootMode = (uint16_t*)(uintptr_t)(s_tableBase32 - (14792 - 3639) * 4 + 24);
+                                uint32_t* pBoot28 = (uint32_t*)(uintptr_t)(s_tableBase32 - (14792 - 3639) * 4 + 28);
+                                uint32_t* pCallback = (uint32_t*)(uintptr_t)(s_tableBase32 - (14792 - 4468) * 4);
+                                MbLog("  STATE: netState=%u fb40=%u bootMode=%u boot28=0x%08X cb=0x%08X\n",
+                                      *pState, *pFB40, *pBootMode, *pBoot28, *pCallback);
+                            }
+
+                            // After 10 polls (~0.5s), force-enable the main loop
+                            // and set state to "network ready" so sub_44330 fires.
+                            // If that doesn't work (callback never registered),
+                            // directly trigger QuickReboot after 30 polls.
+                            static bool stateForced = false;
+                            static bool rebootTriggered = false;
+                            if (!stateForced && monitorCount >= 10) {
+                                if (*pFB40 == 0 || *pState < 4) {
+                                    *pFB40 = 1;
+                                    *pState = 4;
+                                    MbLog("  FORCED: fb40=1, netState=4 (was %u/%u)\n",
+                                          *pFB40, *pState);
+                                    stateForced = true;
+                                }
+                            }
+                            if (stateForced && !rebootTriggered && monitorCount >= 30) {
+                                // sub_44400 callback was never registered — trigger
+                                // QuickReboot directly. HalReturnToFirmware now
+                                // handles NULL LaunchDataPage for Chihiro.
+                                // ONLY for SEGABOOT — in the game process the
+                                // library doesn't need another QuickReboot.
+                                if (!g_QodGamePatchesActive) {
+                                    MbLog("  Direct QuickReboot: sub_44400 not registered, forcing reboot\n");
+                                    rebootTriggered = true;
+                                    // Spawn a thread since HalReturnToFirmware is noreturn
+                                    std::thread([]() {
+                                        xbox::HalReturnToFirmware(xbox::ReturnFirmwareQuickReboot);
+                                    }).detach();
+                                } else {
+                                    MbLog("  Skipping QuickReboot (game process)\n");
+                                    rebootTriggered = true;
+                                }
+                            }
+                            monitorCount++;
+                        }
+                    }
+
+                    // For SEGABOOT: do NOT assert IRQ10 — the direct memory
+                    // write above already placed the response in the entry's [0..31]
+                    // area. The game thread checks sub_40930 → sub_3E5B0 which reads
+                    // entry[2..3] (HIWORD of response DWORD[0]) → sees 0x8002 (non-zero)
+                    // → returns TRUE → sub_40930 returns 0 (success).
+                    //
+                    // For the GAME process: the direct memory writes are skipped (wrong
+                    // offsets for game memory layout). Instead, fire IRQ10 so the game's
+                    // own ISR (sub_3F510) reads fpga_response_packet via 0x84000000
+                    // and stores it in the entry table. Our response has HIWORD=0x0002
+                    // (bit 15 clear), so sub_3E3C0 won't clear the entry — no race.
+                    if (g_QodGamePatchesActive) {
+                        HalSystemInterrupts[10].Assert(true);
+                    }
+                }
+            }
+        }
         return;
     }
 
@@ -270,6 +621,13 @@ void MediaBoard::ComRead(uint32_t offset, void* buffer, uint32_t length)
 
     // MAME: read_sector(LBA 0x4800) → read_buffer (response)
     if (offset == 0x900000) {
+        // If a response is pending (game may have cleared buffer_900000),
+        // re-deliver it now before the game reads.
+        if (m_responsePending) {
+            memcpy(buffer_900000, m_shadowResponse, 512);
+            m_responsePending = false;
+        }
+
         memcpy(buffer, buffer_900000, length);
         static int comRead900000Diag = 0;
         comRead900000Diag++;
@@ -338,6 +696,10 @@ void MediaBoard::ComWrite(uint32_t offset, void* buffer, uint32_t length)
         }
         EmuLog(LOG_LEVEL::DEBUG, "ComWrite [0x900000] sys-cmd write length=%u", length);
         memcpy(buffer_900000, buffer, length);
+
+        // MAME: write_sector(LBA 0x4800) just stores data, no IRQ.
+        // Do NOT inject proactive STATUS here — let the firmware drive
+        // the protocol naturally via ComWrite(0x900200).
         return;
     }
 
@@ -346,8 +708,10 @@ void MediaBoard::ComWrite(uint32_t offset, void* buffer, uint32_t length)
         memcpy(buffer_900200, buffer, length);
         
         uint8_t* inputBuffer  = (uint8_t*)buffer_900200;
-        uint8_t* outputBuffer = (uint8_t*)buffer_900000;
-        memset(buffer_900000, 0, sizeof(buffer_900000));
+        // Write response to shadow buffer (NOT directly to buffer_900000)
+        // because the game may clear buffer_900000 before reading it.
+        uint8_t* outputBuffer = (uint8_t*)m_shadowResponse;
+        memset(m_shadowResponse, 0, sizeof(m_shadowResponse));
 
         uint16_t seq     = *(uint16_t*)&inputBuffer[0];
         uint32_t command = *(uint16_t*)&inputBuffer[2];
@@ -371,9 +735,9 @@ void MediaBoard::ComWrite(uint32_t offset, void* buffer, uint32_t length)
 
         switch (command) {
         case MB_CMD_DIMM_SIZE: { // 0x0001
-            uint32_t sz = g_BetaConfig.mb_dimm_size ? (512 * ONE_MB) : (1024 * ONE_MB);
-            *(uint32_t*)&outputBuffer[4] = sz;
-            EmuLog(LOG_LEVEL::DEBUG, "  MB_CMD_DIMM_SIZE -> %u MB", sz / ONE_MB);
+            // MAME returns 0x00f00000 (partition-related size value)
+            *(uint32_t*)&outputBuffer[4] = 0x00f00000;
+            EmuLog(LOG_LEVEL::DEBUG, "  MB_CMD_DIMM_SIZE -> 0x00f00000");
             break;
         }
         case MB_CMD_STATUS: { // 0x0100
@@ -388,18 +752,8 @@ void MediaBoard::ComWrite(uint32_t offset, void* buffer, uint32_t length)
             break;
         }
         case MB_CMD_SYSTEM_TYPE: { // 0x0102
-            const WanganVariant variant = GetWanganVariantFromXbeHash();
-            const bool requireDevGdrom =
-                (variant == WanganVariant::MT1Japan || variant == WanganVariant::MT2Export);
-
-            *(uint32_t*)&outputBuffer[4] = requireDevGdrom
-                ? (MB_SYSTEM_TYPE_DEVELOPER | MB_SYSTEM_TYPE_GDROM)
-                : 0;
-
-            EmuLog(LOG_LEVEL::DEBUG,
-                "  MB_CMD_SYSTEM_TYPE -> 0x%04X (variant=%d)",
-                (unsigned int)*(uint32_t*)&outputBuffer[4],
-                (int)variant);
+            *(uint32_t*)&outputBuffer[4] = 0; // MAME returns 0; bit 16 = develop mode
+            EmuLog(LOG_LEVEL::DEBUG, "  MB_CMD_SYSTEM_TYPE -> 0 (normal)");
             break;
         }
         case MB_CMD_SERIAL_NUMBER: { // 0x0103
@@ -471,6 +825,10 @@ void MediaBoard::ComWrite(uint32_t offset, void* buffer, uint32_t length)
         *(uint16_t*)&outputBuffer[0] = seq;  // echo sequence number
         outputBuffer[2] = 0x01;              // MAME hardcoded
         outputBuffer[3] = 0x80;              // MAME hardcoded
+
+        // Also write to buffer_900000 immediately (for games that read without kick)
+        memcpy(buffer_900000, m_shadowResponse, 512);
+        m_responsePending = true;
 
         MbLog("  RESP: seq=0x%04X ack=0x8001 data:", seq);
         for (int i = 0; i < 20; i++) MbLog(" %02X", outputBuffer[i]);

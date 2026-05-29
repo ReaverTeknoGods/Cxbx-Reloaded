@@ -38,6 +38,7 @@
 #include "core\kernel\support\EmuFS.h"
 #include "EmuKrnl.h"
 #include "devices\x86\EmuX86.h" // HalReadWritePciSpace needs this
+#include "devices\chihiro\MediaBoard.h" // For g_MediaBoard->GetBootId()
 #include "EmuShared.h"
 #include "core\kernel\support\EmuFile.h" // For FindNtSymbolicLinkObjectByDriveLetter
 #include "common\EmuEEPROM.h" // For EEPROM
@@ -470,6 +471,10 @@ XBSYSAPI EXPORTNUM(48) xbox::void_xt FASTCALL xbox::HalRequestSoftwareInterrupt
 }
 
 // ******************************************************************
+// Callback for game-specific reboot interception.
+// If set and returns true, the QuickReboot is suppressed.
+bool (*g_pfnQuickRebootInterceptor)() = nullptr;
+
 // * 0x0031 - HalReturnToFirmware()
 // ******************************************************************
 XBSYSAPI EXPORTNUM(49) xbox::void_xt DECLSPEC_NORETURN NTAPI xbox::HalReturnToFirmware
@@ -492,7 +497,17 @@ XBSYSAPI EXPORTNUM(49) xbox::void_xt DECLSPEC_NORETURN NTAPI xbox::HalReturnToFi
 
 	case ReturnFirmwareQuickReboot:
 	{
-		if (xbox::LaunchDataPage == NULL)
+		// Check game-specific reboot interceptor
+		if (g_pfnQuickRebootInterceptor && g_pfnQuickRebootInterceptor()) {
+			// Reboot suppressed — suspend this thread so the game's
+			// guard thread can use SetThreadContext to redirect it
+			// back into the game's main loop. After resume, spin
+			// as a safety net (the redirect should change EIP).
+			SuspendThread(GetCurrentThread());
+			while (true) { Sleep(1000); }
+		}
+
+		if (xbox::LaunchDataPage == NULL && !(g_bIsChihiro && g_MediaBoard))
 			LOG_UNIMPLEMENTED();
 		else
 		{
@@ -536,7 +551,10 @@ XBSYSAPI EXPORTNUM(49) xbox::void_xt DECLSPEC_NORETURN NTAPI xbox::HalReturnToFi
 				}
 			}
 
-			std::string TitlePath = xbox::LaunchDataPage->Header.szLaunchPath;
+			std::string TitlePath;
+			if (xbox::LaunchDataPage != NULL) {
+				TitlePath = xbox::LaunchDataPage->Header.szLaunchPath;
+			}
 
 			// If the title path starts with a semicolon, remove it
 			if (TitlePath.length() > 0 && TitlePath[0] == ';') {
@@ -547,8 +565,34 @@ XBSYSAPI EXPORTNUM(49) xbox::void_xt DECLSPEC_NORETURN NTAPI xbox::HalReturnToFi
 			// Or in the case of Chihiro: SEGABOOT
 			std::string XbePath;
 			if (TitlePath.length() == 0) {
-				if (g_bIsChihiro) {
-					//TitlePath = DevicePrefix + "\\" + MediaBoardRomFile;
+				if (g_bIsChihiro && g_MediaBoard) {
+					// Launch the game or test XBE from boot.id instead of looping
+					// back to SEGABOOT. SEGABOOT calls HalReturnToFirmware
+					// with an empty launch path expecting the kernel to know
+					// the game executable from the DIMM/network boot setup.
+					// If g_bChihiroTestMode is set, use testExecutable instead.
+					std::string gameExe;
+					if (g_bChihiroTestMode) {
+						gameExe.assign(g_MediaBoard->GetBootId().testExecutable,
+							strnlen(g_MediaBoard->GetBootId().testExecutable, 0x20));
+						g_bChihiroTestMode = false; // consume the flag
+					}
+					if (gameExe.empty()) {
+						gameExe.assign(g_MediaBoard->GetBootId().gameExecutable,
+							strnlen(g_MediaBoard->GetBootId().gameExecutable, 0x20));
+					}
+					// boot.id stores paths with leading backslash (e.g. "\project_d.xbe")
+					while (!gameExe.empty() && (gameExe[0] == '\\' || gameExe[0] == '/'))
+						gameExe.erase(0, 1);
+					if (!gameExe.empty()) {
+						XbePath = g_MediaBoard->GetMountPath() + "\\" + gameExe;
+						EmuLog(LOG_LEVEL::INFO, "Chihiro QuickReboot: launching %s XBE: %s",
+							g_bChihiroTestMode ? "test" : "game", XbePath.c_str());
+					} else {
+						XbePath = g_MediaBoardBasePath + "\\" + MediaBoardRomFile;
+					}
+				}
+				else if (g_bIsChihiro) {
 					XbePath = g_MediaBoardBasePath + "\\" + MediaBoardRomFile;
 				}
 				else {

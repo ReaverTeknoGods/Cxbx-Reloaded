@@ -36,6 +36,18 @@ JvsIo* g_pJvsIo;
 #include <vector>
 #include <Windows.h>
 
+static void GolfJvsIoLog(const char* fmt, ...)
+{
+	FILE* file = fopen("C:\\temp\\golf_jvs_io.log", "a");
+	if (!file) return;
+	va_list args;
+	va_start(args, fmt);
+	vfprintf(file, fmt, args);
+	va_end(args);
+	fputc('\n', file);
+	fclose(file);
+}
+
 // ============================================================================
 // JVS logging
 // ============================================================================
@@ -249,6 +261,15 @@ void JvsIo::Update()
 		// Channel assignments are game-specific.
 		uint8_t* analog_base = static_cast<uint8_t*>(g_jvs_view_ptr) + 12;
 		switch (g_jvs_game_type) {
+			case JvsGameType::SegaGolfClub:
+				// sub_82EE0 reads *(WORD*)(record+14) = ch3 for club swing.
+				// JVS channel 3 = analog[2] in the response.
+				// Swing sensor is at analog_base[0].
+				Inputs.analog[0].value = expand8to16(analog_base[1]);
+				Inputs.analog[1].value = expand8to16(analog_base[2]);
+				Inputs.analog[2].value = expand8to16(analog_base[0]); // swing → ch3
+				Inputs.analog[3].value = expand8to16(analog_base[3]);
+				break;
 			case JvsGameType::WanganMT1:
 			case JvsGameType::WanganMT2:
 				// WMMT analog layout (confirmed via JVS trace):
@@ -392,6 +413,9 @@ int JvsIo::Jvs_Command_14_GetCapabilities()
 	uint8_t gpoCount   = 20;
 
 	switch (g_jvs_game_type) {
+		case JvsGameType::SegaGolfClub:
+			analogBits = 16;
+			break;
 		case JvsGameType::WanganMT1:
 		case JvsGameType::WanganMT2:
 			buttons    = 13;
@@ -453,6 +477,7 @@ int JvsIo::Jvs_Command_15_ConveyMainBoardId(uint8_t* data, size_t remaining)
 int JvsIo::Jvs_Command_20_ReadSwitchInputs(uint8_t* data)
 {
 	static jvs_switch_player_inputs_t default_switch_player_input;
+	static uint32_t lastGolfSwitchState = 0xFFFFFFFFu;
 	uint8_t nr_switch_players = data[1];
 	uint8_t bytesPerSwitchPlayerInput = data[2];
 
@@ -469,6 +494,18 @@ int JvsIo::Jvs_Command_20_ReadSwitchInputs(uint8_t* data)
 				: (j == 1) ? switch_player_input.GetByte1()
 				: 0; // Pad any remaining bytes with 0, as we don't have that many inputs available
 			ResponseBuffer.push_back(value);
+		}
+	}
+
+	if (g_jvs_game_type == JvsGameType::SegaGolfClub) {
+		uint8_t system = Inputs.switches.system.GetByte0();
+		uint8_t player0Byte0 = Inputs.switches.player[0].GetByte0();
+		uint8_t player0Byte1 = Inputs.switches.player[0].GetByte1();
+		uint32_t packedState = system | (player0Byte0 << 8) | (player0Byte1 << 16);
+		if (packedState != lastGolfSwitchState) {
+			GolfJvsIoLog("switch system=%02X p1=%02X %02X reqPlayers=%u reqBytes=%u",
+				system, player0Byte0, player0Byte1, nr_switch_players, bytesPerSwitchPlayerInput);
+			lastGolfSwitchState = packedState;
 		}
 	}
 
@@ -501,6 +538,7 @@ int JvsIo::Jvs_Command_21_ReadCoinInputs(uint8_t* data)
 int JvsIo::Jvs_Command_22_ReadAnalogInputs(uint8_t* data)
 {
 	static jvs_analog_input_t default_analog;
+	static uint64_t lastGolfAnalogState = ~0ull;
 	uint8_t nr_analog_inputs = data[1];
 
 	ResponseBuffer.push_back(ReportCode::Handled);
@@ -515,6 +553,22 @@ int JvsIo::Jvs_Command_22_ReadAnalogInputs(uint8_t* data)
 				: (j == 1) ? analog_input.GetByte1()
 				: 0; // Pad any remaining bytes with 0, as we don't have that many inputs available
 			ResponseBuffer.push_back(value);
+		}
+	}
+
+	if (g_jvs_game_type == JvsGameType::SegaGolfClub) {
+		uint16_t analog0 = Inputs.analog[0].value;
+		uint16_t analog1 = Inputs.analog[1].value;
+		uint16_t analog2 = Inputs.analog[2].value;
+		uint16_t analog3 = Inputs.analog[3].value;
+		uint64_t packedState = analog0
+			| ((uint64_t)analog1 << 16)
+			| ((uint64_t)analog2 << 32)
+			| ((uint64_t)analog3 << 48);
+		if (packedState != lastGolfAnalogState) {
+			GolfJvsIoLog("analog a0=%04X a1=%04X a2=%04X a3=%04X req=%u",
+				analog0, analog1, analog2, analog3, nr_analog_inputs);
+			lastGolfAnalogState = packedState;
 		}
 	}
 

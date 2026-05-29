@@ -58,6 +58,21 @@ extern std::atomic_bool g_bEnableAllInterrupts;
 
 static int field_pin = 0;
 
+static void X86ProbeLog(xbox::addr_xt addr, uint32_t value, int size)
+{
+	static int probeLogCount = 0;
+	if (addr != 0x80C0 || probeLogCount >= 256) {
+		return;
+	}
+	FILE* logFile = fopen("C:\\temp\\nv_probe.log", probeLogCount == 0 ? "w" : "a");
+	if (!logFile) {
+		return;
+	}
+	fprintf(logFile, "IO_READ addr=0x%08X size=%d value=0x%08X\n", addr, size, value);
+	fclose(logFile);
+	probeLogCount++;
+}
+
 uint32_t EmuX86_IORead(xbox::addr_xt addr, int size)
 {
 	// If we are running a Chihiro game, emulate the Chihiro LPC device
@@ -83,7 +98,9 @@ uint32_t EmuX86_IORead(xbox::addr_xt addr, int size)
 		if (size == sizeof(uint8_t)) {
 			// field pin from tv encoder?
 			field_pin = (field_pin + 1) & 1;
-			return field_pin << 5;
+			uint32_t value = field_pin << 5;
+			X86ProbeLog(addr, value, size);
+			return value;
 		}
 		break;
 	}

@@ -29,6 +29,7 @@
 #include "core\kernel\init\CxbxKrnl.h"
 #include "core\kernel\support\Emu.h"
 #include "common\util\hasher.h" // For ComputeHash
+
 #include "common\xbe\Xbe.h"   // For Xbe::Header
 #include "core\hle\D3D8\Direct3D9/Direct3D9.h"
 #include "core\hle\JVS\JVS.h"
@@ -532,13 +533,18 @@ void EmuInstallPatches()
 	// Per-game byte patches
 	uint32_t imageSize = CxbxKrnl_Xbe->m_Header.dwSizeofImage;
 	uint64_t xbeHash = ComputeHash((void*)&CxbxKrnl_Xbe->m_Header, sizeof(Xbe::Header));
+	uint32_t titleId = CxbxKrnl_Xbe->m_Certificate.dwTitleId;
 
-	printf("EmuInstallPatches: imageSize=0x%X hash=0x%016llX\n", imageSize, (unsigned long long)xbeHash);
+	printf("EmuInstallPatches: titleId=0x%08X imageSize=0x%X hash=0x%016llX\n", titleId, imageSize, (unsigned long long)xbeHash);
 	{
-		FILE* f = fopen("C:\\temp\\golf_patches.log", "w");
-		if (f) { fprintf(f, "EmuInstallPatches: imageSize=0x%X hash=0x%016llX\n", imageSize, (unsigned long long)xbeHash);
-		fprintf(f, "IsGolfXbe=%d IsGundamXbe=%d IsWanganXbe=%d\n", IsGolfXbe(xbeHash), IsGundamXbe(xbeHash), IsWanganXbe(imageSize));
-		fclose(f); }
+		FILE* f = fopen("C:\\temp\\patch_dispatch.log", "w");
+		if (f) {
+			fprintf(f, "EmuInstallPatches: titleId=0x%08X imageSize=0x%X hash=0x%016llX\n", titleId, imageSize, (unsigned long long)xbeHash);
+			fprintf(f, "IsGolfXbe=%d IsGolf2006Xbe=%d IsGundamXbe=%d IsWanganXbe=%d IsMahjongXbe=%d IsOutRun2Xbe=%d IsQuestOfDXbe=%d\n",
+				IsGolfXbe(xbeHash), IsGolf2006Xbe(xbeHash), IsGundamXbe(xbeHash), IsWanganXbe(imageSize), IsMahjongXbe(xbeHash),
+				IsOutRun2Xbe(xbeHash), IsQuestOfDXbe(xbeHash));
+			fclose(f);
+		}
 	}
 
 	ApplyJvsWatchdogPatch(imageSize);
@@ -548,10 +554,20 @@ void EmuInstallPatches()
 	} else if (IsGundamXbe(xbeHash)) {
 		ApplyGundamPatches(xbeHash, imageSize);
 	} else if (IsGolfXbe(xbeHash)) {
-		ApplyGolfPatches(imageSize);
+		ApplyGolfPatches(xbeHash, imageSize);
+	} else if (IsGolf2006Xbe(xbeHash)) {
+		ApplyGolf2006Patches(xbeHash, imageSize);
+	} else if (IsMahjongXbe(xbeHash)) {
+		ApplyMahjongPatches(xbeHash, imageSize);
+	} else if (IsOutRun2Xbe(xbeHash)) {
+		ApplyOutRun2Patches(xbeHash, imageSize);
+	} else if (IsQuestOfDXbe(xbeHash)) {
+		ApplyQuestOfDPatches(xbeHash, imageSize);
 	}
 
-	ApplyCrazyTaxiPatches(xbeHash, imageSize);
+	if (titleId != 0xFFFE0000u) {
+		ApplyCrazyTaxiPatches(xbeHash, imageSize);
+	}
 }
 
 void* GetPatchedFunctionTrampoline(const std::string functionName)

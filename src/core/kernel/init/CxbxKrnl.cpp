@@ -56,6 +56,7 @@
 #include <clocale>
 #include <process.h>
 #include <sstream> // For std::ostringstream
+#include <dbghelp.h> // For MiniDumpWriteDump
 
 #include "devices\EEPROMDevice.h" // For g_EEPROM
 #include "devices\Xbox.h" // For InitXboxHardware()
@@ -96,6 +97,7 @@ char szFilePath_Xbe[xbox::max_path*2] = { 0 };
 
 Xbe* CxbxKrnl_Xbe = NULL;
 bool g_bIsChihiro = false;
+bool g_bChihiroTestMode = false;
 bool g_bIsDevKit = false;
 bool g_bIsRetail = false;
 
@@ -133,13 +135,73 @@ void SetupPerTitleKeys()
 
 }
 
+static void WriteCrashDump(EXCEPTION_POINTERS* ep, const char* tag)
+{
+	// Use Win32 API only — CRT/heap may be corrupted
+	char path[MAX_PATH];
+	wsprintfA(path, "C:\\temp\\qod_crash_%s.dmp", tag);
+	HANDLE hFile = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (hFile != INVALID_HANDLE_VALUE) {
+		// Load dbghelp dynamically to avoid link dependency
+		HMODULE hDbgHelp = LoadLibraryA("dbghelp.dll");
+		if (hDbgHelp) {
+			typedef BOOL (WINAPI *MiniDumpWriteDump_t)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION, PVOID, PVOID);
+			auto pMiniDumpWriteDump = (MiniDumpWriteDump_t)GetProcAddress(hDbgHelp, "MiniDumpWriteDump");
+			if (pMiniDumpWriteDump) {
+				MINIDUMP_EXCEPTION_INFORMATION mei;
+				mei.ThreadId = GetCurrentThreadId();
+				mei.ExceptionPointers = ep;
+				mei.ClientPointers = FALSE;
+				pMiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), hFile,
+					(MINIDUMP_TYPE)(MiniDumpWithFullMemory | MiniDumpWithHandleData), &mei, NULL, NULL);
+			}
+		}
+		CloseHandle(hFile);
+	}
+	// Also write a text crash log
+	char logpath[MAX_PATH];
+	wsprintfA(logpath, "C:\\temp\\qod_crash_%s.log", tag);
+	HANDLE hLog = CreateFileA(logpath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (hLog != INVALID_HANDLE_VALUE) {
+		char buf[2048]; DWORD written;
+		int len = wsprintfA(buf, "Exception 0x%08X at 0x%08X\r\n"
+			"EIP=0x%08X ESP=0x%08X EBP=0x%08X\r\n"
+			"EAX=0x%08X EBX=0x%08X ECX=0x%08X EDX=0x%08X\r\n"
+			"ESI=0x%08X EDI=0x%08X\r\n",
+			ep->ExceptionRecord->ExceptionCode, (DWORD)(uintptr_t)ep->ExceptionRecord->ExceptionAddress,
+			ep->ContextRecord->Eip, ep->ContextRecord->Esp, ep->ContextRecord->Ebp,
+			ep->ContextRecord->Eax, ep->ContextRecord->Ebx,
+			ep->ContextRecord->Ecx, ep->ContextRecord->Edx,
+			ep->ContextRecord->Esi, ep->ContextRecord->Edi);
+		if (ep->ExceptionRecord->ExceptionCode == 0xC0000005 && ep->ExceptionRecord->NumberParameters >= 2) {
+			len += wsprintfA(buf + len, "Access: %s address 0x%08X\r\n",
+				ep->ExceptionRecord->ExceptionInformation[0] ? "WRITE" : "READ",
+				(DWORD)ep->ExceptionRecord->ExceptionInformation[1]);
+		}
+		DWORD* ebp = (DWORD*)ep->ContextRecord->Ebp;
+		for (int depth = 0; depth < 20 && !IsBadReadPtr(ebp, 8); depth++) {
+			len += wsprintfA(buf + len, "  frame %d: EBP=0x%08X ret=0x%08X\r\n",
+				depth, (DWORD)(uintptr_t)ebp, ebp[1]);
+			DWORD* nextEbp = (DWORD*)(uintptr_t)ebp[0];
+			if (nextEbp <= ebp) break;
+			ebp = nextEbp;
+		}
+		WriteFile(hLog, buf, len, &written, NULL);
+		CloseHandle(hLog);
+	}
+}
+
 xbox::void_xt NTAPI CxbxLaunchXbe(xbox::PVOID Entry)
 {
 	EmuLogInit(LOG_LEVEL::DEBUG, "Calling XBE entry point...");
 	char msg[128];
 	sprintf_s(msg, sizeof(msg), "OEP = 0x%08X\n\nAttach debugger now, then click OK.", (DWORD)(uintptr_t)Entry);
 	//MessageBoxA(nullptr, msg, "Cxbx OEP Break", MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
-	static_cast<void(*)()>(Entry)();
+	__try {
+		static_cast<void(*)()>(Entry)();
+	} __except(WriteCrashDump(GetExceptionInformation(), "seh"), EXCEPTION_CONTINUE_SEARCH) {
+		// SEH filter already wrote the dump; continue search for VEH/UEF handlers
+	}
 	EmuLogInit(LOG_LEVEL::DEBUG, "XBE entry point returned");
 }
 

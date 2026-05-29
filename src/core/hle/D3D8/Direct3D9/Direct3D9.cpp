@@ -1,4 +1,4 @@
-﻿// This is an open source non-commercial project. Dear PVS-Studio, please check it.
+// This is an open source non-commercial project. Dear PVS-Studio, please check it.
 // PVS-Studio Static Code Analyzer for C, C++ and C#: http://www.viva64.com
 // ******************************************************************
 // *
@@ -179,6 +179,10 @@ static DWORD                        g_VBLastSwap = 0;
 static xbox::dword_xt                   g_Xbox_PresentationInterval_Default = D3DPRESENT_INTERVAL_IMMEDIATE;
        xbox::dword_xt                   g_Xbox_PresentationInterval_Override = 0;
 static xbox::X_D3DSWAPDATA			g_Xbox_SwapData = {0}; // current swap information
+volatile int g_mj_drawTotal = 0;
+extern int g_ChihiroMjGame;   // 0=none, 1=MJ2, 2=MJ3, 3=MJ3Evo (set by MahjongPatches)
+uint32_t g_ChihiroBackbufferOverrideW = 0;
+uint32_t g_ChihiroBackbufferOverrideH = 0;
 static xbox::X_D3DSWAPCALLBACK		g_pXbox_SwapCallback = xbox::zeroptr;	// Swap/Present callback routine
 static xbox::X_D3DVBLANKDATA			g_Xbox_VBlankData = {0}; // current vertical blank information
 
@@ -1585,12 +1589,13 @@ static DWORD WINAPI EmuRenderWindow(LPVOID lpParam)
     // create the window
     {
 		// Peform selection if running in GUI or kernel mode first.
-		HWND hwndParent = (!CxbxKrnl_hEmuParent ? GetDesktopWindow() : CxbxKrnl_hEmuParent);
+		HWND hwndParent = CxbxKrnl_hEmuParent; // NULL in kernel mode, GUI window in GUI mode
 		DWORD dwStyle = WS_POPUP;
 		RECT windowRect = { 0 };
 
 		// Obtain the selected resolution from GUI or full desktop screen in kernel mode.
-		if (!GetWindowRect(hwndParent, &windowRect)) {
+		HWND hwndForRect = hwndParent ? hwndParent : GetDesktopWindow();
+		if (!GetWindowRect(hwndForRect, &windowRect)) {
 			// Fall back resolution if failed
 			windowRect = { 0, 0, 640, 480 };
 		}
@@ -2965,11 +2970,14 @@ void Direct3D_CreateDevice_End
         // At this point, g_pXbox_BackBufferSurface should now point to a valid render target
         // if it still doesn't, we cannot continue without crashing at draw time
         if (g_pXbox_BackBufferSurface == xbox::zeroptr) {
-            CxbxrAbort("Unable to determine default Xbox backbuffer");
+            LOG_TEST_CASE("Unable to determine default Xbox backbuffer (non-fatal for Chihiro)");
+            // Don't abort — Chihiro games may set the render target later
         }
 
         // Set the backbuffer as the initial rendertarget
-        CxbxImpl_SetRenderTarget(g_pXbox_BackBufferSurface, xbox::zeroptr);
+        if (g_pXbox_BackBufferSurface != xbox::zeroptr) {
+            CxbxImpl_SetRenderTarget(g_pXbox_BackBufferSurface, xbox::zeroptr);
+        }
     }
 
     // Now do the same, but for the default depth stencil surface
@@ -3270,6 +3278,15 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(Direct3D_CreateDevice)
 		LOG_FUNC_ARG(pPresentationParameters)
 		LOG_FUNC_ARG_OUT(ppReturnedDeviceInterface)
 		LOG_FUNC_END;
+
+	// Per-game backbuffer override (e.g. Chihiro golf games need 1024x768)
+	if (g_ChihiroBackbufferOverrideW && g_ChihiroBackbufferOverrideH) {
+		EmuLog(LOG_LEVEL::INFO, "Overriding Xbox backbuffer %ux%u -> %ux%u",
+			pPresentationParameters->BackBufferWidth, pPresentationParameters->BackBufferHeight,
+			g_ChihiroBackbufferOverrideW, g_ChihiroBackbufferOverrideH);
+		pPresentationParameters->BackBufferWidth = g_ChihiroBackbufferOverrideW;
+		pPresentationParameters->BackBufferHeight = g_ChihiroBackbufferOverrideH;
+	}
 
 	Direct3D_CreateDevice_Start(pPresentationParameters);
 
@@ -5370,12 +5387,45 @@ __declspec(naked) xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap_0__LTCG_ea
 // ******************************************************************
 // * patch: D3DDevice_Swap
 // ******************************************************************
+volatile uint32_t g_D3DSwapCounter = 0; // diagnostic: counts D3DDevice_Swap calls
+volatile uint32_t g_D3DSwapLastCaller = 0; // diagnostic: last caller return address
+volatile uint32_t g_D3DSwapGrandCaller = 0; // diagnostic: grandparent caller
 xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap)
 (
 	dword_xt Flags
 )
 {
+	g_D3DSwapCounter++;
+	g_D3DSwapLastCaller = (uint32_t)_ReturnAddress();
+	// Stack: [ret=0x21EE7] [Flags=0] [grandparent_caller]
+	g_D3DSwapGrandCaller = *((uint32_t*)_AddressOfReturnAddress() + 2);
 	LOG_FUNC_ONE_ARG(Flags);
+	// MJ2-specific: force resource loading completion in early Phase 2 swaps
+	if (g_ChihiroMjGame == 1) {
+		static int s_phase2SwapCount = 0;
+		static bool s_inPhase2 = false;
+		// Detect Phase 2 by checking XBE header magic at 0x10000
+		if (!s_inPhase2) {
+			uint32_t xbeHdr = *(volatile uint32_t*)0x00010000;
+			if (xbeHdr == 0x48455A4D) {
+				uint8_t swByte = *(volatile uint8_t*)0x001D3190;
+				if (swByte == 0xE9) { s_inPhase2 = true; s_phase2SwapCount = 0; }
+			}
+		}
+		if (s_inPhase2) s_phase2SwapCount++;
+		if (s_inPhase2 && s_phase2SwapCount < 300) {
+			// Force resource counters to -1 (case 2 of sub_106F00)
+			volatile int32_t* pR78 = (volatile int32_t*)0x0072CA78;
+			volatile int32_t* pR7C = (volatile int32_t*)0x0072CA7C;
+			volatile int32_t* pR80 = (volatile int32_t*)0x0072CA80;
+			if (*pR78 >= 0) *pR78 = -1;
+			if (*pR7C >= 0) *pR7C = -1;
+			if (*pR80 >= 0) *pR80 = -1;
+			// Skip countdown timer: force state 3/4 → 5
+			volatile int32_t* pR68 = (volatile int32_t*)0x0072CA68;
+			if (*pR68 >= 3 && *pR68 <= 4) *pR68 = 5;
+		}
+	}
 	PerfTrace_OnSwapBegin(); // prints previous frame, resets accumulators, starts swap timer
 	RenderTrace_OnSwapBegin();
 	nv2a_const_diag_new_frame();
@@ -5478,10 +5528,11 @@ xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap)
 			tracedDest = dest;
 			tracedHasDest = true;
 			tracedBlitResult = hRet;
-		
+
 			if (hRet != D3D_OK) {
 				EmuLog(LOG_LEVEL::WARNING, "Couldn't blit Xbox BackBuffer to host BackBuffer : %X", hRet);
 			}
+
 		}
 
 		// Is there an overlay to be presented too?
@@ -5763,6 +5814,7 @@ xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap)
 		result = g_Xbox_SwapData.Swap; // Swap returns number of swaps
 
 	PerfTrace_OnSwapEnd();
+
     return result;
 }
 
@@ -9039,7 +9091,7 @@ extern bool nv2a_pfifo_consume_pending_kicks(struct NV2AState *d, bool *outHasMo
 	                                          uint32_t *outFirstNonConstantMethod);
 extern void nv2a_overlay_parsed_constants(float *local_constants);
 extern void nv2a_copy_parsed_constants(uint32_t *outConstants, uint8_t *outDirtyMask);
-extern void nv2a_pfifo_discard_pending_kicks();
+extern void nv2a_pfifo_discard_pending_kicks(NV2AState *d);
 extern void nv2a_pfifo_get_pending_dma_debug(uint32_t *outCurrentDepth,
 	uint32_t *outHighWater,
 	uint32_t *outOverflowCount);
@@ -9180,7 +9232,7 @@ void CxbxUpdateHostVertexShaderConstants()
 
 		if (needsPushBufferSync) {
 			if (!activeShaderNeedsIndexedBoneSync) {
-				nv2a_pfifo_discard_pending_kicks();
+				nv2a_pfifo_discard_pending_kicks(d);
 				g_XboxPushBufferSubmissionPending = false;
 			}
 			else {
@@ -9280,7 +9332,7 @@ void CxbxUpdateHostVertexShaderConstants()
 						kickDrainReasonMask);
 				}
 			}
-			nv2a_pfifo_discard_pending_kicks();
+			nv2a_pfifo_discard_pending_kicks(d);
 			g_XboxPushBufferSubmissionPending = false;
 		}
 		if (captureConstDump) {
@@ -9503,9 +9555,15 @@ void CxbxUpdateHostViewport() {
 extern void CxbxUpdateHostVertexDeclaration(); // TMP glue
 extern void CxbxUpdateHostVertexShader(); // TMP glue
 
+// Disabled: LTCG device state sync was overwriting HLE-patched state and breaking rendering.
+static void CxbxSyncXboxDeviceState()
+{
+}
+
 void CxbxUpdateNativeD3DResources()
 {
 	PERF_SCOPE(PERF_CAT_UPDATE_NATIVE);
+	CxbxSyncXboxDeviceState(); // Sync LTCG-inlined state from Xbox device
 	g_XboxPushBufferPrimed = false;
 	bool usesXboxVertexConstants =
 		!(g_Xbox_VertexShaderMode == VertexShaderMode::FixedFunction && g_UseFixedFunctionVertexShader);
@@ -9809,6 +9867,7 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_DrawVertices)
     uint_xt            VertexCount
 )
 {
+	{ g_mj_drawTotal++; }
 	LOG_FUNC_BEGIN
 		LOG_FUNC_ARG(PrimitiveType)
 		LOG_FUNC_ARG(StartVertex)
@@ -9933,6 +9992,7 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_DrawVerticesUP)
     uint_xt             VertexStreamZeroStride
 )
 {
+	{ g_mj_drawTotal++; }
 	LOG_FUNC_BEGIN
 		LOG_FUNC_ARG(PrimitiveType)
 		LOG_FUNC_ARG(VertexCount)
@@ -9995,6 +10055,7 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_DrawIndexedVertices)
     CONST PWORD         pIndexData
 )
 {
+	{ g_mj_drawTotal++; }
 	// Test-cases : XDK samples (Cartoon, Gamepad)
 	// Note : In gamepad.xbe, the gamepad is drawn by D3DDevice_DrawIndexedVertices
 	// Dxbx Note : In DrawVertices and DrawIndexedVertices, PrimitiveType may not be D3DPT_POLYGON
@@ -10040,6 +10101,7 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_DrawIndexedVerticesUP)
     uint_xt                VertexStreamZeroStride
 )
 {
+	{ g_mj_drawTotal++; }
 	LOG_FUNC_BEGIN
 		LOG_FUNC_ARG(PrimitiveType)
 		LOG_FUNC_ARG(VertexCount)

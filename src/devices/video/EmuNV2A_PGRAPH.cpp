@@ -1136,11 +1136,16 @@ void OpenGL_init_pgraph_plugins()
 	pgraph_draw_clear = OpenGL_draw_clear;
 }
 
+// Diagnostic counter for pgraph method calls
+volatile uint32_t g_pgraphMethodCount = 0;
+volatile uint32_t g_pgraphBeginEndCount = 0;
+
 void pgraph_handle_method(NV2AState *d,
 							unsigned int subchannel,
 							unsigned int method,
 							uint32_t parameter)
 {
+	g_pgraphMethodCount++;
 	unsigned int i;
 	unsigned int slot;
 
@@ -2429,6 +2434,7 @@ void pgraph_handle_method(NV2AState *d,
 			break;
 
 		case NV097_SET_BEGIN_END: {
+			g_pgraphBeginEndCount++;
 			uint32_t control_0 = pg->regs[NV_PGRAPH_CONTROL_0];
 			uint32_t control_1 = pg->regs[NV_PGRAPH_CONTROL_1];
 
@@ -2751,10 +2757,10 @@ void pgraph_handle_method(NV2AState *d,
 			xbox::addr_xt semaphore_dma_len;
 			uint8_t *semaphore_data = (uint8_t*)nv_dma_map(d, pg->dma_semaphore,
 				&semaphore_dma_len);
-			assert(semaphore_offset < semaphore_dma_len);
-			semaphore_data += semaphore_offset;
-
-			stl_le_p((uint32_t*)semaphore_data, parameter);
+			if (semaphore_data && semaphore_offset < semaphore_dma_len) {
+				semaphore_data += semaphore_offset;
+				stl_le_p((uint32_t*)semaphore_data, parameter);
+			}
 
 			//qemu_mutex_lock(&pg->pgraph_lock);
 			//qemu_mutex_unlock_iothread();

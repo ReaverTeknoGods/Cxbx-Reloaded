@@ -59,6 +59,7 @@ typedef struct {
 // channel mapping and 8→16 bit expansion. Set by JVS.cpp patch layer.
 enum class JvsGameType : uint8_t {
 	Generic   = 0,  // Default: straight 1:1 channel mapping
+	SegaGolfClub,   // Sega Golf Club / Virtua Golf titles
 	WanganMT1,      // Wangan Midnight Maximum Tune 1 (V307)
 	WanganMT2,      // Wangan Midnight Maximum Tune 2 (V322e / V322j)
 };
@@ -166,6 +167,10 @@ public:
 	// Open (or re-open) the JVS I/O log file in dataFilePath\jvs_io.log.
 	// Call once after construction, when the data path is known.
 	void OpenLog(const std::string& dataFilePath);
+	// Force the coin count for a given slot (0-based). Used for free play emulation.
+	void SetCoinCount(int slot, uint16_t count) {
+		if (slot >= 0 && slot < JVS_MAX_COINS) { Inputs.coins[slot].coins = count; }
+	}
 
 	// Mutex protecting ResponseBuffer and Inputs from concurrent access
 	// between the game thread (SendPacket/ReceivePacket) and JvsInputThread (Update).
