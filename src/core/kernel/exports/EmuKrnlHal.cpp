@@ -499,12 +499,11 @@ XBSYSAPI EXPORTNUM(49) xbox::void_xt DECLSPEC_NORETURN NTAPI xbox::HalReturnToFi
 	{
 		// Check game-specific reboot interceptor
 		if (g_pfnQuickRebootInterceptor && g_pfnQuickRebootInterceptor()) {
-			// Reboot suppressed — suspend this thread so the game's
-			// guard thread can use SetThreadContext to redirect it
-			// back into the game's main loop. After resume, spin
-			// as a safety net (the redirect should change EIP).
-			SuspendThread(GetCurrentThread());
-			while (true) { Sleep(1000); }
+			// Reboot suppressed — interceptor has saved card data
+			// and reset game state.  The XBE's QuickReboot call
+			// sites are NOP'd (JMP to epilogue) so the caller
+			// returns normally.  Just return here as a safety net.
+			return;
 		}
 
 		if (xbox::LaunchDataPage == NULL && !(g_bIsChihiro && g_MediaBoard))
@@ -604,6 +603,58 @@ XBSYSAPI EXPORTNUM(49) xbox::void_xt DECLSPEC_NORETURN NTAPI xbox::HalReturnToFi
 
 			if (XbePath.empty()) {
 				XbePath = CxbxConvertXboxToHostPath(TitlePath);
+			}
+
+			// Some Chihiro SEGABOOT revisions request a QuickReboot into a raw
+			// MediaBoard partition instead of leaving the launch path empty.
+			// A partition image is not an XBE, so launching it produces an
+			// "Invalid magic number" failure before the game gets control.
+			//
+			// Keep explicit, valid XBE handoffs unchanged. Only fall back to
+			// boot.id when SEGABOOT's resolved target is not an XBE.
+			if (g_bIsChihiro && g_MediaBoard) {
+				auto isXbeFile = [](const std::string& path) {
+					FILE* file = fopen(path.c_str(), "rb");
+					if (file == nullptr)
+						return false;
+
+					char magic[4] = {};
+					const bool isXbe =
+						fread(magic, 1, sizeof(magic), file) == sizeof(magic) &&
+						memcmp(magic, "XBEH", sizeof(magic)) == 0;
+					fclose(file);
+					return isXbe;
+				};
+
+				if (!isXbeFile(XbePath)) {
+					const bool useTestExecutable = g_bChihiroTestMode;
+					const char* executable = useTestExecutable
+						? g_MediaBoard->GetBootId().testExecutable
+						: g_MediaBoard->GetBootId().gameExecutable;
+					std::string bootIdExecutable(
+						executable,
+						strnlen(executable, 0x20));
+					while (!bootIdExecutable.empty() &&
+						(bootIdExecutable[0] == '\\' || bootIdExecutable[0] == '/')) {
+						bootIdExecutable.erase(0, 1);
+					}
+
+					if (!bootIdExecutable.empty()) {
+						const std::string fallbackPath =
+							g_MediaBoard->GetMountPath() + "\\" + bootIdExecutable;
+						if (isXbeFile(fallbackPath)) {
+							EmuLog(
+								LOG_LEVEL::WARNING,
+								"Chihiro QuickReboot target is not an XBE (%s); launching %s from boot.id: %s",
+								XbePath.c_str(),
+								useTestExecutable ? "test executable" : "game executable",
+								fallbackPath.c_str());
+							XbePath = fallbackPath;
+							if (useTestExecutable)
+								g_bChihiroTestMode = false;
+						}
+					}
+				}
 			}
 
 			// Relaunch Cxbx, to load another Xbe

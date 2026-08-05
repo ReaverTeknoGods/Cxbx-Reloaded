@@ -43,7 +43,20 @@ void LookupTrampolinesD3D();
 extern void CxbxInitWindow();
 
 void CxbxUpdateNativeD3DResources();
-void CxbxInvalidateFixedFunctionNonTransformState();
+void CxbxSetCrazyTaxiPendingTexturedQuadTexture(
+	xbox::X_D3DBaseTexture* texture);
+void CxbxSetCrazyTaxiDecodedMovieFrame(
+	const void* pixels,
+	uint32_t width,
+	uint32_t height);
+bool CxbxHasRecentCrazyTaxiDecodedMovieFrame();
+extern volatile LONG g_CrazyTaxiTextureBridgeSetCount;
+extern volatile LONG g_CrazyTaxiTextureBridgePendingChecks;
+extern volatile LONG g_CrazyTaxiTextureBridgeMatchCount;
+extern volatile LONG g_CrazyTaxiTextureBridgeLastTexture;
+extern volatile LONG g_CrazyTaxiTextureBridgeLastShader;
+extern volatile LONG g_CrazyTaxiTextureBridgeLastPrimitiveType;
+extern volatile LONG g_CrazyTaxiTextureBridgeLastVertexCount;
 
 void CxbxImpl_SetRenderTarget(xbox::X_D3DSurface* pRenderTarget, xbox::X_D3DSurface* pNewZStencil);
 void CxbxImpl_SetViewport(xbox::X_D3DVIEWPORT8* pViewport);
@@ -55,6 +68,18 @@ extern void EmuD3DInit();
 extern void EmuD3DCleanup();
 
 extern IDirect3DDevice9Ex *g_pD3DDevice;
+
+void CxbxInvalidateFixedFunctionNonTransformState();
+
+HRESULT CxbxSetVertexShaderConstantF(
+	UINT startRegister,
+	const float* constantData,
+	UINT vector4Count);
+
+HRESULT CxbxSetPixelShaderConstantF(
+	UINT startRegister,
+	const float* constantData,
+	UINT vector4Count);
 
 extern xbox::dword_xt g_Xbox_VertexShader_Handle;
 

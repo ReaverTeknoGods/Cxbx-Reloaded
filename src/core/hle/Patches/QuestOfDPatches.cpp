@@ -27,24 +27,20 @@
 #include "PatchUtil.h"
 #include "ChihiroPatches.h"
 #include "core\kernel\support\Emu.h"
+#include "core\kernel\init\CxbxKrnl.h"
 #include "devices\chihiro\JvsIo.h"
 
 // D3D swap diagnostic — defined in Direct3D9.cpp
-#if defined(_DEBUG)
 extern volatile uint32_t g_D3DSwapCounter;
-#endif
 #include <cstdio>
 #include <windows.h>
 #include <psapi.h>
 #include <TlHelp32.h>
 
+// Keep bring-up details in CXBXR's normal debug logger. Synchronous console
+// and C:\temp writes make the Release path unnecessarily expensive under Wine.
 #if defined(_DEBUG)
-#define QOD_LOG(fmt, ...) do { \
-	printf("QuestOfDPatch: " fmt "\n", ##__VA_ARGS__); \
-	{ FILE* _f = fopen("C:\\temp\\qod_patches.log","a"); \
-	  if(_f){ SYSTEMTIME _st; GetLocalTime(&_st); \
-	  fprintf(_f, "[%02d:%02d:%02d.%03d] QoD: " fmt "\n", _st.wHour,_st.wMinute,_st.wSecond,_st.wMilliseconds, ##__VA_ARGS__); fclose(_f); } } \
-} while(0)
+#define QOD_LOG(...) EmuLog(LOG_LEVEL::DEBUG, __VA_ARGS__)
 #else
 #define QOD_LOG(...) do {} while(0)
 #endif
@@ -67,6 +63,21 @@ static void InitXboxCS(uint32_t csAddr) {
 static LONG WINAPI QodCrashHandler(EXCEPTION_POINTERS* ep)
 {
 	DWORD code = ep->ExceptionRecord->ExceptionCode;
+
+	// Hardware watchpoint hit on byte_8D39FC write
+	if (code == 0x80000004 /* STATUS_SINGLE_STEP */) {
+		// Check if DR6 indicates DR0 triggered (bit 0)
+		DWORD dr6 = ep->ContextRecord->Dr6;
+		if (dr6 & 1) {
+			uint8_t val = *(volatile uint8_t*)0x8D39FC;
+			QOD_LOG("HW_WATCH: byte_8D39FC written! EIP=0x%08X val=%d EAX=0x%08X ECX=0x%08X",
+				ep->ContextRecord->Eip, val,
+				ep->ContextRecord->Eax, ep->ContextRecord->Ecx);
+			// Clear DR6 and continue
+			ep->ContextRecord->Dr6 = 0;
+			return EXCEPTION_CONTINUE_EXECUTION;
+		}
+	}
 
 	// Handle NULL function pointer calls from uninitialized IC card objects.
 	// When EIP=0 (call through NULL), recover by simulating a return with EAX=0.
@@ -572,9 +583,15 @@ static char g_cardFilePath[MAX_PATH] = {0};
 
 static void QodCardPathInit() {
 	if (g_cardFilePath[0]) return;
-	// Build path from XBE directory
-	const char* xbePath = "C:\\arcade\\cxbx\\Quest of D The Battle Kingdom (CDV-10035B)\\card.bin";
-	strncpy(g_cardFilePath, xbePath, MAX_PATH - 1);
+	// Build path relative to XBE directory
+	char xbeDir[MAX_PATH];
+	strncpy(xbeDir, szFilePath_Xbe, MAX_PATH - 1);
+	xbeDir[MAX_PATH - 1] = '\0';
+	char* lastSlash = strrchr(xbeDir, '\\');
+	if (!lastSlash) lastSlash = strrchr(xbeDir, '/');
+	if (lastSlash) *(lastSlash + 1) = '\0';
+	else strcat(xbeDir, "\\");
+	snprintf(g_cardFilePath, MAX_PATH, "%scard.bin", xbeDir);
 	QOD_LOG("Card file path: %s", g_cardFilePath);
 }
 
@@ -620,6 +637,9 @@ static bool QodSaveCardFile(const uint8_t* src, size_t len) {
 // have a server, the reboot just loops forever. Intercept it:
 // save any card data from memory, then suppress the reboot.
 static volatile bool g_QodGameFullyBooted = false;
+static volatile bool g_QodRebootPending = false; // Set when reboot was suppressed; guard thread resumes
+static volatile int  g_QodAutoTouchCountdown = 0; // >0: touch thread simulates tap (countdown frames)
+static volatile uint8_t* g_QodTransitionTrigger = nullptr; // Trigger byte in trampoline page
 static uintptr_t g_QodAdvanceGateAddr = 0; // Address of sub_BF4A0 (state 12 advance gate)
 static uint8_t g_QodAdvanceGateOrig[3] = {}; // Original bytes before patch
 
@@ -628,38 +648,137 @@ static uint8_t g_QodAdvanceGateOrig[3] = {}; // Original bytes before patch
 // (direct entry writes, channel count patch, boot struct, forced reboot).
 bool g_QodGamePatchesActive = false;
 
+// Hook for sub_95020 (setter of byte_8D39FC game-exit flag)
+// Original: MOV [8D39FC], AL; RET  (A2 FC 39 8D 00 C3)
+static void __cdecl QodLogExitFlagSetter(uintptr_t retAddr, uint8_t value)
+{
+	if (value != 0) {
+		QOD_LOG("EXIT_FLAG SET to %d — return addr=0x%08X", value, retAddr);
+	}
+}
+
+static void __declspec(naked) QodExitFlagSetterHook()
+{
+	__asm {
+		// AL = value being written
+		pushad
+		pushfd
+		movzx eax, al
+		push eax
+		// Get return address from stack (past pushad/pushfd = 36 bytes)
+		mov eax, [esp + 40]  // 4 (push eax) + 32 (pushad) + 4 (pushfd) = 40
+		push eax
+		call QodLogExitFlagSetter
+		add esp, 8
+		popfd
+		popad
+		// Execute original: MOV [8D39FC], AL; RET
+		mov byte ptr ds:[0x008D39FC], al
+		ret
+	}
+}
+
 // Declared in EmuKrnlHal.cpp
 extern bool (*g_pfnQuickRebootInterceptor)();
 
 static bool QodQuickRebootInterceptor() {
 	if (!g_QodGameFullyBooted) return false; // allow boot reboots
 
-	QOD_LOG("QuickReboot interceptor: saving card data and suppressing reboot");
-
-	// Save any card data from ACDFE8
+	// Save card data from memory before redirect — the game may have
+	// put registration data into the IC card buffer during funcID=7.
 	uint8_t cardBuf[207];
 	memcpy(cardBuf, (void*)0xACDFE8, sizeof(cardBuf));
-	bool hasData = false;
-	for (int i = 0; i < 207; i++) { if (cardBuf[i] != 0) { hasData = true; break; } }
-	if (hasData) {
-		QodCardPathInit();
+	bool allZero = true;
+	for (int i = 0; i < 207; i++) { if (cardBuf[i] != 0) { allZero = false; break; } }
+	if (!allZero) {
 		QodSaveCardFile(cardBuf, sizeof(cardBuf));
+		QOD_LOG("QuickReboot interceptor: saved card data (non-zero) to card.bin");
+	} else {
+		QOD_LOG("QuickReboot interceptor: card buffer still all zeros");
 	}
 
-	// Clear card state
-	*(volatile uint32_t*)0xACDFB8 = 0;
-	*(volatile uint32_t*)0xACDFBC = 0;
-	*(volatile uint32_t*)0xACDFD0 = 0;
+	QOD_LOG("QuickReboot interceptor: reboot suppressed (boot/reset)");
+	return true;
+}
 
-	return true; // suppress the reboot
+// Reboot redirect — called from game thread instead of sub_6E720 (reboot).
+// Saves card data, then transitions to attract mode via sub_72F10.
+typedef void (__cdecl *pfn_sub_72F10)();
+static void __cdecl QodRebootRedirect() {
+	// One-shot — original sub_6E720 never returned (it rebooted), so the
+	// caller loops. We must only fire once.
+	static volatile bool fired = false;
+	if (fired) return;
+	fired = true;
+	// Save card buffer to card.bin (in case registration wrote data)
+	uint8_t cardBuf[207];
+	memcpy(cardBuf, (void*)0xACDFE8, sizeof(cardBuf));
+	bool allZero = true;
+	for (int i = 0; i < 207; i++) { if (cardBuf[i] != 0) { allZero = false; break; } }
+
+	QOD_LOG("RebootRedirect: card buffer %s, first 16: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+		allZero ? "ALL ZERO" : "HAS DATA",
+		cardBuf[0], cardBuf[1], cardBuf[2], cardBuf[3],
+		cardBuf[4], cardBuf[5], cardBuf[6], cardBuf[7],
+		cardBuf[8], cardBuf[9], cardBuf[10], cardBuf[11],
+		cardBuf[12], cardBuf[13], cardBuf[14], cardBuf[15]);
+
+	if (!allZero) {
+		QodSaveCardFile(cardBuf, sizeof(cardBuf));
+		QOD_LOG("RebootRedirect: saved card data to card.bin");
+	}
+
+	// Set A93684 to gameplay and call sub_72F10 to process transition
+	*(volatile uint32_t*)0xA93684 = 0x002FAABC; // funcID=5
+	QOD_LOG("RebootRedirect: set A93684=0x002FAABC (funcID=5), calling sub_72F10");
+	((pfn_sub_72F10)0x72F10)();
+	QOD_LOG("RebootRedirect: sub_72F10 returned, task80=0x%08X", *(volatile uint32_t*)0xA93680);
 }
 
 // Hook for B1AD0 — IC card runtime poll
 // Intercepts card read/write/eject operations and handles them
 // immediately using file I/O instead of serial protocol.
+static volatile bool g_QodCardInserted = false; // true once card has been read
+
+// Drive the card-reader status flags the SELECTOR queries to "read complete".
+//   dword_ACDFAC is a packed status byte vector queried by:
+//     sub_B1930: (BYTE0==1)  -> card present
+//     sub_B1950: (BYTE1!=0)  -> reader busy
+//     sub_B1970: (BYTE2==1)  -> read complete
+//     sub_B19B0: (BYTE3==1)  -> read error
+//   The monster-card read state machine (sub_B6310) only sets BYTE2 after a
+//   real hardware parse via sub_B7490 succeeds; with no Chihiro card hardware
+//   that never happens, so the SELECTOR keeps showing "insert IC card".
+//   We populate the completed-read status directly. The card identity magic
+//   lives at off_43590C+7148 (off_43590C = &unk_AD2590, so 0xAD2590+7148 =
+//   0xAD417C, the field read as *((_DWORD*)off_43590C + 1787) in sub_B6310).
+//   The parser sub_B7490 only treats a card as a full player card (copying the
+//   profile + names via the qmemcpy/sub_B8A30 path) when the decoded type is
+//   117637394 (0x7030112); the 0x60xxxxx family (0x6030111/0x6040111/0x6060111)
+//   is recognized but yields an empty parse (return 0). So we must write
+//   0x7030112 here, and to the CORRECT address (0xAD417C, not the previously
+//   used 0xAD41BC which is index 1803 and is never read by the game).
+static void QodSetCardReadComplete() {
+	*(volatile uint8_t*)0xACDFAC = 1;          // BYTE0: card present (sub_B1930)
+	*(volatile uint8_t*)0xACDFAD = 0;          // BYTE1: not busy   (sub_B1950)
+	*(volatile uint8_t*)0xACDFAE = 1;          // BYTE2: read done  (sub_B1970)
+	*(volatile uint8_t*)0xACDFAF = 0;          // BYTE3: no error   (sub_B19B0)
+	*(volatile uint32_t*)0xAD417C = 0x7030112; // off_43590C+7148: full-player-card magic
+	*(volatile uint32_t*)0xAD25B4 = 4;         // off_43590C idx9 = post-read-complete
+}
+
 static void QodIcCardRuntimeHook() {
 	// Check for pending serial operation (AD08C4)
 	// The original code at B1ADE handles this; we skip it.
+
+	// Maintain card presence state on every poll
+	if (g_QodCardInserted) {
+		*(volatile uint32_t*)0xAD08D0 = 2;   // card reader state = present
+		*(volatile uint32_t*)0xACDFC4 = 0x0B; // card ready
+		*(volatile uint32_t*)0xACDFE0 = 2;    // card count
+		*(volatile uint8_t*)0xC592BE = 1;     // high-level card present flag
+		QodSetCardReadComplete();             // keep read-complete status latched
+	}
 
 	uint32_t cardState = *(volatile uint32_t*)0xACDFB8;
 	if (cardState == 0) return; // idle
@@ -681,27 +800,30 @@ static void QodIcCardRuntimeHook() {
 		if (loaded) {
 			// Store card data at ACDFE8 (first card slot, offset 0)
 			memcpy((void*)0xACDFE8, cardBuf, sizeof(cardBuf));
-
-			// Set success result
-			*(volatile uint32_t*)0xACDFBC = 0; // error code = success
-			*(volatile uint32_t*)0xACDFC0 = 0; // status 1
-			*(volatile uint32_t*)0xACDFC4 = 0; // status 2
-			*(volatile uint32_t*)0xACDFC8 = 0; // status 3
-
-			// Copy results to ACDFD0-DC
-			*(volatile uint32_t*)0xACDFD0 = 0; // error
-			*(volatile uint32_t*)0xACDFD4 = 0; // status 1
-			*(volatile uint32_t*)0xACDFD8 = 0; // status 2
-			*(volatile uint32_t*)0xACDFDC = 0; // status 3
-			*(volatile uint32_t*)0xACDFE0 = 1; // card count
-
 			QOD_LOG("IC Card READ success: %zu bytes loaded", sizeof(cardBuf));
 		} else {
-			// No card file — report "no card"
-			*(volatile uint32_t*)0xACDFBC = 3; // error = no card
-			*(volatile uint32_t*)0xACDFD0 = 3;
-			QOD_LOG("IC Card READ: no card file available");
+			// No card file — provide a blank card (all zeros) like Golf.
+			// Returning "no card" error causes the game to try to register
+			// a new satellite card and reboot, which loops forever.
+			memset((void*)0xACDFE8, 0, sizeof(cardBuf));
+			QOD_LOG("IC Card READ: no card file — providing blank card");
 		}
+
+		// Always return success with card present
+		*(volatile uint32_t*)0xACDFBC = 0; // error code = success
+		*(volatile uint32_t*)0xACDFC0 = 0; // status 1
+		*(volatile uint32_t*)0xACDFC4 = 0x0B; // card reader state = card ready
+		*(volatile uint32_t*)0xACDFC8 = 0; // status 3
+		*(volatile uint32_t*)0xACDFD0 = 0; // error
+		*(volatile uint32_t*)0xACDFD4 = 0; // status 1
+		*(volatile uint32_t*)0xACDFD8 = 0; // status 2
+		*(volatile uint32_t*)0xACDFDC = 0; // status 3
+		*(volatile uint32_t*)0xACDFE0 = 2; // card count (2 = recognized)
+
+		// Set card reader state to "card present"
+		*(volatile uint32_t*)0xAD08D0 = 2; // card reader state = card present
+		QodSetCardReadComplete();          // mark the read as completed for the SELECTOR
+		g_QodCardInserted = true;
 
 		// Reset card state machine
 		*(volatile uint32_t*)0xACDFB8 = 0; // idle
@@ -773,7 +895,6 @@ static DWORD WINAPI QodPeripheralGuardThread(LPVOID) {
 	uint32_t prevTask80 = 0;
 	uint32_t prevCardOp = 0xFFFFFFFF;
 	int stateTimer = 0;
-	bool dumpedTaskMgr = false;
 	bool dumpedThreadEip = false;
 	int selectorStuckTimer = 0;
 
@@ -789,10 +910,21 @@ static DWORD WINAPI QodPeripheralGuardThread(LPVOID) {
 		*(volatile uint32_t*)0x8D1998 = 3; // Data Load
 		*(volatile uint32_t*)0x8D199C = 3; // Network Connect
 
-		// Gate7 — IC reader ready gate
-		if ((*(volatile uint8_t*)0xADAF08 & 0x02) && *(volatile uint32_t*)0xAD9A48 == 3) {
-			*(volatile uint8_t*)0x8D39FC = 1;
-		}
+		// ── Force FREE-PLAY + credit bank ─────────────────────
+		// Now that the card pipeline works (card parses as a valid
+		// 0x7030112 player card), the selector/next menus gate on
+		// having credits. Force free-play (byte_90E7CF=1) so the
+		// cost check (sub_269E20: free-play OR credits>=cost) always
+		// passes, and keep a credit bank topped up as belt-and-braces
+		// for any path that reads the credit counter directly.
+		*(volatile uint8_t*)0x90E7CF = 1;       // free-play ON
+		if (*(volatile uint32_t*)0x90E7E8 < 5)
+			*(volatile uint32_t*)0x90E7E8 = 10; // credit bank
+
+		// Gate7 — IC reader ready gate (AD9A48)
+		// NOTE: previously wrote 0x8D39FC=1 here, but that's the
+		// game-exit flag (byte_8D39FC) — NOT a gate register.
+		// Writing it caused funcID=7 to exit immediately to results.
 
 		// State 13 condition flags — network/download subsystem checks
 		// can't pass without real network hardware
@@ -803,14 +935,10 @@ static DWORD WINAPI QodPeripheralGuardThread(LPVOID) {
 		// When set, sub-counter stops incrementing.
 		*(volatile uint8_t*)0xA935C6 &= ~1u;
 
-		// Rendering ready bit — force bit 1 at *0x6842E0 so the
-		// main loop's rendering path executes.
-		{
-			uint32_t renderPtr = *(volatile uint32_t*)0x6842E0;
-			if (renderPtr >= 0x10000 && renderPtr < 0x1000000) {
-				*(volatile uint8_t*)renderPtr |= 0x02;
-			}
-		}
+		// NOTE: previously forced bit 1 at *off_6842E0 here,
+		// thinking it was a "rendering ready" bit. But bit 1
+		// of *off_6842E0 is the SELECTOR advance flag — forcing
+		// it caused SELECTOR to skip straight to funcID=7→8.
 
 		// ── Network init bypass (states 10-14) ─────────────────
 		{
@@ -850,26 +978,32 @@ static DWORD WINAPI QodPeripheralGuardThread(LPVOID) {
 						VirtualProtect((void*)0x6D3D0, 6, oldProt, &oldProt);
 						QOD_LOG("Runtime: patched sub_6D3D0 to single-pass CRI process");
 					}
-					// Write custom sub_73D70 stub: only calls sub_6D3D0
-					// (CRI command processing) + sets cleanup-done flag.
-					// Original also called sub_29070(1), sub_29070(2),
-					// sub_6A2C0, sub_6CB30 — those corrupt CRI state
-					// after repeated attract cycles, triggering an
-					// in-game error dialog with garbled text.
-					// Custom stub:
-					//   73D70: E8 5B 96 FF FF        CALL sub_6D3D0
-					//   73D75: C6 05 7A 36 A9 00 01  MOV BYTE [A9367A], 1
-					//   73D7C: C3                    RET
-					if (VirtualProtect((void*)0x73D70, 13, PAGE_EXECUTE_READWRITE, &oldProt)) {
-						*(uint8_t*)0x73D70  = 0xE8; // restore CALL opcode
-						// 73D71-73D74 already has correct rel32 to sub_6D3D0
-						*(uint8_t*)0x73D75  = 0xC6; // MOV BYTE PTR [imm32], imm8
-						*(uint8_t*)0x73D76  = 0x05;
-						*(uint32_t*)0x73D77 = 0x00A9367A;
-						*(uint8_t*)0x73D7B  = 0x01;
-						*(uint8_t*)0x73D7C  = 0xC3; // RET
-						VirtualProtect((void*)0x73D70, 13, oldProt, &oldProt);
-						QOD_LOG("Runtime: wrote custom sub_73D70 stub (CALL sub_6D3D0 + flag + RET)");
+					// Restore original sub_73D70 — the full cleanup function
+					// including sub_29070, sub_6A2C0 (DIALOG creation), and
+					// sub_6CB30 (display cleanup). Previously we replaced this
+					// with a minimal stub that hid the in-game error dialog.
+					// Now that sub_6D3D0 is single-pass, the original code
+					// won't block, and the DIALOG system can show errors.
+					{
+						static const uint8_t orig_73D70[] = {
+							0xE8, 0x5B, 0x96, 0xFF, 0xFF,             // CALL sub_6D3D0
+							0xB8, 0x01, 0x00, 0x00, 0x00,             // MOV EAX, 1
+							0xE8, 0xF1, 0x52, 0xFB, 0xFF,             // CALL sub_29070
+							0xB8, 0x02, 0x00, 0x00, 0x00,             // MOV EAX, 2
+							0xE8, 0xE7, 0x52, 0xFB, 0xFF,             // CALL sub_29070
+							0xC6, 0x05, 0x7A, 0x36, 0xA9, 0x00, 0x01, // MOV BYTE [A9367A], 1
+							0xE8, 0x2B, 0x65, 0xFF, 0xFF,             // CALL sub_6A2C0
+							0xA1, 0x8C, 0x36, 0xA9, 0x00,             // MOV EAX, [A9368C]
+							0x83, 0xF8, 0xFF,                         // CMP EAX, -1
+							0x74, 0x05,                               // JZ +5
+							0xE9, 0x8C, 0x8D, 0xFF, 0xFF,             // JMP sub_6CB30
+							0xC3                                      // RET
+						};
+						if (VirtualProtect((void*)0x73D70, sizeof(orig_73D70), PAGE_EXECUTE_READWRITE, &oldProt)) {
+							memcpy((void*)0x73D70, orig_73D70, sizeof(orig_73D70));
+							VirtualProtect((void*)0x73D70, sizeof(orig_73D70), oldProt, &oldProt);
+							QOD_LOG("Runtime: restored original sub_73D70 (DIALOG system enabled)");
+						}
 					}
 					if (VirtualProtect((void*)0x6D320, 3, PAGE_EXECUTE_READWRITE, &oldProt)) {
 						*(uint8_t*)0x6D320 = 0xB0; // MOV AL, 1
@@ -887,6 +1021,30 @@ static DWORD WINAPI QodPeripheralGuardThread(LPVOID) {
 							VirtualProtect((void*)g_QodAdvanceGateAddr, 3, oldProt, &oldProt);
 							QOD_LOG("Runtime: restored advance gate at 0x%08X (attract mode enabled)", (unsigned)g_QodAdvanceGateAddr);
 						}
+					}
+					// Bypass resource 33 gate — CRI async file loading
+					// for auth2d never completes in the emulator, so
+					// sub_73F20 case 2 blocks forever. Patch sub_73F20
+					// to return 1 immediately so funcID=4 draw can
+					// transition to attract/selector modes.
+					if (VirtualProtect((void*)0x73F20, 3, PAGE_EXECUTE_READWRITE, &oldProt)) {
+						*(uint8_t*)0x73F20 = 0xB0; // MOV AL, 1
+						*(uint8_t*)0x73F21 = 0x01;
+						*(uint8_t*)0x73F22 = 0xC3; // RET
+						VirtualProtect((void*)0x73F20, 3, oldProt, &oldProt);
+						QOD_LOG("Runtime: patched sub_73F20 to return 1 (bypass resource 33 gate)");
+					}
+					// Fix touch detection — sub_195390 checks touch
+					// (byte_AD9530 & 1) and calls sub_BD2E0(1) for game
+					// setup, but the first check is sub_6E660() (board
+					// type=Chihiro→1) which short-circuits to return 0.
+					// NOP the JNZ at 0x195397 (75 36 → 90 90) so the
+					// Chihiro board check doesn't block touch detection.
+					if (VirtualProtect((void*)0x195397, 2, PAGE_EXECUTE_READWRITE, &oldProt)) {
+						*(uint8_t*)0x195397 = 0x90; // NOP
+						*(uint8_t*)0x195398 = 0x90; // NOP
+						VirtualProtect((void*)0x195397, 2, oldProt, &oldProt);
+						QOD_LOG("Runtime: patched sub_195390 (NOP'd board check JNZ) — touch detection enabled");
 					}
 
 				}
@@ -909,22 +1067,19 @@ static DWORD WINAPI QodPeripheralGuardThread(LPVOID) {
 					QOD_LOG("State %d timeout → forcing to 14", curState);
 					*outerState = 14; *outerSub = 0; stateTimer = 0;
 				}
-			} else if (curState == 14 && *outerSub < 3) {
-				*outerSub = 3;
-			} else if (curState == 14 && !dumpedTaskMgr) {
-				dumpedTaskMgr = true;
-				// Dump state 14 patch locations to verify they're intact
-				QOD_LOG("STATE14 CODE DUMP:");
-				for (uint32_t base = 0x73640; base < 0x73780; base += 32) {
-					uint8_t buf[32];
-					memcpy(buf, (void*)base, 32);
-					QOD_LOG("  %05X: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X "
-						"%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
-						base,
-						buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7],
-						buf[8],buf[9],buf[10],buf[11],buf[12],buf[13],buf[14],buf[15],
-						buf[16],buf[17],buf[18],buf[19],buf[20],buf[21],buf[22],buf[23],
-						buf[24],buf[25],buf[26],buf[27],buf[28],buf[29],buf[30],buf[31]);
+			} else if (curState == 14) {
+				if (*outerSub < 3) *outerSub = 3;
+				stateTimer++;
+				// State 14 case handler calls sub_AEFE0() and only sets
+				// state=15 when it returns true. But we patched sub_AEFE0
+				// to return 0 (prevents main-loop exit). The JZ→JMP patch
+				// at 073679 was supposed to bypass this, but the decompiled
+				// code shows nested if/switch logic that can't be fully
+				// fixed with a single jump patch. Force transition after
+				// a short delay to let state 14 init run.
+				if (stateTimer > 60) {
+					QOD_LOG("State 14 timeout → forcing to 15");
+					*outerState = 15; *outerSub = 0; stateTimer = 0;
 				}
 			} else {
 				stateTimer = 0;
@@ -953,6 +1108,93 @@ static DWORD WINAPI QodPeripheralGuardThread(LPVOID) {
 				}
 			}
 
+			// ── Comprehensive edge-triggered state WATCH ──────────
+			// Logs EVERY change of the key game-state values in one
+			// unified stream so transitions are fully traceable (the
+			// user asked for this so we don't get confused by sparse
+			// polled snapshots). Each entry: {address, label}. Only
+			// logs when a value actually changes.
+			{
+				struct WatchEntry { uintptr_t addr; const char* label; };
+				static const WatchEntry kWatch[] = {
+					{ 0xA93680, "task80(cur)" },
+					{ 0xA93684, "A93684(pending)" },
+					{ 0x8D1970, "initState" },
+					{ 0x8D1974, "initSub" },
+					{ 0xAD417C, "cardMagic" },
+					{ 0xACDFAC, "cardStatus" },
+					{ 0xACDFB8, "cardOp" },
+					{ 0xAD08D0, "rdrState" },
+					{ 0x90E7E8, "credits" },
+					{ 0x8D39FC, "exitFlag" },
+					{ 0xA93744, "selSM" },
+					{ 0xA93748, "dlgId" },
+				};
+				static uint32_t prevWatch[sizeof(kWatch)/sizeof(kWatch[0])];
+				static bool watchInit = false;
+				// Selector object flags are pointer-indirected — track separately.
+				static uint32_t prevObjFlags = 0xDEADBEEF;
+				static uint8_t  prevFreePlay = 0xFF;
+				if (!watchInit) {
+					for (size_t i = 0; i < sizeof(kWatch)/sizeof(kWatch[0]); ++i)
+						prevWatch[i] = *(volatile uint32_t*)kWatch[i].addr;
+					watchInit = true;
+				}
+				for (size_t i = 0; i < sizeof(kWatch)/sizeof(kWatch[0]); ++i) {
+					uint32_t v = *(volatile uint32_t*)kWatch[i].addr;
+					if (v != prevWatch[i]) {
+						QOD_LOG("WATCH %-16s %08X -> %08X (t80=%08X st=%d/%d)",
+							kWatch[i].label, prevWatch[i], v,
+							*(volatile uint32_t*)0xA93680,
+							*(volatile uint32_t*)0x8D1970,
+							*(volatile uint32_t*)0x8D1974);
+						prevWatch[i] = v;
+					}
+				}
+				// Selector object header flags (*(uint32*)*0x6842E0).
+				uintptr_t selObj = *(volatile uintptr_t*)0x6842E0;
+				uint32_t objFlags = selObj ? *(volatile uint32_t*)selObj : 0;
+				if (objFlags != prevObjFlags) {
+					QOD_LOG("WATCH %-16s %08X -> %08X (t80=%08X)",
+						"selObjFlags", prevObjFlags, objFlags,
+						*(volatile uint32_t*)0xA93680);
+					prevObjFlags = objFlags;
+				}
+				uint8_t fp = *(volatile uint8_t*)0x90E7CF;
+				if (fp != prevFreePlay) {
+					QOD_LOG("WATCH %-16s %02X -> %02X", "freePlay", prevFreePlay, fp);
+					prevFreePlay = fp;
+				}
+			}
+
+			// Monitor game state flags continuously
+			{
+				static uint8_t prevGameObjByte = 0xFF;
+				static uint8_t prevExitFlag = 0xFF;
+				uint8_t* gameObj = *(uint8_t**)0x6842E0;
+				uint8_t curGameByte = gameObj ? gameObj[0] : 0;
+				uint8_t curExit = *(volatile uint8_t*)0x8D39FC;
+				if (curGameByte != prevGameObjByte) {
+					QOD_LOG("FLAG: *off_6842E0[0] changed 0x%02X → 0x%02X (task80=0x%08X)",
+						prevGameObjByte, curGameByte, task80);
+					prevGameObjByte = curGameByte;
+				}
+				if (curExit != prevExitFlag) {
+					QOD_LOG("FLAG: byte_8D39FC changed %d → %d (task80=0x%08X)",
+						prevExitFlag, curExit, task80);
+					// Verify patch integrity when flag gets set
+					if (curExit == 1) {
+						uint8_t b0 = *(volatile uint8_t*)0x6E660;
+						uint8_t b1 = *(volatile uint8_t*)0x6E661;
+						uint8_t b2 = *(volatile uint8_t*)0x6E662;
+						uint8_t bt = *(volatile uint8_t*)0xAF2638;
+						QOD_LOG("  VERIFY: sub_6E660=[%02X %02X %02X] board_type=%d",
+							b0, b1, b2, bt);
+					}
+					prevExitFlag = curExit;
+				}
+			}
+
 			// One-time dump of all task entries when game reaches state 15
 			{
 				static bool taskTableDumped = false;
@@ -972,6 +1214,62 @@ static DWORD WINAPI QodPeripheralGuardThread(LPVOID) {
 			// sub_6D3D0 (RET) and sub_73D70 (RET) prevent CRI from
 			// blocking during task transitions. sub_6D300 (return 1)
 			// ensures the CRI queue gate always passes.
+		}
+
+		// ── Touch detection diagnostic ───────────────────────
+		// sub_195390 is the touch→game path. Log state periodically.
+		{
+			static int advDiagCounter = 0;
+			if (++advDiagCounter >= 120) { // ~2 sec
+				uint32_t task80 = *(volatile uint32_t*)0xA93680;
+				advDiagCounter = 0;
+				QOD_LOG("TOUCH_STATE: AD9530=%d ACCD20=0x%08X A26C34=0x%08X task80=%08X",
+					*(volatile uint8_t*)0xAD9530,
+					*(volatile uint32_t*)0xACCD20,
+					*(volatile uint32_t*)0xA26C34,
+					task80);
+			}
+		}
+
+		// ── Dialog text dump ──────────────────────────────────
+		// Text entries: byte_A26D3C + index * 1336 + 96 (Shift-JIS)
+		// Scan all 12 slots regardless of dword_A26D08
+		{
+			static bool dialogDumped = false;
+			if (!dialogDumped && *(volatile uint32_t*)0x8D1970 >= 15) {
+				// Check all 12 possible text entry slots
+				bool anyText = false;
+				for (int i = 0; i < 12; i++) {
+					uint8_t* entry = (uint8_t*)(0xA26D3C + i * 1336);
+					const char* textBase = (const char*)(entry + 96);
+					if (textBase[0] != 0) { anyText = true; break; }
+				}
+				if (anyText) {
+					dialogDumped = true;
+					QOD_LOG("DIALOG TEXT DUMP (dword_A26D08=%d):", *(volatile int32_t*)0xA26D08);
+					for (int i = 0; i < 12; i++) {
+						uint8_t* entry = (uint8_t*)(0xA26D3C + i * 1336);
+						uint8_t entState = entry[0];
+						int32_t entState4 = *(int32_t*)(entry + 4);
+						const char* textBase = (const char*)(entry + 96);
+						int textLen = 0;
+						for (int j = 0; j < 1024 && textBase[j]; j++) textLen++;
+						if (textLen == 0) continue;
+						// Dump raw hex (first 128 bytes)
+						char hexBuf[400] = {};
+						int hexPos = 0;
+						int dumpLen = textLen > 128 ? 128 : textLen;
+						for (int j = 0; j < dumpLen && hexPos < 390; j++) {
+							hexPos += sprintf(hexBuf + hexPos, "%02X ", (uint8_t)textBase[j]);
+						}
+						QOD_LOG("  SLOT[%d] s0=%d s4=%d len=%d hex: %s", i, entState, entState4, textLen, hexBuf);
+					}
+					// Also dump pointer array at unk_A26D0C
+					QOD_LOG("  PTR array: %08X %08X %08X %08X",
+						*(volatile uint32_t*)0xA26D0C, *(volatile uint32_t*)0xA26D10,
+						*(volatile uint32_t*)0xA26D14, *(volatile uint32_t*)0xA26D18);
+				}
+			}
 		}
 
 		// ── Card I/O monitoring (after init) ──────────────────
@@ -1018,29 +1316,325 @@ static DWORD WINAPI QodPeripheralGuardThread(LPVOID) {
 				} else {
 					fclose(chk);
 				}
+
+				// Populate system time struct at B14AFC so sub_BF410
+				// returns 1 (card registered). On real hardware this
+				// is written by a vtable callback; in emulation it
+				// stays zero (causing sub_BF410 to always return 0).
+				// sub_BF410 also calls sub_BE500 which processes card data.
+				{
+					SYSTEMTIME st;
+					GetLocalTime(&st);
+					volatile int32_t* tm = (volatile int32_t*)0xB14AFC;
+					tm[0] = st.wSecond;          // tm_sec
+					tm[1] = st.wMinute;          // tm_min
+					tm[2] = st.wHour;            // tm_hour
+					tm[3] = st.wDay;             // tm_mday
+					tm[4] = st.wMonth - 1;       // tm_mon (0-based)
+					tm[5] = st.wYear - 1900;     // tm_year
+					tm[6] = st.wDayOfWeek;       // tm_wday
+					tm[7] = 0;                   // tm_yday
+					tm[8] = -1;                  // tm_isdst (auto)
+					QOD_LOG("Populated B14AFC with system time");
+				}
+
+				// Present the card as ALREADY REGISTERED: clear bit 1
+				// (needs-registration).  Setting bit 1 sent the SELECTOR
+				// into its registration sub-state and made the mode menu
+				// inert.  sub_1923A0 reads bit 1; keeping it clear lets the
+				// draw callback (0x74370) fall through to the mode-selected
+				// check and keep the menu interactive.
 				volatile uint8_t* evtBase = *(volatile uint8_t**)0x6842E0;
-				if (evtBase) *(volatile uint32_t*)evtBase |= 0x02;
+				if (evtBase) *(volatile uint32_t*)evtBase &= ~0x02u;
 				*(volatile uint32_t*)0xACDFB8 = 1;
-				QOD_LOG("IC Card INSERT (F3)");
+				QOD_LOG("IC Card INSERT (F3) — card presented as registered");
+				QodIcCardRuntimeHook();
 			}
 			f3WasDown = f3Down;
 		}
 
+		// ── Auto touch when title/attract screen is stable ───
+		// funcID=4 (task80=002FAA98) is the "press to start" screen.
+		// After 120 frames (~2s), simulate a touch tap to advance to
+		// the selector screen (funcID=6).
+		{
+			static int titleFrames = 0;
+			static bool autoTouchDone = false;
+			uint32_t curTask4 = *(volatile uint32_t*)0xA93680;
+			if (curTask4 == 0x002FAA98 && !autoTouchDone) { // funcID=4
+				titleFrames++;
+				if (titleFrames == 120) {
+					autoTouchDone = true;
+					g_QodAutoTouchCountdown = 6; // 6 frames: 5 held + 1 release
+					QOD_LOG("AUTO-TOUCH: Title screen stable for 120 frames, tapping center");
+				}
+			} else if (curTask4 != 0x002FAA98) {
+				titleFrames = 0;
+			}
+		}
+
+		// ── Auto card insert when selector screen is stable ───
+		// After reaching funcID=6 (selector) for 180 frames (~3s),
+		// automatically trigger card insert so tests can run unattended.
+		{
+			static int selectorFrames = 0;
+			static bool autoInsertDone = false;
+			uint32_t curTask = *(volatile uint32_t*)0xA93680;
+			if (curTask == 0x002FAAE0 && !autoInsertDone) { // funcID=6
+				selectorFrames++;
+				if (selectorFrames == 20) {
+					autoInsertDone = true;
+					QOD_LOG("AUTO-F3: Selector reached, auto card insert");
+
+					QodCardPathInit();
+					FILE* chk = fopen(g_cardFilePath, "rb");
+					if (!chk) {
+						chk = fopen(g_cardFilePath, "wb");
+						if (chk) {
+							uint8_t blank[207];
+							memset(blank, 0, sizeof(blank));
+							fwrite(blank, 1, sizeof(blank), chk);
+							fclose(chk);
+							QOD_LOG("AUTO-F3: Created blank card file");
+						}
+					} else {
+						fclose(chk);
+					}
+
+					SYSTEMTIME st;
+					GetLocalTime(&st);
+					volatile int32_t* tm = (volatile int32_t*)0xB14AFC;
+					tm[0] = st.wSecond;
+					tm[1] = st.wMinute;
+					tm[2] = st.wHour;
+					tm[3] = st.wDay;
+					tm[4] = st.wMonth - 1;
+					tm[5] = st.wYear - 1900;
+					tm[6] = st.wDayOfWeek;
+					tm[7] = 0;
+					tm[8] = -1;
+					QOD_LOG("AUTO-F3: Populated B14AFC");
+
+					// Present as already-registered (clear needs-reg bit 1).
+					volatile uint8_t* evtBase = *(volatile uint8_t**)0x6842E0;
+					if (evtBase) *(volatile uint32_t*)evtBase &= ~0x02u;
+					*(volatile uint32_t*)0xACDFB8 = 1;
+					QOD_LOG("AUTO-F3: IC Card INSERT triggered — card presented as registered");
+					QodIcCardRuntimeHook();
+				}
+			} else if (curTask != 0x002FAAE0) {
+				selectorFrames = 0;
+			}
+		}
+
+		// ── Maintain card presence every frame (B1AD0 hook is not polled) ──
+		if (g_QodCardInserted) {
+			*(volatile uint32_t*)0xAD08D0 = 2;   // card reader state = present
+			*(volatile uint32_t*)0xACDFC4 = 0x0B; // card ready
+			*(volatile uint32_t*)0xACDFE0 = 2;    // card count
+			// NOTE: Do NOT set byte_C592BE = 1 here. C592BE is the
+			// "satellite card dispenser" flag. When 1, the card-reg
+			// state machine (sub_6E760) state 0 takes the satellite
+			// path which calls sub_BF410 (save timer check) and
+			// sub_6E720 (save + reboot). Without real DIMM hardware
+			// this hangs the game loop. Leave at 0 so state 0 goes
+			// to standalone path (state 1 or 5).
+		}
+
 		// ── Periodic diagnostic ───────────────────────────────
+		// ── SELECTOR / card-object ground-truth logger ───────
+		// Logs the card state object, IC reader struct (off_43590C@0xAD2590),
+		// and status flags every ~30 frames while on the SELECTOR screen so
+		// we can see exactly what the game's own card-read machine is doing.
+		{
+			static int selLogCtr = 0;
+			uint32_t t80g = *(volatile uint32_t*)0xA93680;
+			if (t80g == 0x002FAAE0 && (++selLogCtr % 30) == 0) {
+				uintptr_t cardObj = *(volatile uintptr_t*)0x6842E0;
+				uint32_t objFlags = cardObj ? *(volatile uint32_t*)cardObj : 0xFFFFFFFF;
+				uint32_t objStep  = cardObj ? *(volatile uint32_t*)(cardObj + 4) : 0;
+				uint8_t* rdr = (uint8_t*)0xAD2590; // off_43590C
+				uint8_t* prof = (uint8_t*)0xAF2634; // sub_BE630() card profile
+				QOD_LOG("SEL: objFlags=%08X step=%d | prof[4]=%d prof[5]=%d prof[8]=%d prof[85]=%d | magic=%08X ACDFAC=%08X ADAF08=%02X",
+					objFlags, objStep,
+					prof[4], prof[5], prof[8], prof[85],
+					*(volatile uint32_t*)0xAD417C,
+					*(volatile uint32_t*)0xACDFAC,
+					*(volatile uint8_t*)0xADAF08);
+			} else if (t80g != 0x002FAAE0) {
+				selLogCtr = 0;
+			}
+		}
+
+		// ── NETWORK FIRMWARE VERSION (passive data only) ──
+		// Set firmware version at sub_268450()+20/21 = 0x90E180/81.
+		// These are passively read by sub_730A0 (init SM vtable) and
+		// init SM state 14. Setting them is harmless — the game only
+		// reads these bytes, never writes them via network hardware.
+		// DO NOT change B29ACC (network status) — setting it to 0
+		// makes the game think it has a working network board, which
+		// triggers active network operations on nonexistent hardware
+		// and CRASHES (~47s into selector, access violation at host
+		// address 0x527EB174). Leave B29ACC at its natural value (1 =
+		// no network board detected).
+		{
+			static bool fwPatched = false;
+			uint32_t initSt = *(volatile uint32_t*)0x8D1970;
+			if (!fwPatched && initSt >= 11) {
+				// Firmware version at sub_268450() + 20/21 = 0x90E180/81
+				*(volatile uint8_t*)0x90E180 = 0x14; // major = 20
+				*(volatile uint8_t*)0x90E181 = 0x05; // minor = 5
+				fwPatched = true;
+				uint32_t netSt = *(volatile uint32_t*)0xB29AD0;
+				uint32_t netErr = *(volatile uint32_t*)0xB29ACC;
+				QOD_LOG("NET-FW: set firmware 20.05 at initSt=%u | B29AD0=%u B29ACC=%u (NOT changed)", initSt, netSt, netErr);
+			}
+		}
+
+		// ── SELECTOR OBSERVER (enhanced diagnostics) ──
+		{
+			static int gateLogCtr = 0;
+			uint32_t t80a = *(volatile uint32_t*)0xA93680;
+			if (t80a == 0x002FAAE0 && g_QodCardInserted) {
+				if ((++gateLogCtr % 300) == 0) { // ~5s cadence
+					uint32_t funcID = *(volatile uint32_t*)(t80a + 8);
+					uint32_t sm     = *(volatile uint32_t*)0xA93744;
+					uint32_t a93720 = *(volatile uint32_t*)0xA93720;
+					uint32_t a93684 = *(volatile uint32_t*)0xA93684;
+					uint8_t  prof4  = *(volatile uint8_t*)0xAF2638;
+					// Network / firmware state
+					uint32_t netSt  = *(volatile uint32_t*)0xB29AD0;
+					uint32_t netErr = *(volatile uint32_t*)0xB29ACC;
+					uint8_t  fwMaj  = *(volatile uint8_t*)0x90E180;
+					uint8_t  fwMin  = *(volatile uint8_t*)0x90E181;
+					// Init SM
+					uint32_t initSt = *(volatile uint32_t*)0x8D1970;
+					uint32_t initSub= *(volatile uint32_t*)0x8D1974;
+					uint32_t initHw = *(volatile uint32_t*)0x8D197C;
+					// Task entry callbacks
+					uint32_t tcb28 = *(volatile uint32_t*)(t80a + 28);
+					uint32_t tcb24 = *(volatile uint32_t*)(t80a + 24);
+					uint32_t tcb20 = *(volatile uint32_t*)(t80a + 20);
+					// Auth state variables
+					uint8_t  authD8 = *(volatile uint8_t*)0xF78FD8; // sub_E1800: auth flag
+					uint32_t authDC = *(volatile uint32_t*)0xF78FDC; // sub_E17E0: user_id
+					uint8_t  authD6 = *(volatile uint8_t*)0xF78FD6; // sub_E1830: regist flag
+					uint32_t authE4 = *(volatile uint32_t*)0xF78FE4; // network FSM state
+					// Board struct dump (0xAF2634+)
+					uint8_t* bs = (uint8_t*)0xAF2634;
+					QOD_LOG("SEL-OBS: funcID=%u sm=%u err=%u pend=%08X | prof[4]=%u [5]=%u [8]=%u [85]=%u [86]=%u | net=%u/%u fw=%u.%02u | init=%u/%u hw=%u | auth: d8=%u dc=%u d6=%u fsm=%u | cb=%08X draw=%08X",
+						funcID, sm, a93720, a93684,
+						bs[4], bs[5], bs[8], bs[85], bs[86],
+						netSt, netErr, fwMaj, fwMin,
+						initSt, initSub, initHw,
+						authD8, authDC, authD6, authE4,
+						tcb28, tcb24);
+				}
+			}
+		}
+
+		// ── CARD AUTH BYPASS: force task 7 transition ──────────
+		// The selector update callback at 0x74370 checks:
+		//   if (*(byte*)*0x6842E0 & 0x02) → sub_72FC0(7)
+		//   if (*(dword*)*0x6842E0 & 0x10) → sub_72FC0(4)
+		// sub_72FC0(N) sets dword_A93684 = 36*N + 0x2FAA08.
+		// For task 7: A93684 = 0x2FAB04.
+		//
+		// Setting the card object flag didn't work because the
+		// selector callback may be a one-shot coroutine init, not a
+		// per-frame tick. Instead, directly queue task 7 by writing
+		// A93684 = 0x2FAB04, which the main dispatcher (sub_72EE0)
+		// picks up on the next frame.
+		{
+			static int authBypassCtr = 0;
+			static bool authBypassDone = false;
+			uint32_t t80b = *(volatile uint32_t*)0xA93680;
+			if (t80b == 0x002FAAE0 && g_QodCardInserted && !authBypassDone) {
+				++authBypassCtr;
+				// Wait ~3 seconds (180 frames) to let selector fully init
+				if (authBypassCtr == 180) {
+					// Restore prof[4] = 1 (overwritten by save data load)
+					*(volatile uint8_t*)0xAF2638 = 1;
+
+					// Set card object flags bit 1 (for any checks elsewhere)
+					uintptr_t cardObj = *(volatile uintptr_t*)0x6842E0;
+					if (cardObj) {
+						*(volatile uint8_t*)cardObj |= 0x02;
+					}
+
+					// DIRECT task queue: set A93684 = task 7 entry
+					// sub_72FC0(7): A93684 = 4 * (9 * 7) + 0x2FAA08 = 0x2FAB04
+					*(volatile uint32_t*)0xA93684 = 0x002FAB04;
+
+					authBypassDone = true;
+					QOD_LOG("AUTH-BYPASS: queued task 7 via A93684=0x2FAB04 | prof4=1 | cardFlags=%08X",
+						cardObj ? *(volatile uint32_t*)cardObj : 0);
+				}
+			} else if (t80b != 0x002FAAE0) {
+				authBypassCtr = 0;
+			}
+		}
+
+		// ── FUNC4 logger: watch funcID=4 (task80=002FAA98) ───
+		{
+			static int f4Ctr = 0;
+			uint32_t t80f = *(volatile uint32_t*)0xA93680;
+			if (t80f == 0x002FAA98 && (++f4Ctr % 15) == 0) {
+				uintptr_t cardObj = *(volatile uintptr_t*)0x6842E0;
+				uint32_t objFlags = cardObj ? *(volatile uint32_t*)cardObj : 0xFFFFFFFF;
+				uint8_t* prof = (uint8_t*)0xAF2634;
+				QOD_LOG("FUNC4: ctr=%d objFlags=%08X prof[4]=%d prof[5]=%d prof[8]=%d A93684=%08X timer=%.2f",
+					f4Ctr, objFlags, prof[4], prof[5], prof[8],
+					*(volatile uint32_t*)0xA93684, *(volatile float*)0xA93670);
+			} else if (t80f != 0x002FAA98) {
+				f4Ctr = 0;
+			}
+		}
+
+		// ── EXPERIMENT: confirm funcID=4 intro dialog with a tap ─
+		// (DISABLED) Center-tap on the funcID4 dialog cancels it back
+		// to the selector. The no-tap path naturally times out and
+		// proceeds to FAB4C, so do NOT auto-tap here.
+		#if 0
+		{
+			static bool sawSelector = false;
+			static int f4Confirm = 0;
+			static int f4TapsLeft = 3;
+			uint32_t t80c = *(volatile uint32_t*)0xA93680;
+			if (t80c == 0x002FAAE0) sawSelector = true;
+			if (t80c == 0x002FAA98 && sawSelector && f4TapsLeft > 0) {
+				if (++f4Confirm >= 90) { // ~1.5s dwell, then tap
+					f4Confirm = 0;
+					f4TapsLeft--;
+					g_QodAutoTouchCountdown = 6;
+					int32_t dlgId = *(volatile int32_t*)0xA93748;
+					QOD_LOG("F4-CONFIRM: tapping funcID4 dialog (tapsLeft=%d dlgId=%d)",
+						f4TapsLeft, dlgId);
+				}
+			} else if (t80c != 0x002FAA98) {
+				f4Confirm = 0;
+			}
+		}
+		#endif
+
 		diagCount++;
 		if ((diagCount % 125) == 0) {
 			uint32_t t80 = *(volatile uint32_t*)0xA93680;
-			QOD_LOG("DIAG state=%d sub=%d | MB=%d IO=%d NET=%d DL=%d NC=%d | task80=%08X A93684=%08X e+12=%d timer=%.2f gate7=%d swap=%u",
+			uint32_t regSt = *(volatile uint32_t*)0xC592C4;
+			uint32_t regTm = *(volatile uint32_t*)0xC592C8;
+			uint8_t cardPr = *(volatile uint8_t*)0xC592BE;
+			QOD_LOG("DIAG state=%d sub=%d | MB=%d IO=%d NET=%d DL=%d NC=%d | task80=%08X A93684=%08X sm=%d timer=%.2f done=%d swap=%u | reg: s=%d t=%d card=%d",
 				*(volatile uint32_t*)0x8D1970, *(volatile uint32_t*)0x8D1974,
 				*(volatile uint32_t*)0x8D1990, *(volatile uint32_t*)0x8D1984,
 				*(volatile uint32_t*)0x8D197C, *(volatile uint32_t*)0x8D1998,
 				*(volatile uint32_t*)0x8D199C,
 				t80,
 				*(volatile uint32_t*)0xA93684,
-				(t80 >= 0x002FAA08 && t80 <= 0x002FAAE0) ? *(volatile int32_t*)(t80 + 12) : -1,
+				*(volatile uint32_t*)0xA93744,
 				*(volatile float*)0xA93670,
-				*(volatile uint8_t*)0x8D39FC,
-				g_D3DSwapCounter);
+				*(volatile uint8_t*)0xA93675,
+				g_D3DSwapCounter,
+				regSt, regTm, cardPr);
 		}
 
 		// ── Thread EIP dump — find where game thread is blocked ──
@@ -1051,34 +1645,32 @@ static DWORD WINAPI QodPeripheralGuardThread(LPVOID) {
 				selectorStuckTimer++;
 				if (selectorStuckTimer > 62) shouldDump = true;
 			}
-			static bool dumpedAtFAB04 = false;
-			uint32_t curTask = *(volatile uint32_t*)0xA93680;
-			if (!dumpedAtFAB04 && curTask > 0x002FAAE0 && curTask <= 0x002FAB30) {
-				static int fab04Timer = 0;
-				fab04Timer++;
-				if (fab04Timer > 125) { // ~2 seconds to let it settle
-					dumpedAtFAB04 = true;
-					shouldDump = true;
-					// Dump code at 0x29A80-0x29B20 (push buffer spin loop area)
-					QOD_LOG("PUSH BUFFER CODE DUMP (0x29A80-0x29B20):");
-					for (uint32_t base = 0x29A80; base < 0x29B20; base += 16) {
-						uint8_t buf[16];
-						memcpy(buf, (void*)base, 16);
-						QOD_LOG("  %05X: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
-							base, buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7],
-							buf[8],buf[9],buf[10],buf[11],buf[12],buf[13],buf[14],buf[15]);
+			// ── Card reg: monitor reboot redirect progress ────
+			// The reboot CALL at 0x6E94C is now redirected to set A93684
+			// and call sub_72F10. Guard thread just monitors for logging.
+			{
+				uint32_t curTask80 = *(volatile uint32_t*)0xA93680;
+				static int cardRegFrameCount = 0;
+				if (curTask80 >= 0x002FAB04 && curTask80 <= 0x002FAB30) {
+					cardRegFrameCount++;
+					uint32_t regSt  = *(volatile uint32_t*)0xC592C4;
+					uint32_t regTmr = *(volatile uint32_t*)0xC592C8;
+
+					if (cardRegFrameCount <= 30 || (cardRegFrameCount % 60) == 0) {
+						QOD_LOG("CARDREG: frame=%d C592C4=%d C592C8=%d A93684=%08X task80=0x%08X",
+						        cardRegFrameCount, regSt, regTmr,
+						        *(volatile uint32_t*)0xA93684,
+						        curTask80);
 					}
-					// Also dump around 0x56E90 (main thread wait location)
-					QOD_LOG("MAIN LOOP CODE DUMP (0x56E80-0x56F00):");
-					for (uint32_t base = 0x56E80; base < 0x56F00; base += 16) {
-						uint8_t buf[16];
-						memcpy(buf, (void*)base, 16);
-						QOD_LOG("  %05X: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
-							base, buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7],
-							buf[8],buf[9],buf[10],buf[11],buf[12],buf[13],buf[14],buf[15]);
+				} else {
+					if (cardRegFrameCount > 0) {
+						QOD_LOG("CARDREG: task left FAB04 after %d frames, C592C4=%d, new task80=0x%08X",
+						        cardRegFrameCount, *(volatile uint32_t*)0xC592C4, curTask80);
 					}
+					cardRegFrameCount = 0;
 				}
 			}
+
 			if (shouldDump) {
 				if (!dumpedThreadEip) dumpedThreadEip = true;
 				DWORD myTid = GetCurrentThreadId();
@@ -1133,17 +1725,29 @@ static DWORD WINAPI QodPeripheralGuardThread(LPVOID) {
 	return 0;
 }
 
-// Touch panel emulation thread – maps mouse cursor to touch coordinates
-// Writes directly to the game's final touch output addresses that the
-// gameplay code reads:
-//   AD9520: calibrated X float (read by 0x9B909 → AC918C)
-//   AD9524: calibrated Y float (read by 0x9B920 → AC9190)
-//   AD9530: pen status byte (read by 0xA88EB, bit 0 = pen down)
-// Also populates the intermediate parsed data at AD94FC+0x10..0x34
-// and the pen status at AD9530 for the touch serial parse layer.
+// Touch panel emulation thread – maps mouse cursor to touch coordinates.
+//
+// The game's touch processing chain (sub_BC4D0, called from sub_BD0D0):
+//   1. sub_BC9B0: copies AD9530→AD9531, zeros AD9532
+//   2. sub_BC520→sub_BCA50: process serial packets (none in emulation)
+//   3. State machine: reads AD9531 (prev state) and AD9532 (new data flag)
+//
+// Since no serial data arrives, AD9532 stays 0, the debounce counter
+// never activates, and AD9530 stays at 0. Writing to AD9531/AD9532 from
+// a thread races with sub_BC9B0 which clears them each frame.
+//
+// Solution: write directly to AD9530 (final state) AND keep the debounce
+// counter (AD952C) high so the state machine's "debounce > 0" branch
+// preserves our value instead of overriding it.
+//
+// Touch state values:  0=idle, 1=held, 2=pressed, 4=released
+// sub_A88E0() checks (AD9530 & 1) → true for state 1 (held)
 static DWORD WINAPI QodTouchThread(LPVOID) {
 	Sleep(2000); // wait for D3D window
 	QOD_LOG("Touch emulation thread started");
+
+	bool prevMouseDown = false;
+
 	while (true) {
 		HWND hWnd = g_hEmuWindow;
 		if (hWnd) {
@@ -1160,26 +1764,68 @@ static DWORD WINAPI QodTouchThread(LPVOID) {
 
 			uint16_t rawX = (uint16_t)fx;
 			uint16_t rawY = (uint16_t)fy;
-			// BC7F0 inverts Y: invertedY = 0xFFF - rawY
 			float invertedY = 4095.0f - fy;
 
-			// ── Game's final touch coordinate outputs ──
-			// These are read by the gameplay code at 0x9B909/0x9B920.
-			*(volatile float*)0xAD9520 = fx;          // calibrated X
-			*(volatile float*)0xAD9524 = invertedY;   // calibrated Y (inverted)
-			// Pen status byte: bit 0 = touching (read by 0xA88EB)
-			*(volatile uint8_t*)0xAD9530 = mouseDown ? 1 : 0;
+			// ── Synthetic auto-touch override ──
+			// When g_QodAutoTouchCountdown > 0, simulate a tap at screen center.
+			// Countdown: 6→2 = held, 1 = released, 0 = done.
+			int autoTouch = g_QodAutoTouchCountdown;
+			if (autoTouch > 0) {
+				g_QodAutoTouchCountdown = autoTouch - 1;
+				mouseDown = (autoTouch > 1); // held for frames 6..2, released at 1
+				fx = 2048.0f;
+				fy = 2048.0f;
+				rawX = 2048;
+				rawY = 2048;
+				invertedY = 2048.0f;
+			}
+
+			// ── Final touch state (AD9530) ──
+			// Write the state directly, matching the state machine's values.
+			// Also set AD9531 (prev state copy) to match, and AD9532 (new
+			// data flag) + AD952C (debounce counter) to prevent the state
+			// machine from overriding our value.
+			uint8_t touchState;
+			if (mouseDown && !prevMouseDown) {
+				touchState = 2; // pressed
+			} else if (mouseDown) {
+				touchState = 1; // held
+			} else if (!mouseDown && prevMouseDown) {
+				touchState = 4; // released
+			} else {
+				touchState = 0; // idle
+			}
+
+			*(volatile uint8_t*)0xAD9530 = touchState;
+			*(volatile uint8_t*)0xAD9531 = touchState;
+			*(volatile uint8_t*)0xAD9532 = (mouseDown || touchState == 4) ? 1 : 0;
+			*(volatile int32_t*)0xAD952C = 10; // keep debounce counter alive
+
+			{
+				static uint8_t s_lastState = 0xFF;
+				if (touchState != s_lastState) {
+					QOD_LOG("TOUCH: state=%d ADAF08=0x%02X AD95E8=%d mouse=%d X=%.0f Y=%.0f",
+						touchState, *(volatile uint8_t*)0xADAF08,
+						*(volatile int32_t*)0xAD95E8,
+						mouseDown ? 1 : 0, fx, invertedY);
+					s_lastState = touchState;
+				}
+			}
+
+			prevMouseDown = mouseDown;
+
+			// ── Calibrated coordinate outputs ──
+			*(volatile float*)0xAD9520 = fx;
+			*(volatile float*)0xAD9524 = invertedY;
 
 			// ── Intermediate parsed data at AD94FC ──
-			// These mirror what BC7F0 would write from serial packets.
-			*(volatile uint16_t*)0xAD950C = rawX;     // AD94FC+0x10: X raw
-			*(volatile uint16_t*)0xAD950E = rawY;     // AD94FC+0x12: Y raw
-			*(volatile uint16_t*)0xAD9510 = mouseDown ? 1 : 0; // +0x14: Z
-			*(volatile float*)0xAD9514 = fx;          // AD94FC+0x18: X float
-			*(volatile float*)0xAD9518 = invertedY;   // AD94FC+0x1C: Y float
-			*(volatile float*)0xAD951C = mouseDown ? 1.0f : 0.0f; // +0x20: Z
+			*(volatile uint16_t*)0xAD950C = rawX;
+			*(volatile uint16_t*)0xAD950E = rawY;
+			*(volatile uint16_t*)0xAD9510 = mouseDown ? 1 : 0;
+			*(volatile float*)0xAD9514 = fx;
+			*(volatile float*)0xAD9518 = invertedY;
+			*(volatile float*)0xAD951C = mouseDown ? 1.0f : 0.0f;
 
-			// Keep data-processing flag idle so BD020 returns true
 			*(volatile uint32_t*)0xAD93FC = 0;
 		}
 		Sleep(16);
@@ -1242,8 +1888,12 @@ void ApplyQuestOfDPatches(uint64_t xbeHash, uint32_t imageSize)
 	// embedded in the XBE (sub_3E910, sub_3F510, sub_3FC60, etc.).
 	// Patching them causes "Error 02 - Main board malfunctioning."
 	// Network progress relies on correct FPGA mailbox responses instead.
+	// This is still the game process, so mark it active before returning:
+	// MediaBoard uses this flag to select the game's IRQ10 response path and
+	// to suppress SEGABOOT-only forced QuickReboot handling.
 	if (xbeHash == 0xE9EE166CCCBD7847ULL) {
-		QOD_LOG("Type-3 boot hash detected — skipping patches (SEGABOOT library)");
+		g_QodGamePatchesActive = true;
+		QOD_LOG("Type-3 game hash detected — using mailbox/IRQ path without scan patches");
 		return;
 	}
 
@@ -1268,11 +1918,60 @@ void ApplyQuestOfDPatches(uint64_t xbeHash, uint32_t imageSize)
 		};
 		uintptr_t va = ScanXbe(kBoardDetectPat, sizeof(kBoardDetectPat), imageSize);
 		if (va) {
-			static const uint8_t kAlways1[] = { 0xB0,0x01, 0xC3 };
-			PatchXbeBytes(va, kAlways1, sizeof(kAlways1));
-			QOD_LOG("Board detection forced at 0x%08X", (unsigned)va);
+			// Extract the CALL target to find sub_BE630
+			int32_t callRel = *(int32_t*)(va + 1);
+			uintptr_t subGetBoard = va + 5 + callRel;
+			// sub_BE630 is: MOV EAX, imm32 (B8 xx xx xx xx); RET
+			if (*(uint8_t*)subGetBoard == 0xB8) {
+				uintptr_t boardStruct = *(uint32_t*)(subGetBoard + 1);
+				// Set board type byte [+4] = 1 (Chihiro) so ALL
+				// code that checks board type (not just sub_6E660)
+				// sees the correct value from the very start.
+				*(uint8_t*)(boardStruct + 4) = 1;
+				QOD_LOG("Board type byte set to 1 at 0x%08X", (unsigned)(boardStruct + 4));
+			}
+
+			// NOTE: sub_6E660 is left NATURAL (returns 1 on IC cabinet).
+			// Earlier experiments patched it to 0 and patched sub_AEF40 to
+			// -7 to force the sub_72DF0 "start" for-loop. That was based on
+			// the WRONG premise that phase 15 / task 0x2FAC24 is gameplay.
+			// In fact sub_72DF0 is an I/O HEALTH MONITOR and phase 15 queues
+			// the ERROR-display task (draw sub_74860) which renders
+			// "Error 11 / JVS I/O board not connected" when dword_A93720==1.
+			// Forcing that path only produced Error 11. Patches reverted so
+			// the selector stays on the stable mode-select screen.
 		} else {
 			QOD_LOG("Board detection pattern not found!");
+		}
+	}
+
+	// ═══════════════════════════════════════════════════════════════
+	// Prevent sub_74B20 from setting game-exit flag (byte_8D39FC)
+	// NOP the CALL sub_95020 at 0x74B2E (E8 ED 04 02 00)
+	// On Chihiro this call should never execute (sub_6E660 check
+	// skips it), but something triggers it during STARTUP.
+	// ═══════════════════════════════════════════════════════════════
+	{
+		static const uint8_t kExitCallPat[] = {
+			0xE8, 0xFF, 0xFF, 0xFF, 0xFF,  // CALL sub_95020
+			0x8A, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF  // next instr context
+		};
+		// sub_74B20 starts with: CALL sub_6D260; MOV byte [A93675], 1; CALL sub_95020
+		// Scan for the CALL followed by the specific next bytes
+		// Simpler: directly patch at known address
+		if (*(uint8_t*)0x74B2E == 0xE8) {
+			int32_t callRel = *(int32_t*)0x74B2F;
+			uintptr_t callTarget = 0x74B33 + callRel;
+			QOD_LOG("Exit flag CALL at 0x74B2E targets 0x%08X", (unsigned)callTarget);
+			// Verify it targets the exit flag setter (sub_95020)
+			if (callTarget == 0x95020) {
+				DWORD oldProt;
+				if (VirtualProtect((void*)0x74B2E, 5, PAGE_EXECUTE_READWRITE, &oldProt)) {
+					memset((void*)0x74B2E, 0x90, 5); // NOP * 5
+					VirtualProtect((void*)0x74B2E, 5, oldProt, &oldProt);
+					QOD_LOG("NOP'd exit flag CALL at 0x74B2E");
+				}
+			}
 		}
 	}
 
@@ -1324,6 +2023,14 @@ void ApplyQuestOfDPatches(uint64_t xbeHash, uint32_t imageSize)
 			QOD_LOG("Baseboard init error pattern not found!");
 		}
 	}
+
+	// ═══════════════════════════════════════════════════════════════
+	// NOTE: sub_BF410 save timer patch REMOVED.
+	// sub_BF410 returning 1 during init causes sub_6E720() to save
+	// and reboot, hanging the game loop. The real fix is to NOT set
+	// byte_C592BE=1 (satellite dispenser flag) so the card-reg SM
+	// takes the standalone path instead.
+	// ═══════════════════════════════════════════════════════════════
 
 	// ═══════════════════════════════════════════════════════════════
 	// LinkOK — return 1 (link OK)
@@ -1640,8 +2347,10 @@ void ApplyQuestOfDPatches(uint64_t xbeHash, uint32_t imageSize)
 
 	// sub_73D70 — prev task cleanup / shared CRI cleanup.
 	// Called from sub_72FE0 during task transitions and from state 14 init.
-	// Calls CRI wait functions (sub_6D3A0, sub_6D3D0) that block.
-	// Must be RET'd to prevent state 14 hang.
+	// At boot time, sub_6D3D0 (which it calls first) is RET'd, so it won't
+	// block. But sub_29070/sub_6A2C0/sub_6CB30 may not be safe before init
+	// completes. RET'd at boot; original bytes restored at state >= 15 by
+	// the guard thread so the DIALOG system and cleanup logic can run.
 	{
 		DWORD oldProt;
 		if (VirtualProtect((void*)0x73D70, 1, PAGE_EXECUTE_READWRITE, &oldProt)) {
@@ -1897,14 +2606,113 @@ void ApplyQuestOfDPatches(uint64_t xbeHash, uint32_t imageSize)
 	}
 
 	// ═══════════════════════════════════════════════════════════════
-	// Hook HalReturnToFirmware to intercept QuickReboot
-	// After reading a blank card, the game reboots to "register"
-	// with the server. Without a server, this loops forever.
-	// We suppress the reboot and save card data.
+	// Card registration fix.
+	//
+	// Task table (0x24 bytes per entry):
+	//   +0x08 = funcID, +0x18 = init, +0x1C = update, +0x20 = draw
+	//   FAAE0 = funcID=6 (SELECTOR, "insert card" screen)
+	//   FAB04 = funcID=7 (card registration task)
+	//   FAB28 = funcID=8 (gameplay)
+	//
+	// On real Chihiro hardware the card registration flow is:
+	//   1. F3 inserts card → funcID=6 (mode select) checks sub_1923A0
+	//   2. sub_1923A0 returns true if card needs registration (bit 1)
+	//   3. If true → transition to funcID=7 (card reg via server)
+	//   4. Server registers card → reboot → come back to funcID=6
+	//
+	// In emulation there's no server.  Fix:
+	//   1. Patch sub_1923A0 to always return 0 so funcID=7 is never
+	//      entered.  The game stays at funcID=6 (mode select) and the
+	//      card is treated as already registered, enabling the menus.
+	//      The game stays at funcID=6 (mode select) with the card
+	//      recognized, enabling the mode select buttons.
+	//   2. Redirect reboot CALL at 0x6E94C → QodRebootRedirect as
+	//      safety net (in case C592C4 reaches state 3 somehow).
 	// ═══════════════════════════════════════════════════════════════
 	if (game == QOD_TBK && xbeHash != 0xE9EE166CCCBD7847ULL) {
+		// --- Skip card registration transition (patch mode select update) ---
+		// funcID=6 update at 0x74370:
+		//   074370  CALL sub_1923A0   (card needs registration?)
+		//   074375  TEST AL, AL
+		//   074377  JZ 0x74383        ← if 0, skip funcID=7
+		//   074379  MOV EAX, 0x7      ← funcID=7 (card reg, FREEZES)
+		//   07437E  JMP 0x72FC0       ← transition
+		//   074383  CALL sub_195430   ← mode selected check
+		//   ...
+		// We patch the JZ at 0x74377 to unconditional JMP (EB 0A)
+		// so funcID=7 is NEVER entered regardless of sub_1923A0's result.
+		// This lets sub_1923A0 function normally (card state machine works)
+		// while the game stays safe from the freezing funcID=7 path.
+		{
+			// At VA 0x74377: original is 74 0A (JZ +0x0A), change to EB 0A (JMP +0x0A)
+			uint8_t origJZ[] = { 0x74, 0x0A };
+			if (memcmp((void*)0x74377, origJZ, 2) == 0) {
+				uint8_t newJMP[] = { 0xEB, 0x0A };
+				PatchXbeBytes(0x74377, newJMP, 2);
+				QOD_LOG("Patched mode select update: JZ->JMP at 0x74377 (skip funcID=7 transition)");
+			} else {
+				QOD_LOG("WARNING: JZ at 0x74377 not found (bytes=%02X %02X)",
+					*(uint8_t*)0x74377, *(uint8_t*)0x74378);
+			}
+		}
+
+		// --- Force sub_1923A0 (needs-registration check) to return 0 ---
+		// sub_1923A0 reads bit 1 of the card object and returns it as the
+		// "this card must be registered" flag.  With no Chihiro network
+		// server, registration (funcID=7) can never complete and the game
+		// reboots.  Presenting every card as already-registered keeps the
+		// SELECTOR on its interactive mode-select screen.
+		//   Original: A1 E0 42 68 00  mov eax,[6842E0]
+		//             8A 00           mov al,[eax]
+		//             D0 E8           shr al,1
+		//             24 01           and al,1
+		//             C3              ret
+		//   Patched:  32 C0 C3        xor al,al ; ret
+		{
+			static const uint8_t origReg[] = { 0xA1, 0xE0, 0x42, 0x68, 0x00, 0x8A, 0x00 };
+			if (memcmp((void*)0x1923A0, origReg, sizeof(origReg)) == 0) {
+				static const uint8_t retZero[] = { 0x32, 0xC0, 0xC3 };
+				PatchXbeBytes(0x1923A0, retZero, sizeof(retZero));
+				QOD_LOG("Patched sub_1923A0 -> return 0 (card always treated as registered)");
+			} else {
+				QOD_LOG("WARNING: sub_1923A0 prologue not found (bytes=%02X %02X %02X)",
+					*(uint8_t*)0x1923A0, *(uint8_t*)0x1923A1, *(uint8_t*)0x1923A2);
+			}
+		}
+
+		// --- Reboot redirect (safety net) ---
+		// If C592C4 state machine reaches state 3 before the card reg
+		// update fires, it calls sub_6E720 (reboot).  Redirect to our
+		// handler that transitions to gameplay instead.
+		{
+			static const uint8_t kRebootCall[] = { 0xE8, 0xCF, 0xFD, 0xFF, 0xFF };
+			if (memcmp((void*)0x6E94C, kRebootCall, 5) == 0) {
+				uintptr_t redirAddr = (uintptr_t)&QodRebootRedirect;
+				int32_t rel32 = (int32_t)(redirAddr - (0x6E94C + 5));
+				uint8_t newCall[5];
+				newCall[0] = 0xE8;
+				*(int32_t*)&newCall[1] = rel32;
+				PatchXbeBytes(0x6E94C, newCall, 5);
+				QOD_LOG("Patched reboot CALL at 0x6E94C → QodRebootRedirect (safety net)");
+			} else {
+				QOD_LOG("WARNING: CALL sub_6E720 at 0x6E94C not found");
+			}
+		}
+
+		// Step 4: Bypass sub_94F60 — force early return (safety)
+		{
+			if (*(uint8_t*)0x94F70 == 0x74 && *(uint8_t*)0x94F71 == 0x7A) {
+				static const uint8_t kJmp = 0xEB;
+				PatchXbeBytes(0x94F70, &kJmp, 1);
+				QOD_LOG("Bypassed sub_94F60 at 0x94F70 (JZ→JMP)");
+			} else {
+				QOD_LOG("WARNING: sub_94F60 JZ at 0x94F70 not found (bytes=%02X %02X)",
+					*(uint8_t*)0x94F70, *(uint8_t*)0x94F71);
+			}
+		}
+
 		g_pfnQuickRebootInterceptor = QodQuickRebootInterceptor;
-		QOD_LOG("QuickReboot interceptor installed (callback in HalReturnToFirmware)");
+		QOD_LOG("Card registration patches applied (trampoline approach)");
 	}
 
 	// ═══════════════════════════════════════════════════════════════

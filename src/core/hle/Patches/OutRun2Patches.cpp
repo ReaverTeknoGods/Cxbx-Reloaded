@@ -78,6 +78,8 @@ static const uint64_t kOR2SPHashes[] = {
 
 enum Or2Game { OR2_NONE, OR2_A, OR2_B, OR2_SP };
 
+bool g_ChihiroOutRun2Game = false;
+
 static Or2Game IdentifyOr2Game(uint64_t xbeHash)
 {
 	for (auto h : kOR2Hashes)   if (xbeHash == h) return OR2_A;
@@ -96,6 +98,7 @@ bool IsOutRun2Xbe(uint64_t xbeHash)
 void ApplyOutRun2Patches(uint64_t xbeHash, uint32_t imageSize)
 {
 	Or2Game game = IdentifyOr2Game(xbeHash);
+	g_ChihiroOutRun2Game = game != OR2_NONE;
 	const char* gameName = "???";
 	if (game == OR2_A)  gameName = "OutRun 2 (GDX-0004A)";
 	if (game == OR2_B)  gameName = "OutRun 2 Rev B (GDX-0004B)";

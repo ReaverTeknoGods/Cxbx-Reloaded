@@ -30,6 +30,8 @@
 #include "Logging.h"
 #include "common\Settings.hpp"
 #include "EmuShared.h"
+#include <cstdint>
+#include <mutex>
 
 // For thread_local, see : https://en.cppreference.com/w/cpp/language/storage_duration
 // TODO : Use Boost.Format https://www.boost.org/doc/libs/1_53_0/libs/format/index.html
@@ -106,7 +108,12 @@ const char* g_EnumModules2String[to_underlying(CXBXR_MODULE::MAX)] = {
 };
 std::atomic_int g_CurrentLogLevel = to_underlying(LOG_LEVEL::INFO);
 std::atomic_bool g_CurrentLogPopupTestCase = true;
+bool g_FullTraceEnabled = false;
 static bool g_disablePopupMessages = false;
+static std::atomic<uint64_t> g_fullTraceSequence = 0;
+static LARGE_INTEGER g_fullTraceFrequency = {};
+static LARGE_INTEGER g_fullTraceStart = {};
+static std::once_flag g_fullTraceClockOnce;
 
 const char log_debug[] = "DEBUG: ";
 const char log_info[]  = "INFO : ";
@@ -114,6 +121,37 @@ const char log_warn[]  = "WARN : ";
 const char log_error[] = "ERROR: ";
 const char log_fatal[] = "FATAL: ";
 const char log_unkwn[] = "???? : ";
+
+std::string log_trace_prefix()
+{
+	if (!g_FullTraceEnabled) {
+		return "";
+	}
+
+	std::call_once(g_fullTraceClockOnce, []() {
+		QueryPerformanceFrequency(&g_fullTraceFrequency);
+		QueryPerformanceCounter(&g_fullTraceStart);
+	});
+
+	LARGE_INTEGER now = {};
+	QueryPerformanceCounter(&now);
+	const uint64_t sequence =
+		g_fullTraceSequence.fetch_add(1, std::memory_order_relaxed) + 1;
+	const long long elapsedTicks = now.QuadPart - g_fullTraceStart.QuadPart;
+	const long long elapsedMicros = g_fullTraceFrequency.QuadPart > 0
+		? (elapsedTicks * 1000000LL) / g_fullTraceFrequency.QuadPart
+		: 0;
+
+	char prefix[80] = {};
+	snprintf(
+		prefix,
+		sizeof(prefix),
+		"[TRACE %010llu +%lld.%06llds] ",
+		static_cast<unsigned long long>(sequence),
+		elapsedMicros / 1000000LL,
+		elapsedMicros % 1000000LL);
+	return prefix;
+}
 
 // Do not use EmuLogOutput function outside of this file.
 void EmuLogOutput(CXBXR_MODULE cxbxr_module, LOG_LEVEL level, const char *szWarningMessage, const va_list argp)
@@ -142,7 +180,7 @@ void EmuLogOutput(CXBXR_MODULE cxbxr_module, LOG_LEVEL level, const char *szWarn
 			break;
 	}
 
-	std::cout << _logThreadPrefix << level_str
+	std::cout << log_trace_prefix() << _logThreadPrefix << level_str
 		<< g_EnumModules2String[to_underlying(cxbxr_module)];
 
 	vfprintf(stdout, szWarningMessage, argp);
@@ -188,7 +226,7 @@ void EmuLogEx(CXBXR_MODULE cxbxr_module, LOG_LEVEL level, const char *szWarningM
 
 #ifdef NDEBUG
 	// In Release builds, suppress all DEBUG-level messages — they're too noisy for production.
-	if (level == LOG_LEVEL::DEBUG) {
+	if (level == LOG_LEVEL::DEBUG && !g_FullTraceEnabled) {
 		return;
 	}
 #endif
@@ -242,6 +280,25 @@ void log_set_config(int LogLevel, unsigned int* LoggedModules, bool LogPopupTest
 		}
 	}
 	g_CurrentLogPopupTestCase = LogPopupTestCase;
+}
+
+void log_enable_full_trace()
+{
+#if defined(_DEBUG)
+	g_FullTraceEnabled = true;
+	g_CurrentLogLevel = to_underlying(LOG_LEVEL::DEBUG);
+	g_CurrentLogPopupTestCase = false;
+	for (unsigned int index = to_underlying(CXBXR_MODULE::CXBXR);
+		index < to_underlying(CXBXR_MODULE::MAX);
+		index++) {
+		g_EnabledModules[index] = true;
+	}
+	g_bPrintfOn = true;
+#else
+	// Full tracing is an investigation-only facility. Keep the public Release
+	// runtime inert even if another caller accidentally requests it.
+	g_FullTraceEnabled = false;
+#endif
 }
 
 // Generate active log filter output.

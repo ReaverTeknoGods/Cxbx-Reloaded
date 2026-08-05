@@ -107,10 +107,15 @@ std::unordered_map<std::string, std::string> cliToMapPairs(char** argv, int argc
     map_pairs[cli_config::exec] = argv[0];
 
     for (int i = 1; i < argc; i++) {
-        // Check for forward slash to trigger pair bind.
+        // Accept both the traditional Windows "/key" spelling and the
+        // documented GNU-style "--key" spelling.
         std::string first = StripQuotes(argv[i]);
-        if (first.at(0) == str_slash_forward[0]) {
-            first = first.substr(1);
+        const bool hasForwardSlashPrefix =
+            !first.empty() && first.at(0) == str_slash_forward[0];
+        const bool hasDoubleDashPrefix =
+            first.size() > 2 && first.at(0) == '-' && first.at(1) == '-';
+        if (hasForwardSlashPrefix || hasDoubleDashPrefix) {
+            first = first.substr(hasDoubleDashPrefix ? 2 : 1);
             // Do not allow overwrite argv[0].
             if (!first.compare(cli_config::exec)) {
                 continue;
@@ -128,8 +133,11 @@ std::unordered_map<std::string, std::string> cliToMapPairs(char** argv, int argc
             // Check for forward slash to bind pair.
             else if (i + 1 < argc) {
                 std::string second = StripQuotes(argv[i + 1]);
-                // If next arg has a slash, then do a empty pair.
-                if (second.at(0) == str_slash_forward[0]) {
+                // If the next arg is another option, bind an empty value.
+                const bool secondIsOption =
+                    (!second.empty() && second.at(0) == str_slash_forward[0]) ||
+                    (second.size() > 2 && second.at(0) == '-' && second.at(1) == '-');
+                if (secondIsOption) {
                     map_pairs[first] = "";
                 }
                 // Otherwise, do the input pair.

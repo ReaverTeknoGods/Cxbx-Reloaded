@@ -114,6 +114,13 @@ bool HandleFirstLaunch()
 		int BootFlags = 0;
 		g_EmuShared->SetBootFlags(&BootFlags);
 	}
+	else {
+		// The replacement process has already been launched. Do not tear down
+		// render/guest memory while the old process still has running guest
+		// threads: they can execute from memory as it is being unmapped and
+		// crash before TerminateProcess is reached.
+		TerminateProcess(GetCurrentProcess(), 0);
+	}
 
 	// NOTE: This causes a hang when exiting while NV2A is processing
 	// This is okay for now: It won't leak memory or resources since TerminateProcess will free everything

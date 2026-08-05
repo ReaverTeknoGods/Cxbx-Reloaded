@@ -120,6 +120,7 @@ extern std::atomic_bool g_EnabledModules[to_underlying(CXBXR_MODULE::MAX)];
 extern const char* g_EnumModules2String[to_underlying(CXBXR_MODULE::MAX)];
 extern std::atomic_int g_CurrentLogLevel;
 extern std::atomic_bool g_CurrentLogPopupTestCase;
+extern bool g_FullTraceEnabled;
 
 // print out a log message to the console or kernel debug log file if level is high enough
 void EmuLogEx(CXBXR_MODULE cxbxr_module, LOG_LEVEL level, const char *szWarningMessage, ...);
@@ -132,6 +133,12 @@ extern inline void log_get_settings();
 extern inline void log_sync_config();
 
 void log_set_config(int LogLevel, unsigned int* LoggedModules, bool LogPopupTestCase);
+
+// Enables DEBUG output for every module and prefixes each record with a
+// process-local sequence number and monotonic timestamp. This is intentionally
+// opt-in because function-level tracing is extremely verbose.
+void log_enable_full_trace();
+std::string log_trace_prefix();
 
 void log_generate_active_filter_output(const CXBXR_MODULE cxbxr_module);
 
@@ -369,7 +376,7 @@ extern thread_local std::string _logThreadPrefix;
 	do { if(g_bPrintfOn) { \
 		bool _had_arg = false; \
 		std::stringstream msg; \
-		msg << _logThreadPrefix << _logFuncPrefix << "(";
+		msg << log_trace_prefix() << _logThreadPrefix << _logFuncPrefix << "(";
 
 #define LOG_FUNC_BEGIN \
 		LOG_INIT \
@@ -403,7 +410,7 @@ extern thread_local std::string _logThreadPrefix;
 	do { if(g_bPrintfOn) { \
 		bool _had_arg = false; \
 		std::stringstream msg; \
-		msg << _logThreadPrefix << _logFuncPrefix << " returns OUT {";
+		msg << log_trace_prefix() << _logThreadPrefix << _logFuncPrefix << " returns OUT {";
 
 #define LOG_FUNC_BEGIN_ARG_RESULT \
 		LOG_CHECK_ENABLED(LOG_LEVEL::DEBUG) { \
@@ -439,18 +446,18 @@ extern thread_local std::string _logThreadPrefix;
 
 // LOG_FUNC_RESULT logs the function return result
 #define LOG_FUNC_RESULT(r) \
-	std::cout << _logThreadPrefix << _logFuncPrefix << " returns " << _log_sanitize(r) << "\n";
+	std::cout << log_trace_prefix() << _logThreadPrefix << _logFuncPrefix << " returns " << _log_sanitize(r) << "\n";
 
 // LOG_FUNC_RESULT_TYPE logs the function return result using the overloaded << operator of the given type
 #define LOG_FUNC_RESULT_TYPE(type, r) \
-	std::cout << _logThreadPrefix << _logFuncPrefix << " returns " << (type)r << "\n";
+	std::cout << log_trace_prefix() << _logThreadPrefix << _logFuncPrefix << " returns " << (type)r << "\n";
 
 // LOG_FORWARD indicates that an api is implemented by a forward to another API
 #define LOG_FORWARD(api) \
 	LOG_INIT \
 	LOG_CHECK_ENABLED(LOG_LEVEL::DEBUG) { \
 		do { if(g_bPrintfOn) { \
-			std::cout << _logThreadPrefix << _logFuncPrefix << " forwarding to "#api"...\n"; \
+			std::cout << log_trace_prefix() << _logThreadPrefix << _logFuncPrefix << " forwarding to "#api"...\n"; \
 		} } while (0); \
 	}
 
@@ -462,7 +469,7 @@ extern thread_local std::string _logThreadPrefix;
 				LOG_CHECK_ENABLED(LOG_LEVEL::INFO) { \
 					LOG_THREAD_INIT \
 					LOG_FUNC_INIT(__func__) \
-					std::cout << _logThreadPrefix << "WARN: " << _logFuncPrefix << " ignored!\n"; \
+					std::cout << log_trace_prefix() << _logThreadPrefix << "WARN: " << _logFuncPrefix << " ignored!\n"; \
 					b_echoOnce = false; \
 				} \
 			} \
@@ -476,7 +483,7 @@ extern thread_local std::string _logThreadPrefix;
 				LOG_CHECK_ENABLED(LOG_LEVEL::INFO) { \
 					LOG_THREAD_INIT \
 					LOG_FUNC_INIT(__func__) \
-					std::cout << _logThreadPrefix << "WARN: " << _logFuncPrefix << " unimplemented!\n"; \
+					std::cout << log_trace_prefix() << _logThreadPrefix << "WARN: " << _logFuncPrefix << " unimplemented!\n"; \
 					b_echoOnce = false; \
 				} \
 			} \
@@ -490,7 +497,7 @@ extern thread_local std::string _logThreadPrefix;
 				LOG_CHECK_ENABLED(LOG_LEVEL::INFO) { \
 					LOG_THREAD_INIT \
 					LOG_FUNC_INIT(__func__) \
-					std::cout << _logThreadPrefix << "WARN: " << _logFuncPrefix << " incomplete!\n"; \
+					std::cout << log_trace_prefix() << _logThreadPrefix << "WARN: " << _logFuncPrefix << " incomplete!\n"; \
 					b_echoOnce = false; \
 				} \
 			} \
@@ -504,7 +511,7 @@ extern thread_local std::string _logThreadPrefix;
 				LOG_CHECK_ENABLED(LOG_LEVEL::INFO) { \
 					LOG_THREAD_INIT \
 					LOG_FUNC_INIT(__func__) \
-					std::cout << _logThreadPrefix << "WARN: " << _logFuncPrefix << " not supported!\n"; \
+					std::cout << log_trace_prefix() << _logThreadPrefix << "WARN: " << _logFuncPrefix << " not supported!\n"; \
 					b_echoOnce = false; \
 				} \
 			} \

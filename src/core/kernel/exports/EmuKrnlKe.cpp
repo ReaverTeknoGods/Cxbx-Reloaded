@@ -93,6 +93,7 @@ namespace NtDll
 #include <thread>
 #include <windows.h>
 #include <map>
+#include <mutex>
 
 // Copied over from Dxbx. 
 // TODO : Move towards thread-simulation based Dpc emulation
@@ -105,6 +106,12 @@ typedef struct _DpcData {
 
 DpcData g_DpcData = { 0 }; // Note : g_DpcData is initialized in InitDpcData()
 std::atomic_flag xbox::KeSystemTimeChanged;
+
+namespace
+{
+	std::mutex g_CooperativeSelfSuspendMutex;
+	std::map<xbox::PKTHREAD, HANDLE> g_CooperativeSelfSuspendEvents;
+}
 
 xbox::ulonglong_xt LARGE_INTEGER2ULONGLONG(xbox::LARGE_INTEGER value)
 {
@@ -488,6 +495,9 @@ void ExecuteDpcQueue()
 		// RemoveEntryList only checks for nullptr, so a small non-null value crashes.
 		xbox::PLIST_ENTRY pHead = g_DpcData.DpcQueue.Flink;
 		if ((uintptr_t)pHead < 0x10000u) {
+			EmuLog(LOG_LEVEL::WARNING,
+				"ExecuteDpcQueue: corrupt queue head Flink=%p -- resetting queue",
+				pHead);
 			InitializeListHead(&g_DpcData.DpcQueue);
 			break;
 		}
@@ -507,9 +517,17 @@ void ExecuteDpcQueue()
 		pkdpc = CONTAINING_RECORD(RemoveHeadList(&(g_DpcData.DpcQueue)), xbox::KDPC, DpcListEntry);
 		// Mark it as no longer linked into the DpcQueue
 		pkdpc->Inserted = FALSE;
-		// A title handoff can clear a queued DPC before this host thread drains
-		// it. Discard only the invalid entry instead of calling address zero.
+		// A Chihiro media-board title handoff can release or clear a queued DPC
+		// before this host thread drains it. This is easier to hit when the
+		// Windows process runs through Box64 because the guest and DPC threads
+		// advance at different rates. Calling a cleared DeferredRoutine jumps to
+		// address zero and terminates the thread that must finish loading the
+		// next XBE. Discard only the invalid entry while the queue lock is still
+		// held; valid DPC ordering and execution remain unchanged.
 		if (pkdpc->DeferredRoutine == nullptr) {
+			EmuLog(LOG_LEVEL::WARNING,
+				"ExecuteDpcQueue: DPC object %p has a null DeferredRoutine -- skipping",
+				pkdpc);
 			continue;
 		}
 		// Set DpcRoutineActive to support KeIsExecutingDpc:
@@ -772,9 +790,12 @@ XBSYSAPI EXPORTNUM(99) xbox::ntstatus_xt NTAPI xbox::KeDelayExecutionThread
 	// Because user APCs from NtQueueApcThread are now handled by the kernel, we need to wait for them ourselves
 	// We can't remove NtDll::NtDelayExecution until all APCs queued by Io are implemented by our kernel as well
 	// Test case: Metal Slug 3
-	// The Xbox Win32 layer converts INFINITE to INT64_MIN. CRI uses that value
-	// for an alertable worker wait; negating it overflows and returning early
-	// makes the worker repeatedly consume the same streaming request.
+	//
+	// The Xbox Win32 compatibility layer converts INFINITE milliseconds
+	// (0xFFFFFFFF) to INT64_MIN. CRI uses that value for an alertable worker
+	// wait which an APC later releases. Treat it exactly like a null timeout;
+	// attempting to negate it overflows, while returning immediately makes the
+	// CRI worker spin and repeatedly read the same movie data.
 	PLARGE_INTEGER effectiveInterval = Interval;
 	if (g_BetaConfig.llong_min_timeout_fix &&
 		effectiveInterval != nullptr &&
@@ -1452,6 +1473,8 @@ XBSYSAPI EXPORTNUM(124) xbox::long_xt NTAPI xbox::KeQueryBasePriorityThread
 )
 {
 	LOG_FUNC_ONE_ARG(Thread);
+	const void* CallerAddress = _ReturnAddress();
+	const PKTHREAD CurrentThread = KeGetCurrentThread();
 
 	KIRQL OldIrql;
 	KiLockDispatcherDatabase(&OldIrql);
@@ -1459,6 +1482,16 @@ XBSYSAPI EXPORTNUM(124) xbox::long_xt NTAPI xbox::KeQueryBasePriorityThread
 	long_xt ret = Thread->Priority;
 
 	KiUnlockDispatcherDatabase(OldIrql);
+	BetaTrace_Record(
+		"THREAD_PRIORITY_QUERY",
+		"caller=%p guest=%08X target_guest=%08X target_kthread=%p priority=%ld",
+		CallerAddress,
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+			reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+			reinterpret_cast<PETHREAD>(Thread)->UniqueThread)),
+		Thread,
+		static_cast<long>(ret));
 
 	RETURN(ret);
 }
@@ -1783,6 +1816,8 @@ XBSYSAPI EXPORTNUM(138) xbox::long_xt NTAPI xbox::KeResetEvent
 )
 {
 	LOG_FUNC_ONE_ARG(Event);
+	const void* CallerAddress = _ReturnAddress();
+	const PKTHREAD CurrentThread = KeGetCurrentThread();
 
 	KIRQL OldIrql;
 	KiLockDispatcherDatabase(&OldIrql);
@@ -1793,13 +1828,33 @@ XBSYSAPI EXPORTNUM(138) xbox::long_xt NTAPI xbox::KeResetEvent
 	DWORD flags = 0;
 	if (GetHandleInformation((HANDLE)Event, &flags)) {
 		KiUnlockDispatcherDatabase(OldIrql);
-		return NtDll::NtResetEvent((HANDLE)Event, nullptr);
+		const NTSTATUS NativeResult =
+			NtDll::NtResetEvent((HANDLE)Event, nullptr);
+		BetaTrace_Record(
+			"EVENT_RESET",
+			"caller=%p guest=%08X event=%p native=1 result=%08X",
+			CallerAddress,
+			static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+				reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+			Event,
+			static_cast<unsigned int>(NativeResult));
+		return NativeResult;
 	}
 
 	LONG OldState = Event->Header.SignalState;
 	Event->Header.SignalState = 0;
 
 	KiUnlockDispatcherDatabase(OldIrql);
+	BetaTrace_Record(
+		"EVENT_RESET",
+		"caller=%p guest=%08X event=%p native=0 type=%u old=%ld new=%ld",
+		CallerAddress,
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+			reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+		Event,
+		static_cast<unsigned int>(Event->Header.Type),
+		OldState,
+		Event->Header.SignalState);
 	return OldState;	
 }
 
@@ -1829,14 +1884,39 @@ XBSYSAPI EXPORTNUM(140) xbox::ulong_xt NTAPI xbox::KeResumeThread
 )
 {
 	LOG_FUNC_ONE_ARG(Thread);
+	const void* CallerAddress = _ReturnAddress();
+	const PKTHREAD CurrentThread = KeGetCurrentThread();
 
 	KIRQL OldIrql;
 	KiLockDispatcherDatabase(&OldIrql);
 
+	std::unique_lock<std::mutex> CooperativeLock(
+		g_CooperativeSelfSuspendMutex,
+		std::defer_lock);
+	if (g_BetaConfig.cooperative_self_suspend) {
+		CooperativeLock.lock();
+	}
+
 	char_xt OldCount = Thread->SuspendCount;
+	const HANDLE TargetGuestThread =
+		reinterpret_cast<PETHREAD>(Thread)->UniqueThread;
+	HANDLE NativeHandle = nullptr;
+	DWORD NativeResult = static_cast<DWORD>(-2);
+	DWORD NativeError = ERROR_SUCCESS;
+	bool NativeCallAttempted = false;
+	bool CooperativeWake = false;
 	if (OldCount != 0) {
 		--Thread->SuspendCount;
 		if (Thread->SuspendCount == 0) {
+			const auto CooperativeEvent =
+				g_CooperativeSelfSuspendEvents.find(Thread);
+			if (g_BetaConfig.cooperative_self_suspend &&
+				CooperativeEvent != g_CooperativeSelfSuspendEvents.end()) {
+				CooperativeWake = true;
+				SetLastError(ERROR_SUCCESS);
+				NativeResult = SetEvent(CooperativeEvent->second);
+				NativeError = GetLastError();
+			} else {
 #if 0
 			++Thread->SuspendSemaphore.Header.SignalState;
 			KiWaitListLock();
@@ -1844,12 +1924,38 @@ XBSYSAPI EXPORTNUM(140) xbox::ulong_xt NTAPI xbox::KeResumeThread
 			std::this_thread::yield();
 #else
 			if (const auto &nativeHandle = GetNativeHandle<true>(reinterpret_cast<PETHREAD>(Thread)->UniqueThread)) {
-				ResumeThread(*nativeHandle);
+				NativeHandle = *nativeHandle;
+				NativeCallAttempted = true;
+				SetLastError(ERROR_SUCCESS);
+				NativeResult = ResumeThread(NativeHandle);
+				NativeError = GetLastError();
 			} else {
 				EmuLog(LOG_LEVEL::WARNING, "KeResumeThread: GetNativeHandle returned nullopt for UniqueThread 0x%X (Thread 0x%p) - thread will remain suspended!", reinterpret_cast<PETHREAD>(Thread)->UniqueThread, Thread);
 			}
 #endif
+			}
 		}
+	}
+
+	// Suppress the very high-volume old=0/new=0 polling loop. It cannot change
+	// scheduling state and previously obscured the CRI worker's useful calls.
+	if (OldCount != 0 || NativeCallAttempted) {
+		BetaTrace_Record(
+			"THREAD_RESUME",
+			"caller=%p guest=%08X target_guest=%08X target_kthread=%p old=%u new=%u cooperative=%u native_call=%u native_handle=%p native_result=%08lX native_error=%lu",
+			CallerAddress,
+			static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+				reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+			static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(TargetGuestThread)),
+			Thread,
+			static_cast<unsigned int>(static_cast<unsigned char>(OldCount)),
+			static_cast<unsigned int>(
+				static_cast<unsigned char>(Thread->SuspendCount)),
+			CooperativeWake ? 1U : 0U,
+			NativeCallAttempted ? 1U : 0U,
+			NativeHandle,
+			NativeResult,
+			NativeError);
 	}
 
 	KiUnlockDispatcherDatabase(OldIrql);
@@ -1899,14 +2005,33 @@ XBSYSAPI EXPORTNUM(143) xbox::long_xt NTAPI xbox::KeSetBasePriorityThread
 		LOG_FUNC_ARG(Thread)
 		LOG_FUNC_ARG(Priority)
 		LOG_FUNC_END;
+	const void* CallerAddress = _ReturnAddress();
+	const PKTHREAD CurrentThread = KeGetCurrentThread();
 
 	KIRQL oldIRQL;
 	KiLockDispatcherDatabase(&oldIRQL);
 
+	const long_xt OldPriority = Thread->Priority;
 	Thread->Priority = Priority;
 	long_xt ret = Thread->Priority;
 
 	KiUnlockDispatcherDatabase(oldIRQL);
+	// Re-applying the same priority is common in guest shutdown polling loops.
+	// Recording only changes prevents diagnostics from becoming the workload.
+	if (OldPriority != ret) {
+		BetaTrace_Record(
+			"THREAD_PRIORITY_SET",
+			"caller=%p guest=%08X target_guest=%08X target_kthread=%p old=%ld requested=%ld new=%ld",
+			CallerAddress,
+			static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+				reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+			static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+				reinterpret_cast<PETHREAD>(Thread)->UniqueThread)),
+			Thread,
+			static_cast<long>(OldPriority),
+			static_cast<long>(Priority),
+			static_cast<long>(ret));
+	}
 
 	RETURN(ret);
 }
@@ -1948,6 +2073,8 @@ XBSYSAPI EXPORTNUM(145) xbox::long_xt NTAPI xbox::KeSetEvent
 		LOG_FUNC_ARG(Increment)
 		LOG_FUNC_ARG(Wait)
 		LOG_FUNC_END;
+	const void* CallerAddress = _ReturnAddress();
+	const PKTHREAD CurrentThread = KeGetCurrentThread();
 
 	KIRQL OldIrql;
 	KiLockDispatcherDatabase(&OldIrql);
@@ -1958,10 +2085,23 @@ XBSYSAPI EXPORTNUM(145) xbox::long_xt NTAPI xbox::KeSetEvent
 	DWORD flags = 0;
 	if (GetHandleInformation((HANDLE)Event, &flags)) {
 		KiUnlockDispatcherDatabase(OldIrql);
-		return NtDll::NtSetEvent((HANDLE)Event, nullptr);
+		const NTSTATUS NativeResult =
+			NtDll::NtSetEvent((HANDLE)Event, nullptr);
+		BetaTrace_Record(
+			"EVENT_SET",
+			"caller=%p guest=%08X event=%p native=1 result=%08X wait=%u",
+			CallerAddress,
+			static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+				reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+			Event,
+			static_cast<unsigned int>(NativeResult),
+			static_cast<unsigned int>(Wait));
+		return NativeResult;
 	}
 
 	LONG OldState = Event->Header.SignalState;
+	const unsigned int EventType =
+		static_cast<unsigned int>(Event->Header.Type);
 	KiWaitListLock();
 	if (IsListEmpty(&Event->Header.WaitListHead) != FALSE) {
 		KiWaitListUnlock();
@@ -1990,6 +2130,18 @@ XBSYSAPI EXPORTNUM(145) xbox::long_xt NTAPI xbox::KeSetEvent
 	} else {
 		KiUnlockDispatcherDatabase(OldIrql);
 	}
+	BetaTrace_Record(
+		"EVENT_SET",
+		"caller=%p guest=%08X event=%p native=0 type=%u old=%ld new=%ld increment=%ld wait=%u",
+		CallerAddress,
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+			reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+		Event,
+		EventType,
+		OldState,
+		Event->Header.SignalState,
+		static_cast<long>(Increment),
+		static_cast<unsigned int>(Wait));
 
 	RETURN(OldState);
 }
@@ -2174,19 +2326,59 @@ XBSYSAPI EXPORTNUM(152) xbox::ulong_xt NTAPI xbox::KeSuspendThread
 )
 {
 	LOG_FUNC_ONE_ARG(Thread);
+	const void* CallerAddress = _ReturnAddress();
+	const PKTHREAD CurrentThread = KeGetCurrentThread();
 
 	KIRQL OldIrql;
 	KiLockDispatcherDatabase(&OldIrql);
 
+	std::unique_lock<std::mutex> CooperativeLock(
+		g_CooperativeSelfSuspendMutex,
+		std::defer_lock);
+	if (g_BetaConfig.cooperative_self_suspend) {
+		CooperativeLock.lock();
+	}
+
 	char_xt OldCount = Thread->SuspendCount;
+	const HANDLE TargetGuestThread =
+		reinterpret_cast<PETHREAD>(Thread)->UniqueThread;
+	HANDLE NativeHandle = nullptr;
+	DWORD NativeResult = static_cast<DWORD>(-2);
+	DWORD NativeError = ERROR_SUCCESS;
+	bool NativeCallAttempted = false;
+	bool CooperativeWait = false;
+	HANDLE CooperativeEvent = nullptr;
 	if (OldCount == X_MAXIMUM_SUSPEND_COUNT) {
+		BetaTrace_Record(
+			"THREAD_SUSPEND",
+			"caller=%p guest=%08X target_guest=%08X target_kthread=%p old=%u new=%u exceeded=1",
+			CallerAddress,
+			static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+				reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+			static_cast<unsigned int>(
+				reinterpret_cast<ULONG_PTR>(TargetGuestThread)),
+			Thread,
+			static_cast<unsigned int>(static_cast<unsigned char>(OldCount)),
+			static_cast<unsigned int>(
+				static_cast<unsigned char>(Thread->SuspendCount)));
 		KiUnlockDispatcherDatabase(OldIrql);
 		RETURN(X_STATUS_SUSPEND_COUNT_EXCEEDED);
 	}
 
 	if (Thread->ApcState.ApcQueueable == TRUE) {
+		if (g_BetaConfig.cooperative_self_suspend &&
+			Thread == CurrentThread &&
+			OldCount == 0) {
+			CooperativeEvent = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+			if (CooperativeEvent != nullptr) {
+				g_CooperativeSelfSuspendEvents[Thread] = CooperativeEvent;
+				CooperativeWait = true;
+			}
+		}
+
 		++Thread->SuspendCount;
 		if (OldCount == 0) {
+			if (!CooperativeWait) {
 #if 0
 			if (KiInsertQueueApc(&Thread->SuspendApc, 0) == FALSE) {
 				--Thread->SuspendSemaphore.Header.SignalState;
@@ -2197,14 +2389,65 @@ XBSYSAPI EXPORTNUM(152) xbox::ulong_xt NTAPI xbox::KeSuspendThread
 			// we cannot suspend such thread. Thus, we will always have to rely on the host to do the suspension, as long as we do direct execution. Note that this is
 			// a general issue for all kernel APCs too.
 			if (const auto &nativeHandle = GetNativeHandle<true>(reinterpret_cast<PETHREAD>(Thread)->UniqueThread)) {
-				SuspendThread(*nativeHandle);
+				NativeHandle = *nativeHandle;
+				NativeCallAttempted = true;
+				SetLastError(ERROR_SUCCESS);
+				NativeResult = SuspendThread(NativeHandle);
+				NativeError = GetLastError();
 			}
 #endif
+			}
 		}
 
 	}
 
+	BetaTrace_Record(
+		"THREAD_SUSPEND",
+		"caller=%p guest=%08X target_guest=%08X target_kthread=%p old=%u new=%u queueable=%u cooperative=%u native_call=%u native_handle=%p native_result=%08lX native_error=%lu",
+		CallerAddress,
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+			reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(TargetGuestThread)),
+		Thread,
+		static_cast<unsigned int>(static_cast<unsigned char>(OldCount)),
+		static_cast<unsigned int>(
+			static_cast<unsigned char>(Thread->SuspendCount)),
+		Thread->ApcState.ApcQueueable == TRUE ? 1U : 0U,
+		CooperativeWait ? 1U : 0U,
+		NativeCallAttempted ? 1U : 0U,
+		NativeHandle,
+		NativeResult,
+		NativeError);
+
 	KiUnlockDispatcherDatabase(OldIrql);
+
+	if (CooperativeWait) {
+		CooperativeLock.unlock();
+		const DWORD WaitResult = WaitForSingleObject(
+			CooperativeEvent,
+			INFINITE);
+		const DWORD WaitError =
+			WaitResult == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
+		CooperativeLock.lock();
+		const auto EventIt = g_CooperativeSelfSuspendEvents.find(Thread);
+		if (EventIt != g_CooperativeSelfSuspendEvents.end() &&
+			EventIt->second == CooperativeEvent) {
+			g_CooperativeSelfSuspendEvents.erase(EventIt);
+		}
+		CooperativeLock.unlock();
+		CloseHandle(CooperativeEvent);
+		BetaTrace_Record(
+			"THREAD_COOP_WAKE",
+			"caller=%p guest=%08X target_guest=%08X target_kthread=%p wait_result=%08lX wait_error=%lu",
+			CallerAddress,
+			static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+				reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+			static_cast<unsigned int>(
+				reinterpret_cast<ULONG_PTR>(TargetGuestThread)),
+			Thread,
+			WaitResult,
+			WaitError);
+	}
 
 	RETURN(OldCount);
 }
@@ -2567,6 +2810,29 @@ XBSYSAPI EXPORTNUM(159) xbox::ntstatus_xt NTAPI xbox::KeWaitForSingleObject
 
 	// If the lock is not already held, lock it
 	PRKTHREAD Thread = KeGetCurrentThread();
+	const void* CallerAddress = _ReturnAddress();
+	const long long TraceTimeout =
+		Timeout != nullptr ? Timeout->QuadPart : 0;
+	std::uint32_t TraceProbeValue = 0;
+	bool TraceProbeValid = BetaTrace_ReadProbe(&TraceProbeValue);
+	BetaTrace_WatchCriFileStates("wait-enter");
+	BetaTrace_Record(
+		"WAIT_ENTER",
+		"caller=%p guest=%08X object=%p type=%u signal=%ld reason=%u mode=%u alertable=%u timeout_ptr=%p timeout=%lld probe_valid=%u probe=%08X",
+		CallerAddress,
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+			reinterpret_cast<PETHREAD>(Thread)->UniqueThread)),
+		Object,
+		static_cast<unsigned int>(
+			reinterpret_cast<PKMUTANT>(Object)->Header.Type),
+		reinterpret_cast<PKMUTANT>(Object)->Header.SignalState,
+		static_cast<unsigned int>(WaitReason),
+		static_cast<unsigned int>(WaitMode),
+		static_cast<unsigned int>(Alertable),
+		Timeout,
+		TraceTimeout,
+		static_cast<unsigned int>(TraceProbeValid),
+		static_cast<unsigned int>(TraceProbeValue));
 	if (Thread->WaitNext) {
 		Thread->WaitNext = FALSE;
 	}
@@ -2683,7 +2949,11 @@ XBSYSAPI EXPORTNUM(159) xbox::ntstatus_xt NTAPI xbox::KeWaitForSingleObject
 			// so KeSetEvent can run between our SignalState check above and this InsertTailList.
 			// If that happens, the event is already signaled but no waiter was in the list,
 			// so KiWaitTest was a no-op — we'd wait forever. Re-check under WaitListLock.
-			if (g_BetaConfig.wait_list_toctou_recheck) {
+			const bool RecheckAfterInsert =
+				g_BetaConfig.wait_list_toctou_recheck ||
+				(g_BetaConfig.notification_event_wait_recheck &&
+					ObjectMutant->Header.Type == NotificationEvent);
+			if (RecheckAfterInsert) {
 				KiWaitListLock();
 				InsertTailList(&ObjectMutant->Header.WaitListHead, &WaitBlock->WaitListEntry);
 				if (ObjectMutant->Header.Type == MutantObject) {
@@ -2739,6 +3009,19 @@ XBSYSAPI EXPORTNUM(159) xbox::ntstatus_xt NTAPI xbox::KeWaitForSingleObject
 	}
 #endif
 
+	TraceProbeValue = 0;
+	TraceProbeValid = BetaTrace_ReadProbe(&TraceProbeValue);
+	BetaTrace_WatchCriFileStates("wait-exit-blocked");
+	BetaTrace_Record(
+		"WAIT_EXIT",
+		"caller=%p guest=%08X object=%p status=%08X path=blocked probe_valid=%u probe=%08X",
+		CallerAddress,
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+			reinterpret_cast<PETHREAD>(Thread)->UniqueThread)),
+		Object,
+		static_cast<unsigned int>(WaitStatus),
+		static_cast<unsigned int>(TraceProbeValid),
+		static_cast<unsigned int>(TraceProbeValue));
 	RETURN(WaitStatus);
 
 NoWait:
@@ -2753,5 +3036,18 @@ NoWait:
 		KiExecuteUserApc();
 	}
 
+	TraceProbeValue = 0;
+	TraceProbeValid = BetaTrace_ReadProbe(&TraceProbeValue);
+	BetaTrace_WatchCriFileStates("wait-exit-immediate");
+	BetaTrace_Record(
+		"WAIT_EXIT",
+		"caller=%p guest=%08X object=%p status=%08X path=immediate probe_valid=%u probe=%08X",
+		CallerAddress,
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+			reinterpret_cast<PETHREAD>(Thread)->UniqueThread)),
+		Object,
+		static_cast<unsigned int>(WaitStatus),
+		static_cast<unsigned int>(TraceProbeValid),
+		static_cast<unsigned int>(TraceProbeValue));
 	RETURN(WaitStatus);
 }

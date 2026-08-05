@@ -514,6 +514,16 @@ inline void EmuInstallPatch(const std::string FunctionName, const xbox::addr_xt 
 
 	auto success = g_FunctionHooks[FunctionName].Install((void*)(FunctionAddr), (void*)patch.patchFunc);
 	if (success) {
+		// subhook writes a new executable jump into the Xbox image. Native x86
+		// instruction caches are coherent enough that this historically worked
+		// without an explicit flush, but translated hosts can retain a DynaRec
+		// block for the old bytes across Chihiro's soft reboot. Tell Windows
+		// (and Wine/Box64) that the patched guest code must be retranslated.
+		FlushInstructionCache(
+			GetCurrentProcess(),
+			reinterpret_cast<const void*>(
+				static_cast<uintptr_t>(FunctionAddr)),
+			16);
 		printf("HLE: %s Patched\n", FunctionName.c_str());
 	}
 	else {
@@ -542,9 +552,9 @@ void EmuInstallPatches()
 		FILE* f = fopen("C:\\temp\\patch_dispatch.log", "w");
 		if (f) {
 			fprintf(f, "EmuInstallPatches: titleId=0x%08X imageSize=0x%X hash=0x%016llX\n", titleId, imageSize, (unsigned long long)xbeHash);
-			fprintf(f, "IsGolfXbe=%d IsGolf2006Xbe=%d IsGundamXbe=%d IsWanganXbe=%d IsMahjongXbe=%d IsOutRun2Xbe=%d IsQuestOfDXbe=%d\n",
+			fprintf(f, "IsGolfXbe=%d IsGolf2006Xbe=%d IsGundamXbe=%d IsWanganXbe=%d IsMahjongXbe=%d IsOutRun2Xbe=%d IsQuestOfDXbe=%d IsGhostSquadXbe=%d\n",
 				IsGolfXbe(xbeHash), IsGolf2006Xbe(xbeHash), IsGundamXbe(xbeHash), IsWanganXbe(imageSize), IsMahjongXbe(xbeHash),
-				IsOutRun2Xbe(xbeHash), IsQuestOfDXbe(xbeHash));
+				IsOutRun2Xbe(xbeHash), IsQuestOfDXbe(xbeHash), IsGhostSquadXbe(xbeHash));
 			fclose(f);
 		}
 	}
@@ -566,6 +576,8 @@ void EmuInstallPatches()
 		ApplyOutRun2Patches(xbeHash, imageSize);
 	} else if (IsQuestOfDXbe(xbeHash)) {
 		ApplyQuestOfDPatches(xbeHash, imageSize);
+	} else if (IsGhostSquadXbe(xbeHash)) {
+		ApplyGhostSquadPatches(xbeHash, imageSize);
 	}
 
 	if (titleId != 0xFFFE0000u) {

@@ -1201,7 +1201,18 @@ xbox::void_xt xbox::KiWaitTest
 	WaitList = &FirstObject->Header.WaitListHead;
 	WaitEntry = WaitList->Flink;
 	while ((FirstObject->Header.SignalState > 0) && (WaitEntry != WaitList)) {
+		// A Chihiro media-board title switch can clear an object's embedded
+		// wait-list links while a host thread is about to satisfy the object.
+		// A null or low Flink is not a valid list terminator (the head is), and
+		// treating it as a KWAIT_BLOCK reads WaitType from an unmapped low
+		// address. Chihiro has produced both 0x0 and 0x10 here during an
+		// asynchronous title/device transition. Repair only this cleared-list
+		// state and let the next wait rebuild its normal links.
 		if ((uintptr_t)WaitEntry < 0x10000u) {
+			EmuLog(LOG_LEVEL::WARNING,
+				"KiWaitTest: object %p has corrupt WaitListHead.Flink=%p -- reinitializing",
+				Object,
+				WaitEntry);
 			InitializeListHead(WaitList);
 			break;
 		}
@@ -1220,6 +1231,9 @@ xbox::void_xt xbox::KiWaitTest
 			bool corruptWaitChain = false;
 			while (NextBlock != WaitBlock) {
 				if ((uintptr_t)NextBlock < 0x10000u) {
+					EmuLog(LOG_LEVEL::WARNING,
+						"KiWaitTest: object %p has a cleared WaitAll link -- reinitializing",
+						Object);
 					corruptWaitChain = true;
 					break;
 				}

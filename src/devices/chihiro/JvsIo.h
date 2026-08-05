@@ -25,24 +25,24 @@
 #ifndef JVSIO_H
 #define JVSIO_H
 
-// Define JVS_LOG to enable JVS/JVSIo verbose logging to jvs_io.log.
-// Comment out or undefine to disable all JVS log output.
-//#define JVS_LOG
-
 #include <cstdint>
 #include <vector>
 #include <string>
 #include <cstdio>
 #include <mutex>
+#include <atomic>
 
-#if defined(JVS_LOG) && defined(_DEBUG)
-// Shared log function — writes to the jvs_io.log file opened by JvsIo::OpenLog()
+// Shared JVS trace. OpenLog only creates the file when CXBXR's per-game
+// diagnostic mode is enabled. The inline pointer check keeps quiet Release
+// sessions from paying for formatting or varargs calls on the packet path.
+#if defined(_DEBUG)
 extern FILE* g_JvsLogFile;
-void JvsLog(const char* fmt, ...);
+void JvsLogWrite(const char* fmt, ...);
+#define JvsLog(...) do { \
+	if (g_JvsLogFile) JvsLogWrite(__VA_ARGS__); \
+} while (0)
 #else
-// JVS_LOG disabled — all JvsLog calls compile away to nothing
-// Use a template to suppress "unused variable" warnings without evaluating arguments
-#define JvsLog(...) do {} while(0)
+#define JvsLog(...) do {} while (0)
 #endif
 
 typedef struct {
@@ -59,11 +59,18 @@ typedef struct {
 // channel mapping and 8→16 bit expansion. Set by JVS.cpp patch layer.
 enum class JvsGameType : uint8_t {
 	Generic   = 0,  // Default: straight 1:1 channel mapping
+	CrazyTaxi,      // Wheel ch1, gas ch2, brake ch3
 	SegaGolfClub,   // Sega Golf Club / Virtua Golf titles
+	GhostSquad,     // Ghost Squad light-gun shooter
 	WanganMT1,      // Wangan Midnight Maximum Tune 1 (V307)
 	WanganMT2,      // Wangan Midnight Maximum Tune 2 (V322e / V322j)
 };
 extern JvsGameType g_jvs_game_type;
+
+// Last value written to general-purpose output bank 0. WMMT1/2 route the
+// steering controller's enable line through bit 7 of this bank and report the
+// resulting controller state over the SC MIDI channel.
+extern std::atomic<uint8_t> g_jvs_general_output_bank0;
 
 typedef struct _jvs_switch_player_inputs_t {
 	bool start = false;

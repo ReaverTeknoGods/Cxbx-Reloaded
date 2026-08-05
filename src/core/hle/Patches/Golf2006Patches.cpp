@@ -30,6 +30,7 @@
 #include "PatchUtil.h"
 #include "ChihiroPatches.h"
 #include "core\kernel\support\Emu.h"
+#include "core\kernel\init\CxbxKrnl.h"
 #include "devices\chihiro\JvsIo.h"
 #include <cstdio>
 #include <Windows.h>
@@ -37,6 +38,7 @@
 
 #if defined(_DEBUG)
 #define G2006_LOG(fmt, ...) do { \
+	if (!CxbxrKrnlDebugLoggingEnabled()) break; \
 	FILE* _f = fopen("C:\\temp\\golf2006_patches.log", "a"); \
 	if (_f) { fprintf(_f, fmt "\n", ##__VA_ARGS__); fclose(_f); } \
 	printf(fmt "\n", ##__VA_ARGS__); \
@@ -835,7 +837,7 @@ void ApplyGolf2006Patches(uint64_t xbeHash, uint32_t imageSize)
 
 	// Write marker file
 #if defined(_DEBUG)
-	{
+	if (CxbxrKrnlDebugLoggingEnabled()) {
 		FILE* f = fopen("C:\\temp\\golf2006_patches.log", "w");
 		if (f) { fprintf(f, "Golf2006: start (imageSize=0x%X)\n", imageSize); fclose(f); }
 	}

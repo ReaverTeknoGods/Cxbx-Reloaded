@@ -35,6 +35,7 @@
 #include "devices\x86\EmuX86.h"
 #include "EmuShared.h"
 #include "common/cxbxr.hpp" // For CxbxrShutDown()
+#include "common/win32/WineEnv.h"
 #include "core\hle\Intercept.hpp"
 #include "CxbxDebugger.h"
 
@@ -90,8 +91,198 @@ std::string EIPToString(xbox::addr_xt EIP)
 	return result;
 }
 
+#if defined(_DEBUG)
+static void EmuFormatRawAddress(uint32_t address, char* buffer, size_t bufferSize)
+{
+	HMODULE module = NULL;
+	if (address >= g_SystemMaxMemory &&
+		GetModuleHandleExA(
+			GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+				GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			(LPCSTR)(uintptr_t)address,
+			&module) &&
+		module != NULL) {
+		char modulePath[MAX_PATH] = {};
+		GetModuleFileNameA(module, modulePath, sizeof(modulePath));
+		const char* slash = strrchr(modulePath, '\\');
+		const char* moduleName = slash ? slash + 1 : modulePath;
+		snprintf(
+			buffer,
+			bufferSize,
+			"0x%.08X(=%s+0x%X)",
+			address,
+			moduleName,
+			address - (uint32_t)(uintptr_t)module);
+	}
+	else {
+		snprintf(buffer, bufferSize, "0x%.08X", address);
+	}
+}
+
+static void EmuLogNullFpCallSite(uint32_t esp, uint32_t ebp)
+{
+	__try {
+		uint32_t* sp = (uint32_t*)esp;
+		uint32_t retAddr = sp[0];
+		char addressBuffer[2 * MAX_PATH] = {};
+		EmuFormatRawAddress(retAddr, addressBuffer, sizeof(addressBuffer));
+		printf(" RET := %s (caller of NULL fp)\n", addressBuffer);
+		printf(" Active XBE := %s, TitleID := 0x%.08X\n",
+			szFilePath_Xbe,
+			CxbxKrnl_Xbe ? CxbxKrnl_Xbe->m_Certificate.dwTitleId : 0);
+		if (retAddr) {
+			uint8_t* p = (uint8_t*)(retAddr - 8);
+			printf(" bytes before RET: ");
+			for (int i = 0; i < 8; ++i) printf("%02X ", p[i]);
+			printf("\n");
+		}
+		printf(" stack[0..15]: ");
+		for (int i = 0; i < 16; ++i) printf("0x%.08X ", sp[i]);
+		printf("\n");
+		// Scan first 256 dwords looking for any value in XBE code range
+		printf(" XBE-range hits in [esp..esp+1KB]:\n");
+		int hits = 0;
+		for (int i = 0; i < 256 && hits < 8; ++i) {
+			uint32_t v = sp[i];
+			if (v >= XBE_IMAGE_BASE && v <= XBE_MAX_VA) {
+				uint8_t* p = (uint8_t*)(v - 8);
+				printf("  [esp+0x%03X] = 0x%.08X  prev8: ", i*4, v);
+				__try {
+					for (int j = 0; j < 8; ++j) printf("%02X ", p[j]);
+				} __except (EXCEPTION_EXECUTE_HANDLER) { printf("??"); }
+				printf("\n");
+				hits++;
+			}
+		}
+		// Walk EBP chain if EBP is sane
+		if (ebp >= 0x1000) {
+			printf(" EBP walk:");
+			uint32_t cur = ebp;
+			for (int i = 0; i < 6 && cur >= 0x1000; ++i) {
+				uint32_t* fp = (uint32_t*)cur;
+				uint32_t saved_ebp = fp[0];
+				uint32_t saved_ret = fp[1];
+				EmuFormatRawAddress(saved_ret, addressBuffer, sizeof(addressBuffer));
+				printf(" [0x%.08X->%s]", cur, addressBuffer);
+				if (saved_ebp <= cur) break; // bad chain
+				cur = saved_ebp;
+			}
+			printf("\n");
+		}
+	} __except (EXCEPTION_EXECUTE_HANDLER) {
+		printf(" (stack peek failed)\n");
+	}
+}
+
+static void EmuWriteWineExceptionEvidence(LPEXCEPTION_POINTERS e)
+{
+	if (!isWineEnv() || e == nullptr || e->ExceptionRecord == nullptr ||
+		e->ContextRecord == nullptr) {
+		return;
+	}
+
+	FILE* evidence = nullptr;
+	if (fopen_s(
+			&evidence,
+			"C:\\teknoparrot-cxbxr-exception.txt",
+			"a") != 0 ||
+		evidence == nullptr) {
+		return;
+	}
+
+	SYSTEMTIME now = {};
+	GetSystemTime(&now);
+	const CONTEXT* context = e->ContextRecord;
+	fprintf(
+		evidence,
+		"\n[%04u-%02u-%02uT%02u:%02u:%02u.%03uZ] "
+		"tid=0x%04X code=0x%08X eip=0x%08X esp=0x%08X "
+		"ebp=0x%08X eflags=0x%08X\n",
+		now.wYear,
+		now.wMonth,
+		now.wDay,
+		now.wHour,
+		now.wMinute,
+		now.wSecond,
+		now.wMilliseconds,
+		GetCurrentThreadId(),
+		e->ExceptionRecord->ExceptionCode,
+		context->Eip,
+		context->Esp,
+		context->Ebp,
+		context->EFlags);
+	fprintf(
+		evidence,
+		"eax=0x%08X ebx=0x%08X ecx=0x%08X edx=0x%08X "
+		"esi=0x%08X edi=0x%08X\n",
+		context->Eax,
+		context->Ebx,
+		context->Ecx,
+		context->Edx,
+		context->Esi,
+		context->Edi);
+
+	// Optimised 32-bit builds do not guarantee an EBP frame chain. Scan a
+	// bounded portion of the live stack for addresses backed by loaded host
+	// modules; their module-relative RVAs identify the D3D9 caller without
+	// enabling the timing-heavy full kernel/render trace.
+	fprintf(evidence, "host-module stack candidates:\n");
+	unsigned candidateCount = 0;
+	__try {
+		const uint32_t* stack =
+			reinterpret_cast<const uint32_t*>(context->Esp);
+		for (unsigned index = 0;
+			index < 512 && candidateCount < 96;
+			++index) {
+			const uint32_t address = stack[index];
+			if (address < g_SystemMaxMemory) {
+				continue;
+			}
+
+			HMODULE module = nullptr;
+			if (!GetModuleHandleExA(
+					GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+						GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+					reinterpret_cast<LPCSTR>(
+						static_cast<uintptr_t>(address)),
+					&module) ||
+				module == nullptr) {
+				continue;
+			}
+
+			char modulePath[MAX_PATH] = {};
+			GetModuleFileNameA(module, modulePath, sizeof(modulePath));
+			const char* slash = strrchr(modulePath, '\\');
+			const char* moduleName = slash ? slash + 1 : modulePath;
+			fprintf(
+				evidence,
+				"  esp+0x%03X = 0x%08X %s+0x%X\n",
+				index * 4,
+				address,
+				moduleName,
+				address -
+					static_cast<uint32_t>(
+						reinterpret_cast<uintptr_t>(module)));
+			++candidateCount;
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		fprintf(evidence, "  stack scan failed\n");
+	}
+
+	fflush(evidence);
+	fclose(evidence);
+}
+#endif
+
 void EmuExceptionPrintDebugInformation(LPEXCEPTION_POINTERS e, bool IsBreakpointException)
 {
+	#if defined(_DEBUG)
+	if (!IsBreakpointException) {
+		EmuWriteWineExceptionEvidence(e);
+	}
+	#endif
+
 	// print debug information
 	{
 		if (IsBreakpointException)
@@ -122,6 +313,14 @@ void EmuExceptionPrintDebugInformation(LPEXCEPTION_POINTERS e, bool IsBreakpoint
 				op, (uintptr_t)e->ExceptionRecord->ExceptionInformation[1]);
 			printf(" EIP is %s Xbox code range\n",
 				IsXboxCodeAddress(e->ContextRecord->Eip) ? "inside" : "OUTSIDE");
+
+			// NULL function-pointer call: peek the return address pushed by CALL
+			// and a few bytes before it so we can identify the bad call instruction.
+			#if defined(_DEBUG)
+			if (e->ContextRecord->Eip == 0) {
+				EmuLogNullFpCallSite(e->ContextRecord->Esp, e->ContextRecord->Ebp);
+			}
+			#endif
 			printf("\n");
 		}
 
@@ -184,6 +383,23 @@ bool EmuExceptionBreakpointAsk(LPEXCEPTION_POINTERS e)
 bool EmuExceptionNonBreakpointUnhandledShow(LPEXCEPTION_POINTERS e)
 {
 	EmuExceptionPrintDebugInformation(e, /*IsBreakpointException=*/false);
+
+	// Special case: NULL function-pointer dispatch (EIP=0). This happens when an
+	// emulated game dispatches through an uninitialized fp table (commonly state
+	// machines). Killing the whole emulator with a modal popup makes the game
+	// look "crashed" even though the rest of the process is healthy. Instead,
+	// silently terminate just the offending thread so other threads keep running
+	// — this matches the historical "stuck but running" baseline.
+	if (e->ContextRecord->Eip == 0 &&
+		e->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+#if defined(_DEBUG)
+		printf("[0x%.4X] MAIN: NULL fp call — terminating offending thread (process continues)\n",
+			GetCurrentThreadId());
+		fflush(stdout);
+#endif
+		ExitThread(0);
+		return false; // unreachable
+	}
 
 	auto result = PopupFatalEx(nullptr, PopupButtons::AbortRetryIgnore, PopupReturn::Abort,
 		"  The running xbe has encountered an unhandled exception (Code := 0x%.8X) at address 0x%.08X.\n"

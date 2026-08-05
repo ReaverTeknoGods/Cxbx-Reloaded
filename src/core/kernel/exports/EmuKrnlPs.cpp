@@ -45,6 +45,7 @@
 #include "core\kernel\support\EmuFS.h" // For EmuGenerateFS
 #include "core\kernel\support\NativeHandle.h"
 #include "common/PerfTrace.h"  // For PerfTrace_RegisterXboxThread
+#include "common/BetaConfig.h"
 
 // prevent name collisions
 namespace NtDll
@@ -125,6 +126,18 @@ static unsigned int WINAPI PCSTProxy
 	xbox::KiExecuteKernelApc();
 
 	auto routine = (xbox::PKSYSTEM_ROUTINE)StartFrame->SystemRoutine;
+	// Some Chihiro titles (e.g. Mahjong MJ3 Evolution) create system threads whose
+	// SystemRoutine and StartRoutine are both NULL. Calling those produces EIP=0
+	// access violations from a stack-clean thread. Skip cleanly so emulation
+	// continues (the game will be stuck but won't crash).
+	if (routine == nullptr) {
+		EmuLog(LOG_LEVEL::WARNING,
+			"PCSTProxy: NULL SystemRoutine on tid 0x%X (StartRoutine=0x%p, StartContext=0x%p) — terminating thread",
+			GetCurrentThreadId(), StartFrame->StartRoutine, StartFrame->StartContext);
+		xbox::PsTerminateSystemThread(X_STATUS_SUCCESS);
+		return 0;
+	}
+
 	// Debugging notice : When the below line shows up with an Exception dialog and a
 	// message like: "Exception thrown at 0x00026190 in cxbx.exe: 0xC0000005: Access
 	// violation reading location 0xFD001804.", then this is AS-DESIGNED behaviour!
@@ -150,6 +163,13 @@ xbox::void_xt NTAPI PspSystemThreadStartup
 )
 {
 	// TODO : Call PspUnhandledExceptionInSystemThread(GetExceptionInformation())
+	if (StartRoutine == nullptr) {
+		EmuLog(LOG_LEVEL::WARNING,
+			"PspSystemThreadStartup: NULL StartRoutine on tid 0x%X (StartContext=0x%p) — terminating thread",
+			GetCurrentThreadId(), StartContext);
+		xbox::PsTerminateSystemThread(X_STATUS_SUCCESS);
+		return;
+	}
 	(StartRoutine)(StartContext);
 
 	xbox::PsTerminateSystemThread(X_STATUS_SUCCESS);
@@ -434,6 +454,19 @@ XBSYSAPI EXPORTNUM(255) xbox::ntstatus_xt NTAPI xbox::PsCreateSystemThreadEx
 		// Log ThreadID identical to how GetCurrentThreadID() is rendered :
 		EmuLog(LOG_LEVEL::DEBUG, "Created Xbox proxy thread. Handle : 0x%X, ThreadId : [0x%.4X], Native Handle : 0x%X, Native ThreadId : [0x%.4X]",
 			*ThreadHandle, eThread->UniqueThread, handle, nativeThreadId);
+		BetaTrace_Record(
+			"THREAD_CREATE",
+			"xbox_handle=%08X guest=%08X native_handle=%p native_tid=%08X create_suspended=%u start=%p context=%p system=%p",
+			static_cast<unsigned int>(
+				reinterpret_cast<ULONG_PTR>(*ThreadHandle)),
+			static_cast<unsigned int>(
+				reinterpret_cast<ULONG_PTR>(eThread->UniqueThread)),
+			reinterpret_cast<void*>(handle),
+			static_cast<unsigned int>(nativeThreadId),
+			CreateSuspended ? 1U : 0U,
+			StartRoutine,
+			StartContext,
+			SystemRoutine);
 	}
 
 	RETURN(X_STATUS_SUCCESS);

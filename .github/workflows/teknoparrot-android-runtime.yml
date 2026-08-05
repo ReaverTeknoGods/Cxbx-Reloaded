@@ -1,0 +1,83 @@
+name: TeknoParrot Android runtime
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'tp-android-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-runtime:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Generate Win32 project
+        run: >
+          cmake -B build -A Win32
+          -DBUILD_CXBXR_DEBUGGER=OFF
+          -DCMAKE_SYSTEM_VERSION=7
+
+      - name: Build Release
+        run: cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Stage redistributable runtime
+        shell: pwsh
+        run: |
+          $source = 'build/bin/Release'
+          $target = 'artifacts/CxbxReloaded-TeknoParrot-Win32'
+          New-Item -ItemType Directory -Path $target | Out-Null
+          foreach ($name in @(
+              'cxbxr-ldr.exe',
+              'cxbxr-emu.dll',
+              'SDL2.dll',
+              'glew32.dll',
+              'subhook.dll')) {
+            $path = Join-Path $source $name
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Missing runtime file: $path"
+            }
+            Copy-Item -LiteralPath $path -Destination $target
+          }
+          Copy-Item -LiteralPath (Join-Path $source 'hlsl') `
+            -Destination (Join-Path $target 'hlsl') -Recurse
+          $manifest = @(
+            Get-ChildItem -LiteralPath $target -Recurse -File |
+              Sort-Object FullName |
+              ForEach-Object {
+                [pscustomobject]@{
+                  path = ([IO.Path]::GetRelativePath(
+                      $target, $_.FullName)).Replace('\', '/')
+                  size = $_.Length
+                  sha256 = (Get-FileHash -LiteralPath $_.FullName `
+                    -Algorithm SHA256).Hash
+                }
+              })
+          $manifest | ConvertTo-Json -Depth 3 |
+            Set-Content -LiteralPath (Join-Path $target 'manifest.json') `
+              -Encoding utf8
+          Compress-Archive -LiteralPath $target `
+            -DestinationPath 'artifacts/CxbxReloaded-TeknoParrot-Win32.zip'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CxbxReloaded-TeknoParrot-Win32
+          path: artifacts/CxbxReloaded-TeknoParrot-Win32.zip
+          if-no-files-found: error
+
+      - name: Publish tagged runtime
+        if: startsWith(github.ref, 'refs/tags/tp-android-v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create $env:GITHUB_REF_NAME
+          artifacts/CxbxReloaded-TeknoParrot-Win32.zip
+          --verify-tag
+          --title $env:GITHUB_REF_NAME
+          --notes "TeknoParrot CXBXR Win32 runtime. Chihiro firmware is not included."

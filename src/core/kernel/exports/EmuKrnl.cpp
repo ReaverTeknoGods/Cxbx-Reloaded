@@ -191,14 +191,15 @@ bool AddWaitObject(xbox::PKTHREAD kThread, xbox::PLARGE_INTEGER Timeout)
 	Timer->Header.WaitListHead.Flink = &WaitBlock->WaitListEntry;
 	Timer->Header.WaitListHead.Blink = &WaitBlock->WaitListEntry;
 	if (Timeout && Timeout->QuadPart) {
-		// Special case: INT64_MIN (0x8000000000000000) is used by some games (CRI library)
-		// as a KeDelayExecutionThread interval. The DueTime computation overflows
-		// (InterruptTime - INT64_MIN wraps to a huge unsigned value that never expires).
-		// When non-alertable, this creates an infinite hang. Treat it as immediate timeout.
+		// Win32's millisecond-to-relative-time conversion uses INT64_MIN for
+		// INFINITE (0xFFFFFFFF). CRI uses this for an alertable worker wait that
+		// is released by an APC. Do not insert a timer: negating INT64_MIN
+		// overflows, and completing it immediately turns the parked worker into
+		// a tight I/O loop.
 		if (g_BetaConfig.llong_min_timeout_fix && Timeout->QuadPart == LLONG_MIN) {
-			kThread->WaitBlockList = xbox::zeroptr;
+			kThread->State = xbox::Waiting;
 			xbox::KiTimerUnlock();
-			return false;
+			return true;
 		}
 		// Setup a timer so that KiTimerExpiration can discover the timeout and yield to us.
 		// Otherwise, we will only be able to discover the timeout when Windows decides to schedule us again, and testing shows that

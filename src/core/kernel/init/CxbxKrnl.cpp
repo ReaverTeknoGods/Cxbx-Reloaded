@@ -66,6 +66,7 @@
 #include "common\crypto\EmuSha.h" // For the SHA1 functions
 #include "common/Timer.h" // For Timer_Init
 #include "common/BetaConfig.h"
+#include "core/hle/D3D8/XbVertexShader.h"
 #include "common/util/hasher.h" // For ComputeHash (used in game-specific beta overrides)
 #include "common\input\InputManager.h" // For the InputDeviceManager
 #include "core/kernel/support/NativeHandle.h"
@@ -201,15 +202,15 @@ xbox::void_xt NTAPI CxbxLaunchXbe(xbox::PVOID Entry)
 	char msg[128];
 	sprintf_s(msg, sizeof(msg), "OEP = 0x%08X\n\nAttach debugger now, then click OK.", (DWORD)(uintptr_t)Entry);
 	//MessageBoxA(nullptr, msg, "Cxbx OEP Break", MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
-	#if defined(_DEBUG)
+#if defined(_DEBUG)
 	__try {
 		static_cast<void(*)()>(Entry)();
 	} __except(WriteCrashDump(GetExceptionInformation(), "seh"), EXCEPTION_CONTINUE_SEARCH) {
 		// SEH filter already wrote the dump; continue search for VEH/UEF handlers
 	}
-	#else
+#else
 	static_cast<void(*)()>(Entry)();
-	#endif
+#endif
 	EmuLogInit(LOG_LEVEL::DEBUG, "XBE entry point returned");
 }
 
@@ -449,7 +450,10 @@ FILE* CxbxrKrnlSetupVerboseLog(int BootFlags)
 	// Get KernelDebugMode :
 	CxbxrKrnl_DebugMode = DebugMode::DM_NONE;
 	if (cli_config::GetValue(cli_config::debug_mode, &tempStr)) {
-		CxbxrKrnl_DebugMode = (DebugMode)std::atoi(tempStr.c_str());
+		// settings.ini stores this as 0x0/0x1/0x2. atoi("0x1") returns
+		// zero, which made TPUI's per-game diagnostic toggle ineffective.
+		CxbxrKrnl_DebugMode =
+			(DebugMode)std::strtol(tempStr.c_str(), nullptr, 0);
 	}
 
 	// Get KernelDebugFileName :
@@ -457,6 +461,15 @@ FILE* CxbxrKrnlSetupVerboseLog(int BootFlags)
 	if (!cli_config::GetValue(cli_config::debug_file, &CxbxrKrnl_DebugFileName)) {
 		CxbxrKrnl_DebugFileName = "";
 	}
+#if defined(_DEBUG)
+	if (g_FullTraceEnabled) {
+		CxbxrKrnl_DebugMode = DebugMode::DM_FILE;
+		if (CxbxrKrnl_DebugFileName.empty()) {
+			CxbxrKrnl_DebugFileName =
+				g_DataFilePath + "\\cxbxr-full-trace.log";
+		}
+	}
+#endif
 
 	// debug console allocation (if configured)
 	if (CxbxrKrnl_DebugMode == DM_CONSOLE)
@@ -488,21 +501,18 @@ FILE* CxbxrKrnlSetupVerboseLog(int BootFlags)
 			return krnlLog;
 		}
 		else {
-			// No GUI-configured debug file — always write to <DataFilePath>\cxbxr_debug.log
-			// so we can capture errors (like Error 11) that don't appear in jvs_io.log.
-			if (!g_DataFilePath.empty()) {
-				std::string autoLogPath = g_DataFilePath + "\\cxbxr_debug.log";
-				FILE* autoLog = freopen(autoLogPath.c_str(), "wt", stdout);
-				if (autoLog) {
-					return autoLog;
-				}
-			}
-			char buffer[16];
-			if (GetConsoleTitle(buffer, 16) != NULL)
-				(void)freopen("nul", "w", stdout);
+			// DM_NONE is the explicit production/performance setting. Do not
+			// silently replace it with a disk logger; TPUI enables DM_CONSOLE
+			// per game when the user requests troubleshooting diagnostics.
+			(void)freopen("nul", "w", stdout);
 		}
 	}
 	return nullptr;
+}
+
+bool CxbxrKrnlDebugLoggingEnabled()
+{
+	return CxbxrKrnl_DebugMode != DebugMode::DM_NONE;
 }
 
 static void CxbxrKrnlSyncGUI()
@@ -677,6 +687,13 @@ static bool CxbxrKrnlXbeSystemSelector(int BootFlags,
 		emulate_system == SYSTEM_CHIHIRO &&
 		std::filesystem::exists(xbeDirectory / "boot.id")) {
 
+		// Preserve the title's real media root before replacing the requested
+		// game XBE with SEGABOOT. Otherwise the SEGABOOT process records its
+		// per-game firmware cache as the title mount path, and a later
+		// QuickReboot resolves boot.id's executable beside Partition3.bin
+		// instead of beside the original game dump.
+		g_EmuShared->SetTitleMountPath(xbeDirectory.string().c_str());
+
 		std::string chihiroMediaBoardRom = g_MediaBoardBasePath + MediaBoardRomFile;
 		if (!std::filesystem::exists(chihiroMediaBoardRom)) {
 			CxbxrAbort("Chihiro Media Board ROM could not be found at: %s", chihiroMediaBoardRom.c_str());
@@ -703,7 +720,31 @@ static bool CxbxrKrnlXbeSystemSelector(int BootFlags,
 		const std::string& segabootBase = g_GameMediaBoardPath.empty() ? g_MediaBoardBasePath : g_GameMediaBoardPath;
 		std::string chihiroSegaBootOld = segabootBase + MediaBoardSegaBoot0;
 		std::string chihiroSegaBootNew = segabootBase + MediaBoardSegaBoot1;
-		if (!std::filesystem::exists(chihiroSegaBootOld) || !std::filesystem::exists(chihiroSegaBootNew)) {
+		auto isValidSegaBoot = [](const std::string& path) {
+			std::error_code error;
+			if (!std::filesystem::exists(path, error) ||
+				error ||
+				std::filesystem::file_size(path, error) != ONE_MB ||
+				error) {
+				return false;
+			}
+
+			FILE* file = fopen(path.c_str(), "rb");
+			if (file == nullptr)
+				return false;
+
+			char magic[4] = {};
+			const bool isXbe =
+				fread(magic, 1, sizeof(magic), file) == sizeof(magic) &&
+				memcmp(magic, "XBEH", sizeof(magic)) == 0;
+			fclose(file);
+			return isXbe;
+		};
+
+		// Partition setup can leave zero-filled 512 KiB placeholders behind.
+		// Existence alone is therefore not sufficient: repair any cached
+		// SEGABOOT pair that is not a complete XBE image.
+		if (!isValidSegaBoot(chihiroSegaBootOld) || !isValidSegaBoot(chihiroSegaBootNew)) {
 			FILE* fpSegaBootOld = fopen(chihiroSegaBootOld.c_str(), "wb");
 			FILE* fpSegaBootNew = fopen(chihiroSegaBootNew.c_str(), "wb");
 			if (fpSegaBootNew == nullptr || fpSegaBootOld == nullptr) {
@@ -959,6 +1000,11 @@ void CxbxKrnlEmulate(unsigned int reserved_systems, blocks_reserved_t blocks_res
 
 	/* Initialize Cxbx-Reloaded File Paths */
 	CxbxrInitFilePaths();
+	// Load beta.ini before logging is configured so full_trace can capture
+	// startup, QuickReboot, and system-selection behavior as well as gameplay.
+	BetaConfig_Load();
+	g_UseFixedFunctionVertexShader =
+		g_BetaConfig.ff_hlsl_vertex_shader != 0;
 
 	// Get DCHandle :
 	// We must save this handle now to keep the child window working in the case we need to display the UEM
@@ -971,8 +1017,18 @@ void CxbxKrnlEmulate(unsigned int reserved_systems, blocks_reserved_t blocks_res
 	int BootFlags;
 	g_EmuShared->GetBootFlags(&BootFlags);
 
+	// Restore Chihiro test mode flag from shared boot flags (survives QuickReboot)
+	if (BootFlags & BOOT_CHIHIRO_TEST) {
+		g_bChihiroTestMode = true;
+	}
+
 	// Set up the logging variables for the kernel process during initialization.
 	log_sync_config();
+#if defined(_DEBUG)
+	if (g_FullTraceEnabled) {
+		log_enable_full_trace();
+	}
+#endif
 
 	// When a reboot occur, we need to keep persistent memory buffer open before emulation process shutdown.
 	if ((BootFlags & BOOT_QUICK_REBOOT) != 0) {
@@ -1015,7 +1071,11 @@ void CxbxKrnlEmulate(unsigned int reserved_systems, blocks_reserved_t blocks_res
 
 	bool isLogEnabled;
 	g_EmuShared->GetIsKrnlLogEnabled(&isLogEnabled);
+#if defined(_DEBUG)
+	g_bPrintfOn = isLogEnabled || g_FullTraceEnabled;
+#else
 	g_bPrintfOn = isLogEnabled;
+#endif
 
 	g_EmuShared->ResetKrnl();
 
@@ -1162,16 +1222,16 @@ static void CxbxrKrnlInitHacks()
 	__asm mov Host2XbStackBaseReserved, esp;
 	xbox::ulong_xt HostThreadTlsDataSize = 0;
 	if (pTLS != nullptr) {
-		// The kernel/DPC loop executes title callbacks on this host thread. Give
-		// it the same stack-relative Xbox TLS layout as ordinary title threads.
+		// The kernel/DPC loop executes title callbacks directly on this host
+		// thread. Those callbacks can use the Xbox CRT's stack-relative TLS,
+		// so reserve and initialize the same TLS layout as ordinary title
+		// threads instead of leaving the slot uninitialized.
 		HostThreadTlsDataSize = pTLS->dwDataEndAddr - pTLS->dwDataStartAddr;
 		HostThreadTlsDataSize += pTLS->dwSizeofZeroFill + 15;
-		HostThreadTlsDataSize =
-			(HostThreadTlsDataSize & ~15) + sizeof(xbox::addr_xt);
+		HostThreadTlsDataSize = (HostThreadTlsDataSize & ~15) + sizeof(xbox::addr_xt);
 	}
-	unsigned Host2XbStackSizeReserved = EmuGenerateStackSize(
-		Host2XbStackBaseReserved,
-		HostThreadTlsDataSize);
+	unsigned Host2XbStackSizeReserved =
+		EmuGenerateStackSize(Host2XbStackBaseReserved, HostThreadTlsDataSize);
 	__asm sub esp, Host2XbStackSizeReserved;
     // Set windows timer period to 1ms
     // Windows will automatically restore this value back to original on program exit
@@ -1192,8 +1252,6 @@ static void CxbxrKrnlInitHacks()
 
 	// Initialize timer subsystem
 	timer_init();
-	// Load beta feature toggles from beta.ini
-	BetaConfig_Load();
 
 	// Game-specific BetaConfig overrides can be applied here BEFORE CxbxInitWindow
 	// (D3D device creation caches BetaConfig values). Currently none needed.

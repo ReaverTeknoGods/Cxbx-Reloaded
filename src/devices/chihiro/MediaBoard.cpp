@@ -32,31 +32,27 @@
 #include <cstdarg>
 #include <string>
 #include <thread>
+#include <algorithm>
 
 // Set by QuestOfDPatches when the game XBE (not SEGABOOT) is loaded.
 // Used to skip SEGABOOT-only logic (forced QuickReboot) in the game process.
 extern bool g_QodGamePatchesActive;
 
-// File-based media board command log (stdout may be buffered)
-// File logging is available only in Debug builds.
 #if defined(_DEBUG)
-#define MB_LOG_ENABLED 1
-#else
-#define MB_LOG_ENABLED 0
-#endif
-
 static FILE* g_mbLog = nullptr;
 uint32_t s_type3TableBase = 0; // exported for state monitor
 static void MbLog(const char* fmt, ...) {
-#if MB_LOG_ENABLED
     if (!g_mbLog) g_mbLog = fopen("C:\\temp\\mb_log.txt", "w");
     if (!g_mbLog) return;
     va_list ap; va_start(ap, fmt);
     vfprintf(g_mbLog, fmt, ap);
     va_end(ap);
     fflush(g_mbLog);
-#endif
 }
+#else
+uint32_t s_type3TableBase = 0; // exported for state monitor
+#define MbLog(...) do {} while (0)
+#endif
 
 #define _XBOXKRNL_DEFEXTRN_
 #define LOG_PREFIX CXBXR_MODULE::JVS // TODO: XBAM
@@ -593,6 +589,17 @@ void MediaBoard::LpcWrite(uint32_t addr, uint32_t value, int size)
 
 void MediaBoard::ComRead(uint32_t offset, void* buffer, uint32_t length)
 {
+    // Offset 0: game uses this when port 0x4084 returns 0 (DRAM base unset).
+    // Single shared buffer for both read and write (like real DIMM RAM at offset 0).
+    if (offset == 0x00000000) {
+        static int comRead0Count = 0;
+        comRead0Count++;
+        if (comRead0Count <= 5 || (comRead0Count % 10000) == 0)
+            MbLog("ComRead [0x00000000] len=%u (count=%d)\n", length, comRead0Count);
+        memcpy(buffer, buffer_offset0, std::min(length, (uint32_t)sizeof(buffer_offset0)));
+        return;
+    }
+
     static int comRead900000Count = 0;
     if (offset == 0x900000) {
         comRead900000Count++;
@@ -655,6 +662,37 @@ void MediaBoard::ComRead(uint32_t offset, void* buffer, uint32_t length)
 
 void MediaBoard::ComWrite(uint32_t offset, void* buffer, uint32_t length)
 {
+    // Offset 0: shared buffer for command/response when DRAM base unset.
+    // The game writes a command here, we process it and overwrite with response.
+    if (offset == 0x00000000) {
+        static int comWrite0Count = 0;
+        comWrite0Count++;
+        if (comWrite0Count <= 5 || (comWrite0Count % 10000) == 0)
+            MbLog("ComWrite [0x00000000] len=%u (count=%d)\n", length, comWrite0Count);
+
+        // Store in the shared buffer
+        memcpy(buffer_offset0, buffer, std::min(length, (uint32_t)sizeof(buffer_offset0)));
+
+        // Check if this is a command (seq+cmd in first 4 bytes)
+        uint8_t* inputBuffer = (uint8_t*)buffer_offset0;
+        uint16_t seq     = *(uint16_t*)&inputBuffer[0];
+        uint16_t command = *(uint16_t*)&inputBuffer[2];
+
+        if (seq == 0 && command == 0) {
+            // Game is clearing/ack — just store, no processing
+            return;
+        }
+
+        // Process as command: copy to buffer_900200 and trigger the 0x900200 handler
+        memcpy(buffer_900200, buffer, std::min(length, (uint32_t)512u));
+        // Re-route to offset 0x900200 processing (will write response to buffer_900000)
+        offset = 0x900200;
+        m_offset0Pending = true;
+        // Fall through to the 0x900200 handler below, which will process the command,
+        // generate a response in buffer_900000, and assert IRQ10.
+        // After it returns, copy the response back to buffer_offset0 for the game to read.
+    }
+
     static int comWrite900000Count = 0;
     if (offset == 0x900000) {
         comWrite900000Count++;
@@ -741,9 +779,7 @@ void MediaBoard::ComWrite(uint32_t offset, void* buffer, uint32_t length)
         case MB_CMD_DIMM_SIZE: { // 0x0001
             // MAME returns 0x00f00000 (partition-related size value)
             *(uint32_t*)&outputBuffer[4] = 0x00f00000;
-#if defined(_DEBUG)
             EmuLog(LOG_LEVEL::DEBUG, "  MB_CMD_DIMM_SIZE -> 0x00f00000");
-#endif
             break;
         }
         case MB_CMD_STATUS: { // 0x0100
@@ -759,9 +795,7 @@ void MediaBoard::ComWrite(uint32_t offset, void* buffer, uint32_t length)
         }
         case MB_CMD_SYSTEM_TYPE: { // 0x0102
             *(uint32_t*)&outputBuffer[4] = 0; // MAME returns 0; bit 16 = develop mode
-#if defined(_DEBUG)
             EmuLog(LOG_LEVEL::DEBUG, "  MB_CMD_SYSTEM_TYPE -> 0 (normal)");
-#endif
             break;
         }
         case MB_CMD_SERIAL_NUMBER: { // 0x0103
@@ -846,6 +880,13 @@ void MediaBoard::ComWrite(uint32_t offset, void* buffer, uint32_t length)
         inputBuffer[0] = inputBuffer[1] = inputBuffer[2] = inputBuffer[3] = 0;
 
         m_commandsProcessed++;
+
+        // If this command came from offset 0, copy response back to shared buffer
+        if (m_offset0Pending) {
+            memcpy(buffer_offset0, m_shadowResponse, sizeof(buffer_offset0));
+            m_offset0Pending = false;
+            MbLog("  Copied response to buffer_offset0\n");
+        }
 
         HalSystemInterrupts[10].Assert(true);
         return;

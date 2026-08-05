@@ -381,6 +381,7 @@ file (GLOB CXBXR_SOURCE_EMU
  "${CXBXR_ROOT_DIR}/src/core/hle/Patches/MahjongPatches.cpp"
  "${CXBXR_ROOT_DIR}/src/core/hle/Patches/OutRun2Patches.cpp"
  "${CXBXR_ROOT_DIR}/src/core/hle/Patches/QuestOfDPatches.cpp"
+ "${CXBXR_ROOT_DIR}/src/core/hle/Patches/GhostSquadPatches.cpp"
  "${CXBXR_ROOT_DIR}/src/core/hle/XACTENG/XactEng.cpp"
  "${CXBXR_ROOT_DIR}/src/core/hle/XGRAPHIC/XGraphic.cpp"
  "${CXBXR_ROOT_DIR}/src/core/kernel/exports/EmuKrnl.cpp"

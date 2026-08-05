@@ -74,6 +74,8 @@
 #include "common/PerfTrace.h"
 #include "common/RenderTrace.h"
 #include "common/BetaConfig.h"
+#include "common/win32/WineEnv.h"
+#include "devices/chihiro/JvsIo.h"
 
 #include <imgui.h>
 #include <backends/imgui_impl_dx9.h>
@@ -87,6 +89,8 @@
 #include <functional>
 #include <unordered_map>
 #include <thread>
+#include <float.h>
+#include <xmmintrin.h>
 
 #include <wrl/client.h>
 
@@ -94,6 +98,1430 @@ using namespace Microsoft::WRL;
 
 extern void nv2a_const_diag_new_frame();
 extern void nv2a_const_diag_next_draw();
+extern float* HLE_get_NV2A_vertex_constant_float4_ptr(unsigned const_index);
+extern volatile uint32_t s_drawArraysCount;
+extern volatile uint32_t s_drawInlineBufferCount;
+extern volatile uint32_t s_drawInlineArrayCount;
+extern volatile uint32_t s_drawInlineElementsCount;
+extern bool g_ChihiroOutRun2Game;
+extern XboxRenderStateConverter XboxRenderStates;
+extern XboxTextureStateConverter XboxTextureStates;
+extern xbox::X_VERTEXATTRIBUTEFORMAT* GetXboxVertexAttributeFormat();
+extern FixedFunctionVertexShaderState ffShaderState;
+extern D3D8LightState d3d8LightState;
+extern NV2ADevice* g_NV2A;
+extern xbox::X_D3DSurface* g_pXbox_BackBufferSurface;
+extern xbox::X_D3DSurface* g_pXbox_RenderTarget;
+void* GetDataFromXboxResource(xbox::X_D3DResource* pXboxResource);
+uint32_t HLE_read_NV2A_pgraph_register(int reg);
+uintptr_t HLE_get_NV2A_texture_data_address(unsigned stage);
+
+// Set only while an NV2A push-buffer callback is issuing its host draw. This
+// lets the renderer probe distinguish PGRAPH-originated draws from ordinary
+// Xbox D3D API draws without changing either path's behavior.
+thread_local bool g_HlePgraphDrawActive = false;
+
+namespace {
+
+struct OutRunDrawProbeRecord {
+	LONG kind;
+	LONG hostPrimitiveType;
+	LONG xboxPrimitiveType;
+	LONG primitiveCount;
+	LONG vertexCount;
+	LONG startVertex;
+	LONG stride;
+	LONG vertexShaderHandle;
+	LONG pixelShaderHandle;
+	LONG vertexShaderMode;
+	LONG fixedFunctionFlags;
+	LONG vertexShaderKeyLow;
+	LONG vertexShaderKeyHigh;
+	LONG vertexShaderHashLow;
+	LONG vertexShaderHashHigh;
+	LONG vertexBlend;
+	LONG alphaBlendEnable;
+	LONG sourceBlend;
+	LONG destinationBlend;
+	LONG blendColor;
+	LONG alphaTestEnable;
+	LONG alphaReference;
+	LONG alphaFunction;
+	LONG zWriteEnable;
+	LONG colorWriteEnable;
+	LONG cullMode;
+	LONG texture0Data;
+	LONG texture0Format;
+	LONG texture0Common;
+	LONG stencilEnable;
+	LONG stencilFail;
+	LONG stencilZFail;
+	LONG stencilPass;
+	LONG stencilFunction;
+	LONG stencilReference;
+	LONG stencilMask;
+	LONG stencilWriteMask;
+	LONG textureData[4];
+	LONG textureFormat[4];
+	LONG textureCommon[4];
+	LONG colorOp[4];
+	LONG colorArg0[4];
+	LONG colorArg1[4];
+	LONG colorArg2[4];
+	LONG alphaOp[4];
+	LONG alphaArg0[4];
+	LONG alphaArg1[4];
+	LONG alphaArg2[4];
+	LONG resultArg[4];
+	LONG textureFactor;
+	LONG specularEnable;
+	LONG fogEnable;
+	LONG fogColor;
+	LONG lightingEnable;
+	LONG ambient;
+	LONG colorVertex;
+	LONG diffuseMaterialSource;
+	LONG specularMaterialSource;
+	LONG ambientMaterialSource;
+	LONG emissiveMaterialSource;
+	LONG addressU[4];
+	LONG addressV[4];
+	LONG magFilter[4];
+	LONG minFilter[4];
+	LONG mipFilter[4];
+	LONG mipMapLodBias[4];
+	LONG maxMipLevel[4];
+	LONG vertexDeclarationKeyLow;
+	LONG vertexDeclarationKeyHigh;
+	LONG declaredRegistersMask;
+	LONG positionFormat;
+	LONG weightFormat;
+	LONG normalFormat;
+	LONG diffuseFormat;
+	LONG specularFormat;
+	LONG texCoord0Format;
+	LONG positionOffset;
+	LONG normalOffset;
+	LONG normalStream;
+	LONG normalizeNormals;
+	LONG twoSidedLighting;
+	LONG localViewer;
+	LONG pointSpriteEnable;
+	LONG texCoordIndex[4];
+	LONG textureTransformFlags[4];
+	LONG hostTextureType[4];
+	LONG hostTextureFormat[4];
+	LONG hostTextureWidth[4];
+	LONG hostTextureHeight[4];
+	LONG hostTextureLevels[4];
+	LONG colorKeyOp[4];
+	LONG colorSign[4];
+	LONG alphaKill[4];
+	LONG colorKeyColor[4];
+	LONG geometryVertexCount;
+	LONG hostStreamStride;
+	LONG hostStreamOffset;
+	LONG texCoordElementType;
+	LONG texCoordElementOffset;
+	LONG diffuseElementType;
+	LONG diffuseElementOffset;
+	LONG positionBoundsValid;
+	float minPositionX;
+	float minPositionY;
+	float minPositionZ;
+	float maxPositionX;
+	float maxPositionY;
+	float maxPositionZ;
+	LONG texCoordBoundsValid;
+	float minU;
+	float minV;
+	float maxU;
+	float maxV;
+	LONG diffuseBoundsValid;
+	LONG minDiffuseR;
+	LONG minDiffuseG;
+	LONG minDiffuseB;
+	LONG minDiffuseA;
+	LONG maxDiffuseR;
+	LONG maxDiffuseG;
+	LONG maxDiffuseB;
+	LONG maxDiffuseA;
+	float textureScaleU;
+	float textureScaleV;
+	LONG fogTableMode;
+	float fogDensity;
+	float fogStart;
+	float fogEnd;
+	LONG rangeFogEnable;
+	LONG fixedFunctionFogDepthMode;
+	LONG fixedFunctionFogTableMode;
+	float fixedFunctionFogDensity;
+	float fixedFunctionFogStart;
+	float fixedFunctionFogEnd;
+	LONG zFunction;
+	LONG zBias;
+	LONG stippleEnable;
+	LONG multisampleAntialias;
+	LONG multisampleMask;
+	LONG multisampleMode;
+	LONG multisampleRenderTargetMode;
+	LONG shadowFunction;
+	LONG sampleAlpha;
+	LONG dxt1NoiseEnable;
+	LONG occlusionCullEnable;
+	LONG hostZFunction;
+	LONG hostDepthBias;
+	LONG hostMultisampleMask;
+	LONG hostAlphaBlendEnable;
+	LONG hostSourceBlend;
+	LONG hostDestinationBlend;
+	LONG hostBlendOperation;
+	LONG hostBlendFactor;
+	LONG xboxRenderTargetData;
+	LONG xboxRenderTargetFormat;
+	LONG xboxRenderTargetSize;
+	LONG xboxRenderTargetCommon;
+	LONG xboxRenderTargetIsBackBuffer;
+	LONG hostRenderTargetPointer;
+	LONG hostRenderTargetFormat;
+	LONG hostRenderTargetWidth;
+	LONG hostRenderTargetHeight;
+	LONG hostRenderTargetMultisampleType;
+	LONG hostRenderTargetMultisampleQuality;
+	LONG hostViewportX;
+	LONG hostViewportY;
+	LONG hostViewportWidth;
+	LONG hostViewportHeight;
+	float hostViewportMinZ;
+	float hostViewportMaxZ;
+	LONG hostScissorLeft;
+	LONG hostScissorTop;
+	LONG hostScissorRight;
+	LONG hostScissorBottom;
+	LONG fixedFunctionEnabledLightCount;
+	LONG fixedFunctionEnabledLights[8];
+	float fixedFunctionMaterialDiffuse[4];
+	float fixedFunctionMaterialAmbient[4];
+	float fixedFunctionMaterialSpecular[4];
+	float fixedFunctionMaterialEmissive[4];
+	float fixedFunctionMaterialPower;
+	float fixedFunctionTotalAmbientFront[3];
+	float fixedFunctionTotalAmbientBack[3];
+	LONG fixedFunctionLightType[8];
+	float fixedFunctionLightDiffuse[8][4];
+	float fixedFunctionLightPosition[8][3];
+	float fixedFunctionLightDirection[8][3];
+	float fixedFunctionLightRange[8];
+	float fixedFunctionLightAttenuation[8][3];
+	float fixedFunctionLightFalloff[8];
+	float fixedFunctionTextureTransform0[16];
+	LONG hostSamplerMagFilter[4];
+	LONG hostSamplerMinFilter[4];
+	LONG hostSamplerMipFilter[4];
+	LONG hostSamplerMaxMipLevel[4];
+	LONG hostSamplerMipMapLodBias[4];
+	LONG hostSamplerSrgbTexture[4];
+	LONG hostTextureStageColorOp[4];
+	LONG hostTextureStageAlphaOp[4];
+	LONG hostSrgbWriteEnable;
+	LONG pgraphTextureOffset[4];
+	LONG pgraphTextureFormat[4];
+	LONG pgraphTextureControl0[4];
+	LONG pgraphTextureFilter[4];
+	LONG pgraphShaderProgram;
+	LONG pgraphShaderControl;
+	LONG pgraphCombinerControl;
+	LONG pgraphCombinerColorInput0;
+	LONG pgraphCombinerAlphaInput0;
+	LONG pgraphCombinerColorOutput0;
+	LONG pgraphCombinerAlphaOutput0;
+	LONG pgraphCombinerFactor0;
+	LONG pgraphCombinerFactor1;
+	LONG fixedFunctionTextureTransformFlagsCount[4];
+	LONG fixedFunctionTextureTransformFlagsProjected[4];
+	LONG pgraphDrawOrigin;
+	LONG pgraphTextureHostAddress[4];
+	LONG pgraphBlend;
+	LONG pgraphControl0;
+	LONG pgraphFogColor;
+	LONG pgraphCsv0C;
+	LONG immediateFirstDwords[8];
+	LONG pgraphLightMask;
+	LONG pgraphLightType[8];
+	float pgraphLightDiffuse[8][3];
+	float pgraphLightPosition[8][3];
+	float pgraphLightAttenuation[8][3];
+	float pgraphLightRange[8];
+};
+
+constexpr LONG kOutRunDrawProbeRecordCount = 4096;
+
+struct OutRunDrawProbeState {
+	volatile LONG enabled;
+	volatile LONG skipBegin;
+	volatile LONG skipEnd;
+	volatile LONG frameNumber;
+	volatile LONG lastDrawCount;
+	volatile LONG currentDraw;
+	volatile LONG matchedOrdinal;
+	volatile LONG matchedKind;
+	volatile LONG matchedHostPrimitiveType;
+	volatile LONG matchedXboxPrimitiveType;
+	volatile LONG matchedPrimitiveCount;
+	volatile LONG matchedVertexCount;
+	volatile LONG matchedStartVertex;
+	volatile LONG matchedStride;
+	volatile LONG matchedVertexShaderHandle;
+	volatile LONG matchedPixelShaderHandle;
+	volatile LONG matchedVertexShaderMode;
+	volatile LONG matchedFixedFunctionFlags;
+	volatile LONG matchedVertexShaderKeyLow;
+	volatile LONG matchedVertexShaderKeyHigh;
+	volatile LONG matchedVertexShaderHashLow;
+	volatile LONG matchedVertexShaderHashHigh;
+	volatile LONG filterKind;
+	volatile LONG filterHostPrimitiveType;
+	volatile LONG filterXboxPrimitiveType;
+	volatile LONG filterPrimitiveCountMin;
+	volatile LONG filterPrimitiveCountMax;
+	volatile LONG filterVertexCountMin;
+	volatile LONG filterVertexCountMax;
+	volatile LONG filterVertexShaderHandle;
+	volatile LONG filterPixelShaderHandle;
+	volatile LONG filterVertexShaderMode;
+	volatile LONG filterFixedFunctionFlags;
+	volatile LONG filterMatchMask;
+	volatile LONG captureRequest;
+	volatile LONG captureComplete;
+	volatile LONG captureCount;
+	volatile LONG captureFrame;
+	volatile LONG filterTexture0Data;
+	volatile LONG filterTexture0Format;
+	volatile LONG filterTexture0DataMin;
+	volatile LONG filterTexture0DataMax;
+	volatile LONG dumpRequest;
+	volatile LONG dumpComplete;
+	volatile LONG dumpTexture0Data;
+	volatile LONG pushDrawArraysCount;
+	volatile LONG pushDrawInlineBufferCount;
+	volatile LONG pushDrawInlineArrayCount;
+	volatile LONG pushDrawInlineElementsCount;
+	OutRunDrawProbeRecord captureRecords[kOutRunDrawProbeRecordCount];
+};
+
+HANDLE g_OutRunDrawProbeMapping = nullptr;
+OutRunDrawProbeState* g_OutRunDrawProbe = nullptr;
+LONG g_OutRunDrawOrdinal = 0;
+bool g_OutRunDrawProbeCaptureActive = false;
+
+void EnsureOutRunDrawProbe()
+{
+	// The draw probe is useful for any title-specific render investigation.
+	// Its historical name is retained for compatibility with the existing
+	// shared-memory controller.
+	if (!g_BetaConfig.or2_draw_probe || g_OutRunDrawProbe != nullptr) {
+		return;
+	}
+
+	g_OutRunDrawProbeMapping = CreateFileMappingA(
+		INVALID_HANDLE_VALUE,
+		nullptr,
+		PAGE_READWRITE,
+		0,
+		sizeof(OutRunDrawProbeState),
+		"TeknoParrot_CxbxOutRunDrawProbe");
+	if (g_OutRunDrawProbeMapping == nullptr) {
+		return;
+	}
+
+	g_OutRunDrawProbe = static_cast<OutRunDrawProbeState*>(
+		MapViewOfFile(
+			g_OutRunDrawProbeMapping,
+			FILE_MAP_ALL_ACCESS,
+			0,
+			0,
+			sizeof(OutRunDrawProbeState)));
+	if (g_OutRunDrawProbe == nullptr) {
+		CloseHandle(g_OutRunDrawProbeMapping);
+		g_OutRunDrawProbeMapping = nullptr;
+	}
+}
+
+void OutRunDrawProbeBeginFrame()
+{
+	EnsureOutRunDrawProbe();
+	if (g_OutRunDrawProbe != nullptr) {
+		if (g_OutRunDrawProbeCaptureActive) {
+			InterlockedExchange(
+				&g_OutRunDrawProbe->captureCount,
+				std::min(g_OutRunDrawOrdinal, kOutRunDrawProbeRecordCount));
+			InterlockedExchange(
+				&g_OutRunDrawProbe->captureFrame,
+				g_OutRunDrawProbe->frameNumber);
+			InterlockedExchange(&g_OutRunDrawProbe->captureComplete, 1);
+			g_OutRunDrawProbeCaptureActive = false;
+		}
+		InterlockedExchange(
+			&g_OutRunDrawProbe->lastDrawCount,
+			g_OutRunDrawOrdinal);
+		InterlockedExchange(
+			&g_OutRunDrawProbe->pushDrawArraysCount,
+			static_cast<LONG>(s_drawArraysCount));
+		InterlockedExchange(
+			&g_OutRunDrawProbe->pushDrawInlineBufferCount,
+			static_cast<LONG>(s_drawInlineBufferCount));
+		InterlockedExchange(
+			&g_OutRunDrawProbe->pushDrawInlineArrayCount,
+			static_cast<LONG>(s_drawInlineArrayCount));
+		InterlockedExchange(
+			&g_OutRunDrawProbe->pushDrawInlineElementsCount,
+			static_cast<LONG>(s_drawInlineElementsCount));
+		InterlockedIncrement(&g_OutRunDrawProbe->frameNumber);
+		InterlockedExchange(&g_OutRunDrawProbe->currentDraw, 0);
+		if (InterlockedExchange(
+				&g_OutRunDrawProbe->captureRequest, 0) != 0) {
+			InterlockedExchange(&g_OutRunDrawProbe->captureComplete, 0);
+			InterlockedExchange(&g_OutRunDrawProbe->captureCount, 0);
+			g_OutRunDrawProbeCaptureActive = true;
+		}
+	}
+	g_OutRunDrawOrdinal = 0;
+}
+
+bool OutRunDrawProbeShouldSkipDraw(
+	LONG kind,
+	D3DPRIMITIVETYPE hostPrimitiveType,
+	xbox::X_D3DPRIMITIVETYPE xboxPrimitiveType,
+	UINT primitiveCount,
+	UINT vertexCount,
+	UINT startVertex,
+	UINT stride)
+{
+	bool skipCrazyTaxiNoiseTexture = false;
+	bool skipCrazyTaxiStencilDraw = false;
+	if (g_BetaConfig.ct_debug_skip_noise_textures &&
+		g_jvs_game_type == JvsGameType::CrazyTaxi &&
+		g_pD3DDevice != nullptr &&
+		g_pXbox_SetTexture[0] != nullptr &&
+		XboxTextureStates.Get(0, xbox::X_D3DTSS_MAGFILTER) ==
+			xbox::X_D3DTEXF_POINT &&
+		XboxTextureStates.Get(0, xbox::X_D3DTSS_MINFILTER) ==
+			xbox::X_D3DTEXF_POINT) {
+		IDirect3DBaseTexture9* hostTexture = nullptr;
+		if (SUCCEEDED(g_pD3DDevice->GetTexture(0, &hostTexture)) &&
+			hostTexture != nullptr) {
+			if (hostTexture->GetType() == D3DRTYPE_TEXTURE) {
+				D3DSURFACE_DESC desc{};
+				if (SUCCEEDED(
+						static_cast<IDirect3DTexture9*>(hostTexture)
+							->GetLevelDesc(0, &desc))) {
+					skipCrazyTaxiNoiseTexture =
+						desc.Format == D3DFMT_DXT1 &&
+						desc.Width == 64 &&
+						desc.Height == 128;
+				}
+			}
+			hostTexture->Release();
+		}
+	}
+
+	// Crazy Taxi High Roller builds its nighttime masks from paired shadow
+	// volumes. The two passes draw with color disabled (ZERO, ONE blending),
+	// alternate CW/CCW culling, and wrap the stencil value in opposite
+	// directions. Keep the comparison title-scoped so D3D9 winding and wrap
+	// orientation can be checked against NV2A/Xemu without affecting another
+	// Xbox title.
+	if (g_jvs_game_type == JvsGameType::CrazyTaxi &&
+		g_pD3DDevice != nullptr &&
+		g_BetaConfig.ct_debug_stencil_volume_mode != 0) {
+		const DWORD stencilEnable =
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_STENCILENABLE);
+		const DWORD stencilPass =
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_STENCILPASS);
+		const DWORD sourceBlend =
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_SRCBLEND);
+		const DWORD destinationBlend =
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_DESTBLEND);
+		const bool isStencilVolume =
+			stencilEnable != 0 &&
+			sourceBlend == 0x000 &&
+			destinationBlend == 0x001 &&
+			(stencilPass == 0x8507 || stencilPass == 0x8508) &&
+			primitiveCount >= 20;
+		const bool isFinalDarkeningQuad =
+			stencilEnable != 0 &&
+			kind == 3 &&
+			primitiveCount == 2 &&
+			vertexCount == 4 &&
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_STENCILFUNC) == 0x205 &&
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_STENCILREF) == 0 &&
+			stencilPass == 0x1e00;
+
+		switch (g_BetaConfig.ct_debug_stencil_volume_mode) {
+		case 1:
+			if (isStencilVolume) {
+				DWORD hostCullMode = D3DCULL_NONE;
+				if (SUCCEEDED(g_pD3DDevice->GetRenderState(
+						D3DRS_CULLMODE,
+						&hostCullMode))) {
+					if (hostCullMode == D3DCULL_CW) {
+						g_pD3DDevice->SetRenderState(
+							D3DRS_CULLMODE,
+							D3DCULL_CCW);
+					}
+					else if (hostCullMode == D3DCULL_CCW) {
+						g_pD3DDevice->SetRenderState(
+							D3DRS_CULLMODE,
+							D3DCULL_CW);
+					}
+				}
+			}
+			break;
+		case 2:
+			if (isStencilVolume) {
+				g_pD3DDevice->SetRenderState(
+					D3DRS_STENCILPASS,
+					stencilPass == 0x8507
+						? D3DSTENCILOP_DECR
+						: D3DSTENCILOP_INCR);
+			}
+			break;
+		case 3:
+			skipCrazyTaxiStencilDraw = isStencilVolume;
+			break;
+		case 4:
+			skipCrazyTaxiStencilDraw = isFinalDarkeningQuad;
+			break;
+		default:
+			break;
+		}
+	}
+
+	if (g_OutRunDrawProbe == nullptr) {
+		return skipCrazyTaxiNoiseTexture || skipCrazyTaxiStencilDraw;
+	}
+
+	const LONG ordinal = ++g_OutRunDrawOrdinal;
+	InterlockedExchange(&g_OutRunDrawProbe->currentDraw, ordinal);
+	const uint64_t vertexShaderKey = g_ActiveXboxVertexShaderKey;
+	const uint64_t vertexShaderHash = g_ActiveXboxVertexShaderCacheHash;
+	const LONG vertexShaderHandle =
+		static_cast<LONG>(g_Xbox_VertexShader_Handle);
+	const LONG pixelShaderHandle =
+		static_cast<LONG>(reinterpret_cast<uintptr_t>(g_pXbox_PixelShader));
+	const LONG vertexShaderMode =
+		static_cast<LONG>(g_Xbox_VertexShaderMode);
+	const LONG fixedFunctionFlags =
+		(g_UseFixedFunctionVertexShader ? 1L : 0L) |
+			(g_UseFixedFunctionPixelShader ? 2L : 0L);
+	if (g_OutRunDrawProbeCaptureActive &&
+		ordinal <= kOutRunDrawProbeRecordCount) {
+		OutRunDrawProbeRecord& record =
+			g_OutRunDrawProbe->captureRecords[ordinal - 1];
+		record.kind = kind;
+		record.hostPrimitiveType = static_cast<LONG>(hostPrimitiveType);
+		record.xboxPrimitiveType = static_cast<LONG>(xboxPrimitiveType);
+		record.primitiveCount = static_cast<LONG>(primitiveCount);
+		record.vertexCount = static_cast<LONG>(vertexCount);
+		record.startVertex = static_cast<LONG>(startVertex);
+		record.stride = static_cast<LONG>(stride);
+		record.vertexShaderHandle = vertexShaderHandle;
+		record.pixelShaderHandle = pixelShaderHandle;
+		record.vertexShaderMode = vertexShaderMode;
+		record.fixedFunctionFlags = fixedFunctionFlags;
+		record.vertexShaderKeyLow =
+			static_cast<LONG>(vertexShaderKey & 0xFFFFFFFFu);
+		record.vertexShaderKeyHigh =
+			static_cast<LONG>(vertexShaderKey >> 32);
+		record.vertexShaderHashLow =
+			static_cast<LONG>(vertexShaderHash & 0xFFFFFFFFu);
+		record.vertexShaderHashHigh =
+			static_cast<LONG>(vertexShaderHash >> 32);
+		record.vertexBlend = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_VERTEXBLEND));
+		record.alphaBlendEnable = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_ALPHABLENDENABLE));
+		record.sourceBlend = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_SRCBLEND));
+		record.destinationBlend = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_DESTBLEND));
+		record.blendColor = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_BLENDCOLOR));
+		record.alphaTestEnable = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_ALPHATESTENABLE));
+		record.alphaReference = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_ALPHAREF));
+		record.alphaFunction = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_ALPHAFUNC));
+		record.zWriteEnable = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_ZWRITEENABLE));
+		record.colorWriteEnable = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_COLORWRITEENABLE));
+		record.cullMode = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_CULLMODE));
+		xbox::X_VERTEXATTRIBUTEFORMAT* vertexAttributes =
+			GetXboxVertexAttributeFormat();
+		CxbxVertexDeclaration* vertexDeclaration =
+			CxbxGetVertexDeclaration();
+		const uint64_t vertexDeclarationKey =
+			vertexDeclaration != nullptr ? vertexDeclaration->Key : 0;
+		record.vertexDeclarationKeyLow =
+			static_cast<LONG>(vertexDeclarationKey & 0xFFFFFFFFu);
+		record.vertexDeclarationKeyHigh =
+			static_cast<LONG>(vertexDeclarationKey >> 32);
+		record.declaredRegistersMask = 0;
+		if (vertexDeclaration != nullptr) {
+			for (unsigned registerIndex = 0;
+				registerIndex < X_VSH_MAX_ATTRIBUTES;
+				++registerIndex) {
+				if (vertexDeclaration->vRegisterInDeclaration[registerIndex]) {
+					record.declaredRegistersMask |= 1L << registerIndex;
+				}
+			}
+		}
+		record.positionFormat =
+			static_cast<LONG>(
+				vertexAttributes->Slots[xbox::X_D3DVSDE_POSITION].Format);
+		record.weightFormat =
+			static_cast<LONG>(
+				vertexAttributes->Slots[xbox::X_D3DVSDE_BLENDWEIGHT].Format);
+		record.normalFormat =
+			static_cast<LONG>(
+				vertexAttributes->Slots[xbox::X_D3DVSDE_NORMAL].Format);
+		record.diffuseFormat =
+			static_cast<LONG>(
+				vertexAttributes->Slots[xbox::X_D3DVSDE_DIFFUSE].Format);
+		record.specularFormat =
+			static_cast<LONG>(
+				vertexAttributes->Slots[xbox::X_D3DVSDE_SPECULAR].Format);
+		record.texCoord0Format =
+			static_cast<LONG>(
+				vertexAttributes->Slots[xbox::X_D3DVSDE_TEXCOORD0].Format);
+		record.positionOffset =
+			static_cast<LONG>(
+				vertexAttributes->Slots[xbox::X_D3DVSDE_POSITION].Offset);
+		record.normalOffset =
+			static_cast<LONG>(
+				vertexAttributes->Slots[xbox::X_D3DVSDE_NORMAL].Offset);
+		record.normalStream =
+			static_cast<LONG>(
+				vertexAttributes->Slots[xbox::X_D3DVSDE_NORMAL].StreamIndex);
+		record.normalizeNormals = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_NORMALIZENORMALS));
+		record.twoSidedLighting = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_TWOSIDEDLIGHTING));
+		record.localViewer = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_LOCALVIEWER));
+		record.pointSpriteEnable = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_POINTSPRITEENABLE));
+		record.texture0Data =
+			g_pXbox_SetTexture[0] != nullptr
+				? static_cast<LONG>(g_pXbox_SetTexture[0]->Data)
+				: 0;
+		record.texture0Format =
+			g_pXbox_SetTexture[0] != nullptr
+				? static_cast<LONG>(g_pXbox_SetTexture[0]->Format)
+				: 0;
+		record.texture0Common =
+			g_pXbox_SetTexture[0] != nullptr
+				? static_cast<LONG>(g_pXbox_SetTexture[0]->Common)
+				: 0;
+		record.stencilEnable = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_STENCILENABLE));
+		record.stencilFail = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_STENCILFAIL));
+		record.stencilZFail = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_STENCILZFAIL));
+		record.stencilPass = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_STENCILPASS));
+		record.stencilFunction = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_STENCILFUNC));
+		record.stencilReference = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_STENCILREF));
+		record.stencilMask = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_STENCILMASK));
+		record.stencilWriteMask = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_STENCILWRITEMASK));
+		for (int stage = 0; stage < xbox::X_D3DTS_STAGECOUNT; ++stage) {
+			const xbox::X_D3DBaseTexture* texture = g_pXbox_SetTexture[stage];
+			record.textureData[stage] =
+				texture != nullptr ? static_cast<LONG>(texture->Data) : 0;
+			record.textureFormat[stage] =
+				texture != nullptr ? static_cast<LONG>(texture->Format) : 0;
+			record.textureCommon[stage] =
+				texture != nullptr ? static_cast<LONG>(texture->Common) : 0;
+			record.colorOp[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(stage, xbox::X_D3DTSS_COLOROP));
+			record.colorArg0[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(stage, xbox::X_D3DTSS_COLORARG0));
+			record.colorArg1[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(stage, xbox::X_D3DTSS_COLORARG1));
+			record.colorArg2[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(stage, xbox::X_D3DTSS_COLORARG2));
+			record.alphaOp[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(stage, xbox::X_D3DTSS_ALPHAOP));
+			record.alphaArg0[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(stage, xbox::X_D3DTSS_ALPHAARG0));
+			record.alphaArg1[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(stage, xbox::X_D3DTSS_ALPHAARG1));
+			record.alphaArg2[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(stage, xbox::X_D3DTSS_ALPHAARG2));
+			record.resultArg[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(stage, xbox::X_D3DTSS_RESULTARG));
+			record.addressU[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(stage, xbox::X_D3DTSS_ADDRESSU));
+			record.addressV[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(stage, xbox::X_D3DTSS_ADDRESSV));
+			record.magFilter[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(stage, xbox::X_D3DTSS_MAGFILTER));
+			record.minFilter[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(stage, xbox::X_D3DTSS_MINFILTER));
+			record.mipFilter[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(stage, xbox::X_D3DTSS_MIPFILTER));
+			record.mipMapLodBias[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(stage, xbox::X_D3DTSS_MIPMAPLODBIAS));
+			record.maxMipLevel[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(stage, xbox::X_D3DTSS_MAXMIPLEVEL));
+			record.texCoordIndex[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(stage, xbox::X_D3DTSS_TEXCOORDINDEX));
+			record.textureTransformFlags[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(
+					stage,
+					xbox::X_D3DTSS_TEXTURETRANSFORMFLAGS));
+			record.colorKeyOp[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(stage, xbox::X_D3DTSS_COLORKEYOP));
+			record.colorSign[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(stage, xbox::X_D3DTSS_COLORSIGN));
+			record.alphaKill[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(stage, xbox::X_D3DTSS_ALPHAKILL));
+			record.colorKeyColor[stage] = static_cast<LONG>(
+				XboxTextureStates.Get(
+					stage,
+					xbox::X_D3DTSS_COLORKEYCOLOR));
+			record.hostTextureType[stage] = 0;
+			record.hostTextureFormat[stage] = 0;
+			record.hostTextureWidth[stage] = 0;
+			record.hostTextureHeight[stage] = 0;
+			record.hostTextureLevels[stage] = 0;
+			DWORD hostSamplerState = 0;
+			record.hostSamplerMagFilter[stage] =
+				SUCCEEDED(g_pD3DDevice->GetSamplerState(
+					stage,
+					D3DSAMP_MAGFILTER,
+					&hostSamplerState))
+					? static_cast<LONG>(hostSamplerState)
+					: -1;
+			record.hostSamplerMinFilter[stage] =
+				SUCCEEDED(g_pD3DDevice->GetSamplerState(
+					stage,
+					D3DSAMP_MINFILTER,
+					&hostSamplerState))
+					? static_cast<LONG>(hostSamplerState)
+					: -1;
+			record.hostSamplerMipFilter[stage] =
+				SUCCEEDED(g_pD3DDevice->GetSamplerState(
+					stage,
+					D3DSAMP_MIPFILTER,
+					&hostSamplerState))
+					? static_cast<LONG>(hostSamplerState)
+					: -1;
+			record.hostSamplerMaxMipLevel[stage] =
+				SUCCEEDED(g_pD3DDevice->GetSamplerState(
+					stage,
+					D3DSAMP_MAXMIPLEVEL,
+					&hostSamplerState))
+					? static_cast<LONG>(hostSamplerState)
+					: -1;
+			record.hostSamplerMipMapLodBias[stage] =
+				SUCCEEDED(g_pD3DDevice->GetSamplerState(
+					stage,
+					D3DSAMP_MIPMAPLODBIAS,
+					&hostSamplerState))
+					? static_cast<LONG>(hostSamplerState)
+					: -1;
+			record.hostSamplerSrgbTexture[stage] =
+				SUCCEEDED(g_pD3DDevice->GetSamplerState(
+					stage,
+					D3DSAMP_SRGBTEXTURE,
+					&hostSamplerState))
+					? static_cast<LONG>(hostSamplerState)
+					: -1;
+			record.hostTextureStageColorOp[stage] =
+				SUCCEEDED(g_pD3DDevice->GetTextureStageState(
+					stage,
+					D3DTSS_COLOROP,
+					&hostSamplerState))
+					? static_cast<LONG>(hostSamplerState)
+					: -1;
+			record.hostTextureStageAlphaOp[stage] =
+				SUCCEEDED(g_pD3DDevice->GetTextureStageState(
+					stage,
+					D3DTSS_ALPHAOP,
+					&hostSamplerState))
+					? static_cast<LONG>(hostSamplerState)
+					: -1;
+			record.pgraphTextureOffset[stage] = static_cast<LONG>(
+				HLE_read_NV2A_pgraph_register(
+					NV_PGRAPH_TEXOFFSET0 + stage * 4));
+			record.pgraphTextureFormat[stage] = static_cast<LONG>(
+				HLE_read_NV2A_pgraph_register(
+					NV_PGRAPH_TEXFMT0 + stage * 4));
+			record.pgraphTextureControl0[stage] = static_cast<LONG>(
+				HLE_read_NV2A_pgraph_register(
+					NV_PGRAPH_TEXCTL0_0 + stage * 4));
+			record.pgraphTextureFilter[stage] = static_cast<LONG>(
+				HLE_read_NV2A_pgraph_register(
+					NV_PGRAPH_TEXFILTER0 + stage * 4));
+			record.fixedFunctionTextureTransformFlagsCount[stage] =
+				static_cast<LONG>(
+					ffShaderState.TextureStates[stage]
+						.TextureTransformFlagsCount);
+			record.fixedFunctionTextureTransformFlagsProjected[stage] =
+				static_cast<LONG>(
+					ffShaderState.TextureStates[stage]
+						.TextureTransformFlagsProjected);
+			IDirect3DBaseTexture* hostTexture = nullptr;
+			if (SUCCEEDED(g_pD3DDevice->GetTexture(stage, &hostTexture)) &&
+				hostTexture != nullptr) {
+				const D3DRESOURCETYPE hostType = hostTexture->GetType();
+				record.hostTextureType[stage] =
+					static_cast<LONG>(hostType);
+				record.hostTextureLevels[stage] =
+					static_cast<LONG>(hostTexture->GetLevelCount());
+				if (hostType == D3DRTYPE_TEXTURE) {
+					D3DSURFACE_DESC desc{};
+					if (SUCCEEDED(
+							static_cast<IDirect3DTexture*>(hostTexture)
+								->GetLevelDesc(0, &desc))) {
+						record.hostTextureFormat[stage] =
+							static_cast<LONG>(desc.Format);
+						record.hostTextureWidth[stage] =
+							static_cast<LONG>(desc.Width);
+						record.hostTextureHeight[stage] =
+							static_cast<LONG>(desc.Height);
+					}
+				}
+				const uint32_t dumpSelector = static_cast<uint32_t>(
+					InterlockedCompareExchange(
+						&g_OutRunDrawProbe->dumpTexture0Data, 0, 0));
+				const bool dumpMatchesOrdinal =
+					(dumpSelector & 0x80000000u) != 0 &&
+					static_cast<uint32_t>(ordinal) ==
+						(dumpSelector & 0x7FFFFFFFu);
+				const bool dumpMatchesTexture =
+					(dumpSelector & 0x80000000u) == 0 &&
+					texture != nullptr &&
+					static_cast<uint32_t>(texture->Data) == dumpSelector;
+				if (stage == 0 &&
+					InterlockedCompareExchange(
+						&g_OutRunDrawProbe->dumpRequest, 0, 0) != 0 &&
+					texture != nullptr &&
+					(dumpMatchesOrdinal || dumpMatchesTexture)) {
+					char tempPath[MAX_PATH]{};
+					char hostDumpPath[MAX_PATH]{};
+					char guestDumpPath[MAX_PATH]{};
+					const DWORD tempPathLength =
+						GetTempPathA(MAX_PATH, tempPath);
+					HRESULT dumpResult = E_FAIL;
+					if (tempPathLength > 0 &&
+						tempPathLength < MAX_PATH) {
+						snprintf(
+							hostDumpPath,
+							sizeof(hostDumpPath),
+							"%sCxbxTex-%08X-host.dds",
+							tempPath,
+							static_cast<unsigned>(texture->Data));
+						snprintf(
+							guestDumpPath,
+							sizeof(guestDumpPath),
+							"%sCxbxTex-%08X-guest.bin",
+							tempPath,
+							static_cast<unsigned>(texture->Data));
+						dumpResult = D3DXSaveTextureToFileA(
+							hostDumpPath,
+							D3DXIFF_DDS,
+							hostTexture,
+							nullptr);
+						if (FAILED(dumpResult) &&
+							hostType == D3DRTYPE_TEXTURE) {
+							IDirect3DSurface9* levelZero = nullptr;
+							if (SUCCEEDED(
+									static_cast<IDirect3DTexture9*>(
+										hostTexture)
+										->GetSurfaceLevel(
+											0,
+											&levelZero)) &&
+								levelZero != nullptr) {
+								dumpResult = D3DXSaveSurfaceToFileA(
+									hostDumpPath,
+									D3DXIFF_DDS,
+									levelZero,
+									nullptr,
+									nullptr);
+								if (FAILED(dumpResult)) {
+									D3DSURFACE_DESC sourceDesc{};
+									IDirect3DSurface9* readableSurface =
+										nullptr;
+									if (SUCCEEDED(
+											levelZero->GetDesc(
+												&sourceDesc)) &&
+										SUCCEEDED(
+											g_pD3DDevice->
+												CreateOffscreenPlainSurface(
+													sourceDesc.Width,
+													sourceDesc.Height,
+													D3DFMT_A8R8G8B8,
+													D3DPOOL_SYSTEMMEM,
+													&readableSurface,
+													nullptr)) &&
+										readableSurface != nullptr) {
+										const HRESULT copyResult =
+											D3DXLoadSurfaceFromSurface(
+												readableSurface,
+												nullptr,
+												nullptr,
+												levelZero,
+												nullptr,
+												nullptr,
+												D3DX_FILTER_NONE,
+												0);
+										if (SUCCEEDED(copyResult)) {
+											dumpResult =
+												D3DXSaveSurfaceToFileA(
+													hostDumpPath,
+													D3DXIFF_DDS,
+													readableSurface,
+													nullptr,
+													nullptr);
+										}
+										readableSurface->Release();
+									}
+								}
+								levelZero->Release();
+							}
+						}
+						if (hostType == D3DRTYPE_TEXTURE) {
+							D3DSURFACE_DESC desc{};
+							if (SUCCEEDED(
+									static_cast<IDirect3DTexture*>(
+										hostTexture)
+										->GetLevelDesc(0, &desc))) {
+								const xbox::X_D3DFORMAT xboxFormat =
+									GetXboxPixelContainerFormat(texture);
+								const UINT bytesPerBlock =
+									xboxFormat == xbox::X_D3DFMT_DXT1
+										? 8u
+										: 16u;
+								const UINT guestTopLevelBytes =
+									EmuXBFormatIsCompressed(xboxFormat)
+										? ((desc.Width + 3u) / 4u) *
+											((desc.Height + 3u) / 4u) *
+											bytesPerBlock
+										: desc.Width * desc.Height *
+											EmuXBFormatBytesPerPixel(
+												xboxFormat);
+								FILE* guestDump = nullptr;
+								if (fopen_s(
+										&guestDump,
+										guestDumpPath,
+										"wb") == 0 &&
+									guestDump != nullptr) {
+									fwrite(
+										GetDataFromXboxResource(
+											const_cast<
+												xbox::X_D3DBaseTexture*>(
+												texture)),
+										1,
+										guestTopLevelBytes,
+										guestDump);
+									fclose(guestDump);
+								}
+							}
+						}
+					}
+					InterlockedExchange(
+						&g_OutRunDrawProbe->dumpComplete,
+						SUCCEEDED(dumpResult) ? 1 : -1);
+					InterlockedExchange(
+						&g_OutRunDrawProbe->dumpRequest,
+						0);
+				}
+				hostTexture->Release();
+			}
+		}
+		memcpy(
+			record.fixedFunctionTextureTransform0,
+			&ffShaderState.Transforms.Texture[0],
+			sizeof(record.fixedFunctionTextureTransform0));
+		DWORD hostSrgbWriteEnable = 0;
+		record.hostSrgbWriteEnable =
+			SUCCEEDED(g_pD3DDevice->GetRenderState(
+				D3DRS_SRGBWRITEENABLE,
+				&hostSrgbWriteEnable))
+				? static_cast<LONG>(hostSrgbWriteEnable)
+				: -1;
+		record.pgraphShaderProgram = static_cast<LONG>(
+			HLE_read_NV2A_pgraph_register(NV_PGRAPH_SHADERPROG));
+		record.pgraphShaderControl = static_cast<LONG>(
+			HLE_read_NV2A_pgraph_register(NV_PGRAPH_SHADERCTL));
+		record.pgraphCombinerControl = static_cast<LONG>(
+			HLE_read_NV2A_pgraph_register(NV_PGRAPH_COMBINECTL));
+		record.pgraphCombinerColorInput0 = static_cast<LONG>(
+			HLE_read_NV2A_pgraph_register(NV_PGRAPH_COMBINECOLORI0));
+		record.pgraphCombinerAlphaInput0 = static_cast<LONG>(
+			HLE_read_NV2A_pgraph_register(NV_PGRAPH_COMBINEALPHAI0));
+		record.pgraphCombinerColorOutput0 = static_cast<LONG>(
+			HLE_read_NV2A_pgraph_register(NV_PGRAPH_COMBINECOLORO0));
+		record.pgraphCombinerAlphaOutput0 = static_cast<LONG>(
+			HLE_read_NV2A_pgraph_register(NV_PGRAPH_COMBINEALPHAO0));
+		record.pgraphCombinerFactor0 = static_cast<LONG>(
+			HLE_read_NV2A_pgraph_register(NV_PGRAPH_COMBINEFACTOR0));
+		record.pgraphCombinerFactor1 = static_cast<LONG>(
+			HLE_read_NV2A_pgraph_register(NV_PGRAPH_COMBINEFACTOR1));
+		record.pgraphDrawOrigin = g_HlePgraphDrawActive ? 1L : 0L;
+		for (int stage = 0; stage < xbox::X_D3DTS_STAGECOUNT; ++stage) {
+			record.pgraphTextureHostAddress[stage] = static_cast<LONG>(
+				HLE_get_NV2A_texture_data_address(stage));
+		}
+		record.pgraphBlend = static_cast<LONG>(
+			HLE_read_NV2A_pgraph_register(NV_PGRAPH_BLEND));
+		record.pgraphControl0 = static_cast<LONG>(
+			HLE_read_NV2A_pgraph_register(NV_PGRAPH_CONTROL_0));
+		record.pgraphFogColor = static_cast<LONG>(
+			HLE_read_NV2A_pgraph_register(NV_PGRAPH_FOGCOLOR));
+		record.pgraphCsv0C = static_cast<LONG>(
+			HLE_read_NV2A_pgraph_register(NV_PGRAPH_CSV0_C));
+		record.pgraphLightMask = 0;
+		if (g_NV2A != nullptr) {
+			const NV2AState* nv2a = g_NV2A->GetDeviceState();
+			if (nv2a != nullptr) {
+				const PGRAPHState& pgraph = nv2a->pgraph;
+				record.pgraphLightMask = static_cast<LONG>(
+					GET_MASK(
+						pgraph.regs[NV_PGRAPH_CSV0_D],
+						NV_PGRAPH_CSV0_D_LIGHTS));
+				for (int light = 0; light < NV2A_MAX_LIGHTS; ++light) {
+					record.pgraphLightType[light] = static_cast<LONG>(
+						GET_MASK(
+							pgraph.regs[NV_PGRAPH_CSV0_D],
+							NV_PGRAPH_CSV0_D_LIGHT0 << (light * 2)));
+					for (int component = 0; component < 3; ++component) {
+						const uint32_t diffuseBits =
+							pgraph.ltctxb[
+								NV_IGRAPH_XF_LTCTXB_L0_DIF +
+								light * 6][component];
+						memcpy(
+							&record.pgraphLightDiffuse[light][component],
+							&diffuseBits,
+							sizeof(diffuseBits));
+						record.pgraphLightPosition[light][component] =
+							pgraph.light_local_position[light][component];
+						record.pgraphLightAttenuation[light][component] =
+							pgraph.light_local_attenuation[light][component];
+					}
+					const uint32_t rangeBits =
+						pgraph.ltc1[
+							NV_IGRAPH_XF_LTC1_r0 + light][0];
+					memcpy(
+						&record.pgraphLightRange[light],
+						&rangeBits,
+						sizeof(rangeBits));
+				}
+			}
+		}
+		record.textureFactor = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_TEXTUREFACTOR));
+		record.specularEnable = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_SPECULARENABLE));
+		record.fogEnable = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_FOGENABLE));
+		record.fogColor = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_FOGCOLOR));
+		record.fogTableMode = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_FOGTABLEMODE));
+		record.fogDensity =
+			XboxRenderStates.GetXboxRenderStateAsFloat(
+				xbox::X_D3DRS_FOGDENSITY);
+		record.fogStart =
+			XboxRenderStates.GetXboxRenderStateAsFloat(
+				xbox::X_D3DRS_FOGSTART);
+		record.fogEnd =
+			XboxRenderStates.GetXboxRenderStateAsFloat(
+				xbox::X_D3DRS_FOGEND);
+		record.rangeFogEnable = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_RANGEFOGENABLE));
+		record.fixedFunctionFogDepthMode =
+			static_cast<LONG>(ffShaderState.Fog.DepthMode);
+		record.fixedFunctionFogTableMode =
+			static_cast<LONG>(ffShaderState.Fog.TableMode);
+		record.fixedFunctionFogDensity = ffShaderState.Fog.Density;
+		record.fixedFunctionFogStart = ffShaderState.Fog.Start;
+		record.fixedFunctionFogEnd = ffShaderState.Fog.End;
+		record.zFunction = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_ZFUNC));
+		record.zBias = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_ZBIAS));
+		record.stippleEnable = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_STIPPLEENABLE));
+		record.multisampleAntialias = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_MULTISAMPLEANTIALIAS));
+		record.multisampleMask = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_MULTISAMPLEMASK));
+		record.multisampleMode = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_MULTISAMPLEMODE));
+		record.multisampleRenderTargetMode = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_MULTISAMPLERENDERTARGETMODE));
+		record.shadowFunction = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_SHADOWFUNC));
+		record.sampleAlpha = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_SAMPLEALPHA));
+		record.dxt1NoiseEnable = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_DXT1NOISEENABLE));
+		record.occlusionCullEnable = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_OCCLUSIONCULLENABLE));
+		DWORD hostState = 0;
+		record.hostZFunction =
+			SUCCEEDED(g_pD3DDevice->GetRenderState(D3DRS_ZFUNC, &hostState))
+				? static_cast<LONG>(hostState)
+				: -1;
+		record.hostDepthBias =
+			SUCCEEDED(
+				g_pD3DDevice->GetRenderState(D3DRS_DEPTHBIAS, &hostState))
+				? static_cast<LONG>(hostState)
+				: -1;
+		record.hostMultisampleMask =
+			SUCCEEDED(
+				g_pD3DDevice->GetRenderState(
+					D3DRS_MULTISAMPLEMASK,
+					&hostState))
+				? static_cast<LONG>(hostState)
+				: -1;
+		record.hostAlphaBlendEnable =
+			SUCCEEDED(
+				g_pD3DDevice->GetRenderState(
+					D3DRS_ALPHABLENDENABLE,
+					&hostState))
+				? static_cast<LONG>(hostState)
+				: -1;
+		record.hostSourceBlend =
+			SUCCEEDED(
+				g_pD3DDevice->GetRenderState(D3DRS_SRCBLEND, &hostState))
+				? static_cast<LONG>(hostState)
+				: -1;
+		record.hostDestinationBlend =
+			SUCCEEDED(
+				g_pD3DDevice->GetRenderState(D3DRS_DESTBLEND, &hostState))
+				? static_cast<LONG>(hostState)
+				: -1;
+		record.hostBlendOperation =
+			SUCCEEDED(
+				g_pD3DDevice->GetRenderState(D3DRS_BLENDOP, &hostState))
+				? static_cast<LONG>(hostState)
+				: -1;
+		record.hostBlendFactor =
+			SUCCEEDED(
+				g_pD3DDevice->GetRenderState(D3DRS_BLENDFACTOR, &hostState))
+				? static_cast<LONG>(hostState)
+				: -1;
+		record.xboxRenderTargetData =
+			g_pXbox_RenderTarget != xbox::zeroptr
+				? static_cast<LONG>(g_pXbox_RenderTarget->Data)
+				: 0;
+		record.xboxRenderTargetFormat =
+			g_pXbox_RenderTarget != xbox::zeroptr
+				? static_cast<LONG>(g_pXbox_RenderTarget->Format)
+				: 0;
+		record.xboxRenderTargetSize =
+			g_pXbox_RenderTarget != xbox::zeroptr
+				? static_cast<LONG>(g_pXbox_RenderTarget->Size)
+				: 0;
+		record.xboxRenderTargetCommon =
+			g_pXbox_RenderTarget != xbox::zeroptr
+				? static_cast<LONG>(g_pXbox_RenderTarget->Common)
+				: 0;
+		record.xboxRenderTargetIsBackBuffer =
+			g_pXbox_RenderTarget != xbox::zeroptr &&
+					g_pXbox_RenderTarget == g_pXbox_BackBufferSurface
+				? 1
+				: 0;
+		record.hostRenderTargetPointer = 0;
+		record.hostRenderTargetFormat = 0;
+		record.hostRenderTargetWidth = 0;
+		record.hostRenderTargetHeight = 0;
+		record.hostRenderTargetMultisampleType = 0;
+		record.hostRenderTargetMultisampleQuality = 0;
+		IDirect3DSurface9* hostRenderTarget = nullptr;
+		if (SUCCEEDED(
+				g_pD3DDevice->GetRenderTarget(0, &hostRenderTarget)) &&
+			hostRenderTarget != nullptr) {
+			record.hostRenderTargetPointer = static_cast<LONG>(
+				reinterpret_cast<uintptr_t>(hostRenderTarget));
+			D3DSURFACE_DESC renderTargetDesc{};
+			if (SUCCEEDED(hostRenderTarget->GetDesc(&renderTargetDesc))) {
+				record.hostRenderTargetFormat =
+					static_cast<LONG>(renderTargetDesc.Format);
+				record.hostRenderTargetWidth =
+					static_cast<LONG>(renderTargetDesc.Width);
+				record.hostRenderTargetHeight =
+					static_cast<LONG>(renderTargetDesc.Height);
+				record.hostRenderTargetMultisampleType =
+					static_cast<LONG>(renderTargetDesc.MultiSampleType);
+				record.hostRenderTargetMultisampleQuality =
+					static_cast<LONG>(renderTargetDesc.MultiSampleQuality);
+			}
+			hostRenderTarget->Release();
+		}
+		record.hostViewportX = 0;
+		record.hostViewportY = 0;
+		record.hostViewportWidth = 0;
+		record.hostViewportHeight = 0;
+		record.hostViewportMinZ = 0.0f;
+		record.hostViewportMaxZ = 0.0f;
+		D3DVIEWPORT9 hostViewport{};
+		if (SUCCEEDED(g_pD3DDevice->GetViewport(&hostViewport))) {
+			record.hostViewportX = static_cast<LONG>(hostViewport.X);
+			record.hostViewportY = static_cast<LONG>(hostViewport.Y);
+			record.hostViewportWidth =
+				static_cast<LONG>(hostViewport.Width);
+			record.hostViewportHeight =
+				static_cast<LONG>(hostViewport.Height);
+			record.hostViewportMinZ = hostViewport.MinZ;
+			record.hostViewportMaxZ = hostViewport.MaxZ;
+		}
+		record.hostScissorLeft = 0;
+		record.hostScissorTop = 0;
+		record.hostScissorRight = 0;
+		record.hostScissorBottom = 0;
+		RECT hostScissor{};
+		if (SUCCEEDED(g_pD3DDevice->GetScissorRect(&hostScissor))) {
+			record.hostScissorLeft = hostScissor.left;
+			record.hostScissorTop = hostScissor.top;
+			record.hostScissorRight = hostScissor.right;
+			record.hostScissorBottom = hostScissor.bottom;
+		}
+		record.lightingEnable = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_LIGHTING));
+		record.ambient = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_AMBIENT));
+		record.colorVertex = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_COLORVERTEX));
+		record.diffuseMaterialSource = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_DIFFUSEMATERIALSOURCE));
+		record.specularMaterialSource = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_SPECULARMATERIALSOURCE));
+		record.ambientMaterialSource = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_AMBIENTMATERIALSOURCE));
+		record.emissiveMaterialSource = static_cast<LONG>(
+			XboxRenderStates.GetXboxRenderState(
+				xbox::X_D3DRS_EMISSIVEMATERIALSOURCE));
+		record.fixedFunctionEnabledLightCount =
+			static_cast<LONG>(d3d8LightState.EnabledLightCount);
+		for (size_t light = 0;
+			light < d3d8LightState.EnabledLights.size();
+			++light) {
+			record.fixedFunctionEnabledLights[light] =
+				d3d8LightState.EnabledLights[light];
+			record.fixedFunctionLightType[light] =
+				static_cast<LONG>(ffShaderState.Lights[light].Type);
+			memcpy(
+				record.fixedFunctionLightDiffuse[light],
+				&ffShaderState.Lights[light].Diffuse,
+				sizeof(record.fixedFunctionLightDiffuse[light]));
+			memcpy(
+				record.fixedFunctionLightPosition[light],
+				&ffShaderState.Lights[light].PositionV,
+				sizeof(record.fixedFunctionLightPosition[light]));
+			memcpy(
+				record.fixedFunctionLightDirection[light],
+				&ffShaderState.Lights[light].DirectionVN,
+				sizeof(record.fixedFunctionLightDirection[light]));
+			record.fixedFunctionLightRange[light] =
+				ffShaderState.Lights[light].RangeAmbient.x;
+			memcpy(
+				record.fixedFunctionLightAttenuation[light],
+				&ffShaderState.Lights[light].Attenuation,
+				sizeof(record.fixedFunctionLightAttenuation[light]));
+			record.fixedFunctionLightFalloff[light] =
+				ffShaderState.Lights[light].Falloff;
+		}
+		memcpy(
+			record.fixedFunctionMaterialDiffuse,
+			&ffShaderState.Materials[0].Diffuse,
+			sizeof(record.fixedFunctionMaterialDiffuse));
+		memcpy(
+			record.fixedFunctionMaterialAmbient,
+			&ffShaderState.Materials[0].Ambient,
+			sizeof(record.fixedFunctionMaterialAmbient));
+		memcpy(
+			record.fixedFunctionMaterialSpecular,
+			&ffShaderState.Materials[0].Specular,
+			sizeof(record.fixedFunctionMaterialSpecular));
+		memcpy(
+			record.fixedFunctionMaterialEmissive,
+			&ffShaderState.Materials[0].Emissive,
+			sizeof(record.fixedFunctionMaterialEmissive));
+		record.fixedFunctionMaterialPower =
+			ffShaderState.Materials[0].Power;
+		memcpy(
+			record.fixedFunctionTotalAmbientFront,
+			&ffShaderState.TotalLightsAmbient.Front,
+			sizeof(record.fixedFunctionTotalAmbientFront));
+		memcpy(
+			record.fixedFunctionTotalAmbientBack,
+			&ffShaderState.TotalLightsAmbient.Back,
+			sizeof(record.fixedFunctionTotalAmbientBack));
+	}
+	if (InterlockedCompareExchange(
+			&g_OutRunDrawProbe->enabled, 0, 0) == 0) {
+		return skipCrazyTaxiNoiseTexture || skipCrazyTaxiStencilDraw;
+	}
+
+	const LONG begin = InterlockedCompareExchange(
+		&g_OutRunDrawProbe->skipBegin, 0, 0);
+	const LONG end = InterlockedCompareExchange(
+		&g_OutRunDrawProbe->skipEnd, 0, 0);
+	bool matched =
+		begin > 0 && end >= begin && ordinal >= begin && ordinal <= end;
+	const LONG filterKind = InterlockedCompareExchange(
+		&g_OutRunDrawProbe->filterKind, 0, 0);
+	const LONG filterHostPrimitiveType = InterlockedCompareExchange(
+		&g_OutRunDrawProbe->filterHostPrimitiveType, 0, 0);
+	const LONG filterXboxPrimitiveType = InterlockedCompareExchange(
+		&g_OutRunDrawProbe->filterXboxPrimitiveType, 0, 0);
+	const LONG filterPrimitiveCountMin = InterlockedCompareExchange(
+		&g_OutRunDrawProbe->filterPrimitiveCountMin, 0, 0);
+	const LONG filterPrimitiveCountMax = InterlockedCompareExchange(
+		&g_OutRunDrawProbe->filterPrimitiveCountMax, 0, 0);
+	const LONG filterVertexCountMin = InterlockedCompareExchange(
+		&g_OutRunDrawProbe->filterVertexCountMin, 0, 0);
+	const LONG filterVertexCountMax = InterlockedCompareExchange(
+		&g_OutRunDrawProbe->filterVertexCountMax, 0, 0);
+	const LONG filterMatchMask = InterlockedCompareExchange(
+		&g_OutRunDrawProbe->filterMatchMask, 0, 0);
+	const LONG filterTexture0Data = InterlockedCompareExchange(
+		&g_OutRunDrawProbe->filterTexture0Data, 0, 0);
+	const LONG filterTexture0Format = InterlockedCompareExchange(
+		&g_OutRunDrawProbe->filterTexture0Format, 0, 0);
+	const LONG filterTexture0DataMin = InterlockedCompareExchange(
+		&g_OutRunDrawProbe->filterTexture0DataMin, 0, 0);
+	const LONG filterTexture0DataMax = InterlockedCompareExchange(
+		&g_OutRunDrawProbe->filterTexture0DataMax, 0, 0);
+	matched =
+		matched &&
+		(filterKind == 0 || kind == filterKind) &&
+		(filterHostPrimitiveType == 0 ||
+			static_cast<LONG>(hostPrimitiveType) == filterHostPrimitiveType) &&
+		(filterXboxPrimitiveType == 0 ||
+			static_cast<LONG>(xboxPrimitiveType) == filterXboxPrimitiveType) &&
+		(filterPrimitiveCountMin == 0 ||
+			static_cast<LONG>(primitiveCount) >= filterPrimitiveCountMin) &&
+		(filterPrimitiveCountMax == 0 ||
+			static_cast<LONG>(primitiveCount) <= filterPrimitiveCountMax) &&
+		(filterVertexCountMin == 0 ||
+			static_cast<LONG>(vertexCount) >= filterVertexCountMin) &&
+		(filterVertexCountMax == 0 ||
+			static_cast<LONG>(vertexCount) <= filterVertexCountMax) &&
+		((filterMatchMask & 1) == 0 ||
+			vertexShaderHandle == InterlockedCompareExchange(
+				&g_OutRunDrawProbe->filterVertexShaderHandle, 0, 0)) &&
+		((filterMatchMask & 2) == 0 ||
+			pixelShaderHandle == InterlockedCompareExchange(
+				&g_OutRunDrawProbe->filterPixelShaderHandle, 0, 0)) &&
+		((filterMatchMask & 4) == 0 ||
+			vertexShaderMode == InterlockedCompareExchange(
+				&g_OutRunDrawProbe->filterVertexShaderMode, 0, 0)) &&
+		((filterMatchMask & 8) == 0 ||
+			fixedFunctionFlags == InterlockedCompareExchange(
+				&g_OutRunDrawProbe->filterFixedFunctionFlags, 0, 0)) &&
+		((filterMatchMask & 16) == 0 ||
+			(g_pXbox_SetTexture[0] != nullptr &&
+				static_cast<LONG>(g_pXbox_SetTexture[0]->Data) ==
+					filterTexture0Data)) &&
+		((filterMatchMask & 32) == 0 ||
+			(g_pXbox_SetTexture[0] != nullptr &&
+				static_cast<LONG>(g_pXbox_SetTexture[0]->Format) ==
+					filterTexture0Format)) &&
+		((filterMatchMask & 64) == 0 ||
+			(g_pXbox_SetTexture[0] != nullptr &&
+				static_cast<LONG>(g_pXbox_SetTexture[0]->Data) >=
+					filterTexture0DataMin &&
+				static_cast<LONG>(g_pXbox_SetTexture[0]->Data) <=
+					filterTexture0DataMax));
+	if (!matched) {
+		return skipCrazyTaxiNoiseTexture || skipCrazyTaxiStencilDraw;
+	}
+
+	InterlockedExchange(&g_OutRunDrawProbe->matchedOrdinal, ordinal);
+	InterlockedExchange(&g_OutRunDrawProbe->matchedKind, kind);
+	InterlockedExchange(
+		&g_OutRunDrawProbe->matchedHostPrimitiveType,
+		static_cast<LONG>(hostPrimitiveType));
+	InterlockedExchange(
+		&g_OutRunDrawProbe->matchedXboxPrimitiveType,
+		static_cast<LONG>(xboxPrimitiveType));
+	InterlockedExchange(
+		&g_OutRunDrawProbe->matchedPrimitiveCount,
+		static_cast<LONG>(primitiveCount));
+	InterlockedExchange(
+		&g_OutRunDrawProbe->matchedVertexCount,
+		static_cast<LONG>(vertexCount));
+	InterlockedExchange(
+		&g_OutRunDrawProbe->matchedStartVertex,
+		static_cast<LONG>(startVertex));
+	InterlockedExchange(
+		&g_OutRunDrawProbe->matchedStride,
+		static_cast<LONG>(stride));
+	InterlockedExchange(
+		&g_OutRunDrawProbe->matchedVertexShaderHandle,
+		vertexShaderHandle);
+	InterlockedExchange(
+		&g_OutRunDrawProbe->matchedPixelShaderHandle,
+		pixelShaderHandle);
+	InterlockedExchange(
+		&g_OutRunDrawProbe->matchedVertexShaderMode,
+		vertexShaderMode);
+	InterlockedExchange(
+		&g_OutRunDrawProbe->matchedFixedFunctionFlags,
+		fixedFunctionFlags);
+	InterlockedExchange(
+		&g_OutRunDrawProbe->matchedVertexShaderKeyLow,
+		static_cast<LONG>(vertexShaderKey & 0xFFFFFFFFu));
+	InterlockedExchange(
+		&g_OutRunDrawProbe->matchedVertexShaderKeyHigh,
+		static_cast<LONG>(vertexShaderKey >> 32));
+	InterlockedExchange(
+		&g_OutRunDrawProbe->matchedVertexShaderHashLow,
+		static_cast<LONG>(vertexShaderHash & 0xFFFFFFFFu));
+	InterlockedExchange(
+		&g_OutRunDrawProbe->matchedVertexShaderHashHigh,
+		static_cast<LONG>(vertexShaderHash >> 32));
+	return true;
+}
+
+} // namespace
 
 XboxRenderStateConverter XboxRenderStates;
 XboxTextureStateConverter XboxTextureStates;
@@ -101,10 +1529,12 @@ XboxTextureStateConverter XboxTextureStates;
 D3D8LightState d3d8LightState = D3D8LightState();
 D3D8TransformState d3d8TransformState = D3D8TransformState();
 FixedFunctionVertexShaderState ffShaderState = {0}; // TODO find a home for this and associated code
-extern bool g_ChihiroCrazyTaxiGame;
 static bool g_FFRestInvalid = true; // Set when Xbox constants overwrite GPU registers, forces re-upload of non-transform FF data
 static bool g_FFTransformDirty = true; // Set when any transform changes (SetTransform)
 static bool g_FFNonTransformDirty = true; // Set when render states, lights, materials, or non-world transforms change
+static HRESULT g_FFLastTransformUploadResult = S_FALSE;
+static HRESULT g_FFLastRestUploadResult = S_FALSE;
+static unsigned long long g_FFUploadSerial = 0;
 
 void CxbxInvalidateFixedFunctionNonTransformState()
 {
@@ -119,6 +1549,107 @@ HWND                                g_hEmuWindow   = NULL; // rendering window
 bool                                g_bClipCursor  = false; // indicates that the mouse cursor should be confined inside the rendering window
 IDirect3DDevice9Ex                 *g_pD3DDevice   = nullptr; // Direct3D Device
 
+static const float* CxbxSanitizeWineShaderConstants(
+	const float* constantData,
+	UINT vector4Count,
+	std::vector<float>& sanitized)
+{
+	if (constantData == nullptr || vector4Count == 0) {
+		return constantData;
+	}
+
+	const size_t floatCount = static_cast<size_t>(vector4Count) * 4;
+	for (size_t index = 0; index < floatCount; ++index) {
+		uint32_t bits = 0;
+		memcpy(&bits, constantData + index, sizeof(bits));
+		if ((bits & 0x7F800000U) != 0x7F800000U) {
+			continue;
+		}
+
+		// Native D3D9 accepts arbitrary IEEE-754 shader-constant bits. Wine's
+		// D3D9 path instead converts some values through an x87 helper which
+		// traps under Box64 for NaN/Infinity even when exceptions are masked.
+		// Replace only non-finite values at the Wine boundary; keep every
+		// finite value, including subnormals and signed zero, bit-exact.
+		sanitized.assign(constantData, constantData + floatCount);
+		for (float& value : sanitized) {
+			uint32_t valueBits = 0;
+			memcpy(&valueBits, &value, sizeof(valueBits));
+			if ((valueBits & 0x7F800000U) == 0x7F800000U) {
+				value = 0.0f;
+			}
+		}
+		return sanitized.data();
+	}
+
+	return constantData;
+}
+
+HRESULT CxbxSetVertexShaderConstantF(
+	UINT startRegister,
+	const float* constantData,
+	UINT vector4Count)
+{
+	if (!isWineEnv()) {
+		return g_pD3DDevice->SetVertexShaderConstantF(
+			startRegister, constantData, vector4Count);
+	}
+
+	// The Wine D3D9 constant upload path tests and converts shader constants
+	// with both SSE and x87 helpers. Xbox code can leave either exception
+	// family unmasked; on Wine/Box64 that makes otherwise valid host-side NaN
+	// handling raise STATUS_FLOAT_MULTIPLE_TRAPS. Give the COM call clean,
+	// fully masked host FP state, then restore the guest's modes without
+	// leaking status flags raised by D3D9.
+	const unsigned int guestMxcsr = _mm_getcsr();
+	unsigned int guestControlWord = 0;
+	_controlfp_s(&guestControlWord, 0, 0);
+	_mm_setcsr((guestMxcsr | _MM_MASK_MASK) & ~_MM_EXCEPT_MASK);
+	unsigned int ignored = 0;
+	_controlfp_s(&ignored, _MCW_EM, _MCW_EM);
+	_clearfp();
+	std::vector<float> sanitized;
+	const float* hostConstantData = CxbxSanitizeWineShaderConstants(
+		constantData, vector4Count, sanitized);
+	const HRESULT result = g_pD3DDevice->SetVertexShaderConstantF(
+		startRegister, hostConstantData, vector4Count);
+	_clearfp();
+	_controlfp_s(&ignored, guestControlWord, _MCW_EM);
+	_mm_setcsr(guestMxcsr & ~_MM_EXCEPT_MASK);
+	return result;
+}
+
+HRESULT CxbxSetPixelShaderConstantF(
+	UINT startRegister,
+	const float* constantData,
+	UINT vector4Count)
+{
+	if (!isWineEnv()) {
+		return g_pD3DDevice->SetPixelShaderConstantF(
+			startRegister, constantData, vector4Count);
+	}
+
+	// Wine sanitises both vertex and pixel constants through the same mixed
+	// SSE/x87 path. Preserve the Xbox thread's FP modes while ensuring host
+	// comparisons and conversions cannot surface as guest exceptions.
+	const unsigned int guestMxcsr = _mm_getcsr();
+	unsigned int guestControlWord = 0;
+	_controlfp_s(&guestControlWord, 0, 0);
+	_mm_setcsr((guestMxcsr | _MM_MASK_MASK) & ~_MM_EXCEPT_MASK);
+	unsigned int ignored = 0;
+	_controlfp_s(&ignored, _MCW_EM, _MCW_EM);
+	_clearfp();
+	std::vector<float> sanitized;
+	const float* hostConstantData = CxbxSanitizeWineShaderConstants(
+		constantData, vector4Count, sanitized);
+	const HRESULT result = g_pD3DDevice->SetPixelShaderConstantF(
+		startRegister, hostConstantData, vector4Count);
+	_clearfp();
+	_controlfp_s(&ignored, guestControlWord, _MCW_EM);
+	_mm_setcsr(guestMxcsr & ~_MM_EXCEPT_MASK);
+	return result;
+}
+
 // Static Variable(s)
 static bool                         g_bSupportsFormatSurface[xbox::X_D3DFMT_LIN_R8G8B8A8 + 1]; // Does device support surface format?
 static bool                         g_bSupportsFormatSurfaceRenderTarget[xbox::X_D3DFMT_LIN_R8G8B8A8 + 1]; // Does device support surface format?
@@ -129,6 +1660,15 @@ static bool                         g_bSupportsFormatTextureDepthStencil[xbox::X
 static bool                         g_bSupportsFormatVolumeTexture[xbox::X_D3DFMT_LIN_R8G8B8A8 + 1]; // Does device support surface format?
 static bool                         g_bSupportsFormatCubeTexture[xbox::X_D3DFMT_LIN_R8G8B8A8 + 1]; // Does device support surface format?
 static HBRUSH                       g_hBgBrush = NULL; // Background Brush
+// GDI fallback rendering: shared frame buffer for WM_PAINT-based display
+// Used when D3D9Ex Present doesn't composite to the window (e.g. Chihiro games)
+static CRITICAL_SECTION             g_GdiFallbackCS;
+static BYTE*                        g_pGdiFallbackBuf = nullptr;
+static LONG                         g_GdiFallbackW = 0;
+static LONG                         g_GdiFallbackH = 0;
+static bool                         g_bGdiFallbackReady = false;
+static bool                         g_bGdiFallbackInited = false;
+static IDirect3DSurface*            g_pGdiFallbackSysSurf = nullptr; // cached system-memory readback surface
 static bool                         g_bIsFauxFullscreen = false;
 static DWORD						g_OverlaySwap = 0; // Set in D3DDevice_UpdateOverlay
 static int                          g_iWireframe = 0; // wireframe toggle
@@ -209,6 +1749,86 @@ static unsigned                     g_Xbox_Palette_Size[xbox::X_D3DTS_STAGECOUNT
 
        xbox::X_D3DBaseTexture       *g_pXbox_SetTexture[xbox::X_D3DTS_STAGECOUNT] = {0,0,0,0}; // Set by our D3DDevice_SetTexture and D3DDevice_SwitchTexture patches
 static xbox::X_D3DBaseTexture        CxbxActiveTextureCopies[xbox::X_D3DTS_STAGECOUNT] = {}; // Set by D3DDevice_SwitchTexture. Cached active texture
+static xbox::X_D3DBaseTexture g_CrazyTaxiTexturedQuadTextureCopy = {};
+static xbox::X_D3DBaseTexture* g_CrazyTaxiPendingTexturedQuadTexture = nullptr;
+static unsigned g_CrazyTaxiPendingTexturedQuadDraws = 0;
+static SRWLOCK g_CrazyTaxiMovieFrameLock = SRWLOCK_INIT;
+static std::vector<uint8_t> g_CrazyTaxiMovieFramePixels;
+static uint32_t g_CrazyTaxiMovieFrameWidth = 0;
+static uint32_t g_CrazyTaxiMovieFrameHeight = 0;
+static volatile LONG g_CrazyTaxiMovieFrameGeneration = 0;
+static volatile LONG g_CrazyTaxiMovieFrameLastTick = 0;
+static LONG g_CrazyTaxiMovieFrameUploadedGeneration = 0;
+static ComPtr<IDirect3DTexture> g_CrazyTaxiMovieHostTexture;
+static uint32_t g_CrazyTaxiMovieHostTextureWidth = 0;
+static uint32_t g_CrazyTaxiMovieHostTextureHeight = 0;
+static volatile LONG g_CrazyTaxiMovieGuestTextureData = 0;
+volatile LONG g_CrazyTaxiTextureBridgeSetCount = 0;
+volatile LONG g_CrazyTaxiTextureBridgePendingChecks = 0;
+volatile LONG g_CrazyTaxiTextureBridgeMatchCount = 0;
+volatile LONG g_CrazyTaxiTextureBridgeLastTexture = 0;
+volatile LONG g_CrazyTaxiTextureBridgeLastShader = 0;
+volatile LONG g_CrazyTaxiTextureBridgeLastPrimitiveType = 0;
+volatile LONG g_CrazyTaxiTextureBridgeLastVertexCount = 0;
+
+void CxbxSetCrazyTaxiPendingTexturedQuadTexture(
+	xbox::X_D3DBaseTexture* texture)
+{
+	if (texture != nullptr) {
+		// Crazy Taxi reuses the guest texture object immediately after emitting
+		// the LTCG push buffer. Preserve the resource descriptor that belongs
+		// to this movie frame, just as D3DDevice_SwitchTexture preserves its
+		// active descriptor in a host-owned copy.
+		g_CrazyTaxiTexturedQuadTextureCopy.Common = texture->Common;
+		g_CrazyTaxiTexturedQuadTextureCopy.Data = texture->Data;
+		g_CrazyTaxiTexturedQuadTextureCopy.Lock = texture->Lock;
+		g_CrazyTaxiTexturedQuadTextureCopy.Format = texture->Format;
+		g_CrazyTaxiTexturedQuadTextureCopy.Size = texture->Size;
+		g_CrazyTaxiPendingTexturedQuadTexture =
+			&g_CrazyTaxiTexturedQuadTextureCopy;
+	}
+	else {
+		g_CrazyTaxiPendingTexturedQuadTexture = nullptr;
+	}
+	g_CrazyTaxiPendingTexturedQuadDraws =
+		texture != nullptr ? 2u : 0u;
+	InterlockedIncrement(&g_CrazyTaxiTextureBridgeSetCount);
+	InterlockedExchange(
+		&g_CrazyTaxiTextureBridgeLastTexture,
+		static_cast<LONG>(reinterpret_cast<uintptr_t>(
+			g_CrazyTaxiPendingTexturedQuadTexture)));
+}
+
+void CxbxSetCrazyTaxiDecodedMovieFrame(
+	const void* pixels,
+	uint32_t width,
+	uint32_t height)
+{
+	if (pixels == nullptr || width < 16 || width > 1920 ||
+		height < 16 || height > 1080) {
+		return;
+	}
+
+	const size_t byteCount =
+		static_cast<size_t>(width) * height * sizeof(uint32_t);
+	if (byteCount > 16 * 1024 * 1024) {
+		return;
+	}
+
+	AcquireSRWLockExclusive(&g_CrazyTaxiMovieFrameLock);
+	g_CrazyTaxiMovieFramePixels.resize(byteCount);
+	memcpy(
+		g_CrazyTaxiMovieFramePixels.data(),
+		pixels,
+		byteCount);
+	g_CrazyTaxiMovieFrameWidth = width;
+	g_CrazyTaxiMovieFrameHeight = height;
+	InterlockedIncrement(&g_CrazyTaxiMovieFrameGeneration);
+	InterlockedExchange(
+		&g_CrazyTaxiMovieFrameLastTick,
+		static_cast<LONG>(GetTickCount()));
+	ReleaseSRWLockExclusive(&g_CrazyTaxiMovieFrameLock);
+}
 
 xbox::X_D3DVIEWPORT8 g_Xbox_Viewport = { 0 };
 float g_Xbox_BackbufferScaleX = 1;
@@ -1570,6 +3190,12 @@ static DWORD WINAPI EmuRenderWindow(LPVOID lpParam)
 {
 	CxbxSetThreadName("Cxbx Render Window");
 
+    // Initialize GDI fallback critical section (once)
+    if (!g_bGdiFallbackInited) {
+        InitializeCriticalSection(&g_GdiFallbackCS);
+        g_bGdiFallbackInited = true;
+    }
+
     // register window class
     {
         LOGBRUSH logBrush = {BS_SOLID, RGB(0,0,0)};
@@ -1744,6 +3370,10 @@ static LRESULT WINAPI EmuMsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
         }
         break;
 
+		case WM_ERASEBKGND:
+			// Suppress background erasure so GDI fallback content persists
+			return TRUE;
+
 		case WM_PAINT:
 		{
 			if (g_CxbxPrintUEM)
@@ -1752,7 +3382,28 @@ static LRESULT WINAPI EmuMsgProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
 			}
 			else
 			{
-				DefWindowProc(hWnd, msg, wParam, lParam);
+				PAINTSTRUCT ps;
+				HDC hdc = BeginPaint(hWnd, &ps);
+				// GDI fallback: blit the shared frame buffer to the window
+				if (g_bGdiFallbackInited && g_bGdiFallbackReady) {
+					EnterCriticalSection(&g_GdiFallbackCS);
+					if (g_bGdiFallbackReady && g_pGdiFallbackBuf) {
+						BITMAPINFO bmi = {};
+						bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+						bmi.bmiHeader.biWidth = g_GdiFallbackW;
+						bmi.bmiHeader.biHeight = -g_GdiFallbackH; // top-down
+						bmi.bmiHeader.biPlanes = 1;
+						bmi.bmiHeader.biBitCount = 32;
+						bmi.bmiHeader.biCompression = BI_RGB;
+						RECT cr;
+						GetClientRect(hWnd, &cr);
+						StretchDIBits(hdc, 0, 0, cr.right, cr.bottom,
+							0, 0, g_GdiFallbackW, g_GdiFallbackH,
+							g_pGdiFallbackBuf, &bmi, DIB_RGB_COLORS, SRCCOPY);
+					}
+					LeaveCriticalSection(&g_GdiFallbackCS);
+				}
+				EndPaint(hWnd, &ps);
 			}
 		}
 		break;
@@ -2251,6 +3902,13 @@ static void CreateDefaultD3D9Device
 
         // TODO: ensure all other resources are cleaned up too
 
+        // Release cached GDI fallback surface
+        if (g_pGdiFallbackSysSurf) {
+            g_pGdiFallbackSysSurf->Release();
+            g_pGdiFallbackSysSurf = nullptr;
+        }
+        g_bGdiFallbackReady = false;
+
         // Final release of IDirect3DDevice9 must be called from the window message thread
         // See https://docs.microsoft.com/en-us/windows/win32/direct3d9/multithreading-issues
         RunOnWndMsgThread([] {
@@ -2303,14 +3961,25 @@ static void CreateDefaultD3D9Device
     // See https://docs.microsoft.com/en-us/windows/win32/direct3d9/multithreading-issues
     HRESULT hr;
     RunOnWndMsgThread([&hr, BehaviorFlags, &displayMode] {
-        hr = g_pDirect3D->CreateDeviceEx(
-            g_EmuCDPD.Adapter,
-            g_EmuCDPD.DeviceType,
-            g_hEmuWindow,
-            BehaviorFlags,
-            &g_EmuCDPD.HostPresentationParameters,
-			g_EmuCDPD.HostPresentationParameters.Windowed ? nullptr : &displayMode,
-            &g_pD3DDevice);
+        if (g_EmuCDPD.HostPresentationParameters.Windowed) {
+            hr = g_pDirect3D->CreateDeviceEx(
+                g_EmuCDPD.Adapter,
+                g_EmuCDPD.DeviceType,
+                g_hEmuWindow,
+                BehaviorFlags,
+                &g_EmuCDPD.HostPresentationParameters,
+                nullptr,
+                &g_pD3DDevice);
+        } else {
+            hr = g_pDirect3D->CreateDeviceEx(
+                g_EmuCDPD.Adapter,
+                g_EmuCDPD.DeviceType,
+                g_hEmuWindow,
+                BehaviorFlags,
+                &g_EmuCDPD.HostPresentationParameters,
+                &displayMode,
+                &g_pD3DDevice);
+        }
     });
     DEBUG_D3DRESULT(hr, "IDirect3D::CreateDeviceEx");
 
@@ -4391,8 +6060,8 @@ void CxbxUpdateHostViewPortOffsetAndScaleConstants()
 
 	float screenspaceScale[4] = { xboxScreenspaceWidth / 2,  -xboxScreenspaceHeight / 2, zOutputScale, 1 };
 	float screenspaceOffset[4] = { xboxScreenspaceWidth / 2 + aaOffsetX, xboxScreenspaceHeight / 2 + aaOffsetY, 0, 0 };
-	g_pD3DDevice->SetVertexShaderConstantF(CXBX_D3DVS_SCREENSPACE_SCALE_BASE, screenspaceScale, CXBX_D3DVS_NORMALIZE_SCALE_SIZE);
-	g_pD3DDevice->SetVertexShaderConstantF(CXBX_D3DVS_SCREENSPACE_OFFSET_BASE, screenspaceOffset, CXBX_D3DVS_NORMALIZE_OFFSET_SIZE);
+	CxbxSetVertexShaderConstantF(CXBX_D3DVS_SCREENSPACE_SCALE_BASE, screenspaceScale, CXBX_D3DVS_NORMALIZE_SCALE_SIZE);
+	CxbxSetVertexShaderConstantF(CXBX_D3DVS_SCREENSPACE_OFFSET_BASE, screenspaceOffset, CXBX_D3DVS_NORMALIZE_OFFSET_SIZE);
 
 	// Store viewport offset and scale in constant registers 58 (c-38) and
 	// 59 (c-37) used for screen space transformation.
@@ -4401,7 +6070,7 @@ void CxbxUpdateHostViewPortOffsetAndScaleConstants()
 	// Treat this as a flag
 	// Test Case: GTA III, Soldier of Fortune II
 	if (!(g_Xbox_VertexShaderConstantMode & X_D3DSCM_NORESERVEDCONSTANTS)) {
-		g_pD3DDevice->SetVertexShaderConstantF(X_D3DSCM_RESERVED_CONSTANT_SCALE_CORRECTED, reinterpret_cast<float*>(vScaleOffset), 2);
+		CxbxSetVertexShaderConstantF(X_D3DSCM_RESERVED_CONSTANT_SCALE_CORRECTED, reinterpret_cast<float*>(vScaleOffset), 2);
 	}
 
 }
@@ -4711,6 +6380,8 @@ __declspec(naked) xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_SetTexture_4__LT
 
     // Log
     D3DDevice_SetTexture_4__LTCG_eax2(Stage, pTexture);
+    RenderTrace_RecordTextureProducer(
+        "set-ltcg-eax2-enter", Stage, pTexture, 0, nullptr);
 
     // Call the Xbox implementation of this function, to properly handle reference counting for us
     __asm {
@@ -4720,6 +6391,8 @@ __declspec(naked) xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_SetTexture_4__LT
     }
 
     g_pXbox_SetTexture[Stage] = pTexture;
+    RenderTrace_RecordTextureProducer(
+        "set-ltcg-eax2-exit", Stage, pTexture, 0, nullptr);
 
     __asm {
         LTCG_EPILOGUE
@@ -4756,6 +6429,8 @@ __declspec(naked) xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_SetTexture_4__LT
 
     // Log
 	D3DDevice_SetTexture_4__LTCG_eax1(Stage, pTexture);
+    RenderTrace_RecordTextureProducer(
+        "set-ltcg-eax1-enter", Stage, pTexture, 0, nullptr);
 
     // Call the Xbox implementation of this function, to properly handle reference counting for us
     __asm {
@@ -4765,6 +6440,8 @@ __declspec(naked) xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_SetTexture_4__LT
     }
 
     g_pXbox_SetTexture[Stage] = pTexture;
+    RenderTrace_RecordTextureProducer(
+        "set-ltcg-eax1-exit", Stage, pTexture, 0, nullptr);
 
     __asm {
         LTCG_EPILOGUE
@@ -4785,11 +6462,15 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_SetTexture)
 		LOG_FUNC_ARG(Stage)
 		LOG_FUNC_ARG(pTexture)
 		LOG_FUNC_END;
+	RenderTrace_RecordTextureProducer(
+		"set-enter", Stage, pTexture, 0, _ReturnAddress());
 
 	// Call the Xbox implementation of this function, to properly handle reference counting for us
 	XB_TRMP(D3DDevice_SetTexture)(Stage, pTexture);
 
 	g_pXbox_SetTexture[Stage] = pTexture;
+	RenderTrace_RecordTextureProducer(
+		"set-exit", Stage, pTexture, 0, _ReturnAddress());
 }
 
 // ******************************************************************
@@ -4822,6 +6503,8 @@ xbox::void_xt __fastcall xbox::EMUPATCH(D3DDevice_SwitchTexture)
 	}
 
     if (Stage >= 0) {
+		RenderTrace_RecordTextureProducer(
+			"switch", Stage, g_pXbox_SetTexture[Stage], Data, _ReturnAddress());
 		// Switch Texture updates the data pointer of an active texture using pushbuffer commands
 		if (g_pXbox_SetTexture[Stage] == xbox::zeroptr) {
 			LOG_TEST_CASE("D3DDevice_SwitchTexture without an active texture");
@@ -5397,22 +7080,37 @@ __declspec(naked) xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap_0__LTCG_ea
 // ******************************************************************
 // * patch: D3DDevice_Swap
 // ******************************************************************
-#if defined(_DEBUG)
 volatile uint32_t g_D3DSwapCounter = 0; // diagnostic: counts D3DDevice_Swap calls
 volatile uint32_t g_D3DSwapLastCaller = 0; // diagnostic: last caller return address
 volatile uint32_t g_D3DSwapGrandCaller = 0; // diagnostic: grandparent caller
-#endif
+
+static size_t CopyRenderTraceHookBytes(
+	const void* source,
+	BYTE* destination,
+	size_t byteCount)
+{
+	if (source == nullptr || destination == nullptr || byteCount == 0) {
+		return 0;
+	}
+
+	__try {
+		memcpy(destination, source, byteCount);
+		return byteCount;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return 0;
+	}
+}
+
 xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap)
 (
 	dword_xt Flags
 )
 {
-#if defined(_DEBUG)
 	g_D3DSwapCounter++;
 	g_D3DSwapLastCaller = (uint32_t)_ReturnAddress();
 	// Stack: [ret=0x21EE7] [Flags=0] [grandparent_caller]
 	g_D3DSwapGrandCaller = *((uint32_t*)_AddressOfReturnAddress() + 2);
-#endif
 	LOG_FUNC_ONE_ARG(Flags);
 	// MJ2-specific: force resource loading completion in early Phase 2 swaps
 	if (g_ChihiroMjGame == 1) {
@@ -5442,6 +7140,7 @@ xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap)
 	}
 	PerfTrace_OnSwapBegin(); // prints previous frame, resets accumulators, starts swap timer
 	RenderTrace_OnSwapBegin();
+	OutRunDrawProbeBeginFrame();
 	nv2a_const_diag_new_frame();
 
 	// Handle swap flags
@@ -5723,6 +7422,40 @@ xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap)
 		pCurrentHostBackBuffer->Release();
 	}
 
+	if (g_RenderTraceEnabled) {
+		static unsigned long long textureHookSample = 0;
+		const unsigned long long currentSample = textureHookSample++;
+		if (currentSample < 8 || (currentSample % 120) == 0) {
+			auto symbol = g_SymbolAddresses.find("D3DDevice_SetTexture");
+			if (symbol != g_SymbolAddresses.end() && symbol->second != 0) {
+				const DWORD sourceAddress = symbol->second;
+				const BYTE* source = reinterpret_cast<const BYTE*>(
+					static_cast<uintptr_t>(sourceAddress));
+				const void* trampoline = reinterpret_cast<const void*>(
+					XB_TRMP(D3DDevice_SetTexture));
+				BYTE sourceBytes[16] = {};
+				BYTE trampolineBytes[16] = {};
+				const size_t sourceByteCount = CopyRenderTraceHookBytes(
+					source,
+					sourceBytes,
+					sizeof(sourceBytes));
+				const size_t trampolineByteCount =
+					CopyRenderTraceHookBytes(
+						trampoline,
+						trampolineBytes,
+						sizeof(trampolineBytes));
+				RenderTrace_RecordTextureHookState(
+					sourceAddress,
+					sourceBytes,
+					sourceByteCount,
+					trampoline,
+					trampolineBytes,
+					trampolineByteCount,
+					g_pXbox_SetTexture[0]);
+			}
+		}
+	}
+
 	RenderTrace_RecordSwap(
 		Flags,
 		false,
@@ -5736,6 +7469,55 @@ xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap)
 	{
 		PERF_SCOPE(PERF_CAT_ENDSCENE);
 		g_pD3DDevice->EndScene();
+	}
+
+	// GDI fallback: copy backbuffer to shared buffer, then trigger WM_PAINT on window thread
+	{
+		IDirect3DSurface* pBB2 = nullptr;
+		if (SUCCEEDED(g_pD3DDevice->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &pBB2))) {
+			D3DSURFACE_DESC desc;
+			pBB2->GetDesc(&desc);
+
+			// (Re)create cached system-memory surface if dimensions/format changed
+			if (g_pGdiFallbackSysSurf) {
+				D3DSURFACE_DESC cachedDesc;
+				g_pGdiFallbackSysSurf->GetDesc(&cachedDesc);
+				if (cachedDesc.Width != desc.Width || cachedDesc.Height != desc.Height || cachedDesc.Format != desc.Format) {
+					g_pGdiFallbackSysSurf->Release();
+					g_pGdiFallbackSysSurf = nullptr;
+				}
+			}
+			if (!g_pGdiFallbackSysSurf) {
+				g_pD3DDevice->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format, D3DPOOL_SYSTEMMEM, &g_pGdiFallbackSysSurf, nullptr);
+			}
+
+			if (g_pGdiFallbackSysSurf && SUCCEEDED(g_pD3DDevice->GetRenderTargetData(pBB2, g_pGdiFallbackSysSurf))) {
+				D3DLOCKED_RECT lr;
+				if (SUCCEEDED(g_pGdiFallbackSysSurf->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
+					EnterCriticalSection(&g_GdiFallbackCS);
+					LONG needed = (LONG)(desc.Width * desc.Height * 4);
+					if (g_GdiFallbackW != (LONG)desc.Width || g_GdiFallbackH != (LONG)desc.Height) {
+						free(g_pGdiFallbackBuf);
+						g_pGdiFallbackBuf = (BYTE*)malloc(needed);
+						g_GdiFallbackW = desc.Width;
+						g_GdiFallbackH = desc.Height;
+					}
+					if (g_pGdiFallbackBuf) {
+						for (UINT y = 0; y < desc.Height; y++) {
+							memcpy(g_pGdiFallbackBuf + y * desc.Width * 4,
+								   (BYTE*)lr.pBits + y * lr.Pitch,
+								   desc.Width * 4);
+						}
+						g_bGdiFallbackReady = true;
+					}
+					LeaveCriticalSection(&g_GdiFallbackCS);
+					g_pGdiFallbackSysSurf->UnlockRect();
+				}
+			}
+			pBB2->Release();
+		}
+		// Trigger WM_PAINT on the window thread
+		InvalidateRect(g_hEmuWindow, NULL, FALSE);
 	}
 
 	{
@@ -6506,7 +8288,26 @@ void CreateHostResource(xbox::X_D3DResource *pResource, DWORD D3DUsage, int iTex
 					);
 				}
 				else if (bCompressed) {
-					memcpy(pDst, pSrc, mip2dSize);
+					// D3DPOOL_SYSTEMMEM textures can align compressed rows to
+					// a wider pitch than the tightly packed Xbox resource.
+					// A flat memcpy then places every DXT block row after the
+					// first at the wrong destination offset, producing the
+					// characteristic diagonal/block corruption seen on city
+					// façade atlases. Copy only the active blocks per row and
+					// advance each side by its own pitch.
+					const DWORD compressedRowBytes =
+						((pxMipWidth + 3) / 4) * blockSize;
+					if (dwDstRowPitch == dwMipRowPitch &&
+						compressedRowBytes == dwMipRowPitch) {
+						memcpy(pDst, pSrc, mip2dSize);
+					}
+					else {
+						for (DWORD row = 0; row < numRows; ++row) {
+							memcpy(pDst, pSrc, compressedRowBytes);
+							pDst += dwDstRowPitch;
+							pSrc += dwMipRowPitch;
+						}
+					}
 				}
 				else {
 					if (dwDstRowPitch == dwMipRowPitch) {
@@ -6585,19 +8386,29 @@ void CreateHostResource(xbox::X_D3DResource *pResource, DWORD D3DUsage, int iTex
         }
         case xbox::X_D3DRTYPE_VOLUME:
             // We didn't use a copy for Volumes
+            hRet = D3D_OK;
             break;
         case xbox::X_D3DRTYPE_TEXTURE:
-            g_pD3DDevice->UpdateTexture(pIntermediateHostTexture.Get(), pNewHostTexture.Get());
+            hRet = g_pD3DDevice->UpdateTexture(pIntermediateHostTexture.Get(), pNewHostTexture.Get());
             break;
         case xbox::X_D3DRTYPE_VOLUMETEXTURE:
-            g_pD3DDevice->UpdateTexture(pIntermediateHostVolumeTexture.Get(), pNewHostVolumeTexture.Get());
+            hRet = g_pD3DDevice->UpdateTexture(pIntermediateHostVolumeTexture.Get(), pNewHostVolumeTexture.Get());
             break;
         case xbox::X_D3DRTYPE_CUBETEXTURE:
-            g_pD3DDevice->UpdateTexture(pIntermediateHostCubeTexture.Get(), pNewHostCubeTexture.Get());
+            hRet = g_pD3DDevice->UpdateTexture(pIntermediateHostCubeTexture.Get(), pNewHostCubeTexture.Get());
             break;
         default:
             assert(false);
         }
+
+        RenderTrace_RecordTextureUpload(
+            static_cast<DWORD>(XboxResourceType),
+            static_cast<DWORD>(X_Format),
+            static_cast<DWORD>(PCFormat),
+            hostWidth,
+            hostHeight,
+            dwMipMapLevels,
+            hRet);
 
         if (hRet != D3D_OK) {
             EmuLog(LOG_LEVEL::WARNING, "Updating host %s failed! 0x%08X", ResourceTypeName, hRet);
@@ -6744,10 +8555,25 @@ void UpdateFixedFunctionShaderLight(int d3dLightIndex, Light* pShaderLight, D3DX
 	pShaderLight->Attenuation.x = d3dLight->Attenuation0;
 	pShaderLight->Attenuation.y = d3dLight->Attenuation1;
 	pShaderLight->Attenuation.z = d3dLight->Attenuation2;
+	if (g_jvs_game_type == JvsGameType::CrazyTaxi &&
+		d3dLight->Type == D3DLIGHT_POINT) {
+		const float rangeScale =
+			std::max(0, g_BetaConfig.ct_debug_point_light_range_percent) /
+			100.0f;
+		const float attenuationScale =
+			std::max(
+				0,
+				g_BetaConfig.ct_debug_point_light_attenuation_percent) /
+			100.0f;
+		pShaderLight->RangeAmbient.x *= rangeScale;
+		pShaderLight->Attenuation.x *= attenuationScale;
+		pShaderLight->Attenuation.y *= attenuationScale;
+		pShaderLight->Attenuation.z *= attenuationScale;
+	}
 
-	// Crazy Taxi needs NV2A-style per-light ambient attenuation. Preserve the
-	// established global accumulation for every other title.
-	if (!g_ChihiroCrazyTaxiGame) {
+	// Crazy Taxi uses NV2A-style local light ambient in the vertex shader.
+	// Preserve the established global accumulation for every other title.
+	if (g_jvs_game_type != JvsGameType::CrazyTaxi) {
 		pLightAmbient->x += d3dLight->Ambient.r;
 		pLightAmbient->y += d3dLight->Ambient.g;
 		pLightAmbient->z += d3dLight->Ambient.b;
@@ -6760,6 +8586,8 @@ void UpdateFixedFunctionShaderLight(int d3dLightIndex, Light* pShaderLight, D3DX
 
 void UpdateFixedFunctionVertexShaderState()
 {
+	using namespace xbox;
+
 	// Dirty-flag early exit: skip entirely if no Xbox state has changed and GPU data is current.
 	// This avoids redundant computation+upload for multi-pass draws on the same object.
 	// With ~1100 draw calls/frame in WMMT2, skipping the non-transform computation
@@ -6767,6 +8595,53 @@ void UpdateFixedFunctionVertexShaderState()
 	bool transformDirty = g_FFTransformDirty;
 	bool nonTransformDirty = g_FFNonTransformDirty;
 	bool gpuInvalid = g_FFRestInvalid;
+	if (g_BetaConfig.ff_force_full_rebuild) {
+		transformDirty = true;
+		nonTransformDirty = true;
+	}
+	const DWORD currentVertexBlend =
+		XboxRenderStates.GetXboxRenderState(X_D3DRS_VERTEXBLEND);
+	const unsigned currentNrBlendMatrices =
+		((currentVertexBlend + (currentVertexBlend & 1)) / 2) + 1;
+
+	// Xbox fixed-function matrix palettes are ultimately written through the
+	// NV2A push buffer. Keep those constants as a fallback for titles whose SDK
+	// helper was not identified. Once D3DDevice_SetVertexBlendModelView is
+	// HLE-patched, its exact model-view and inverse matrices are authoritative.
+	D3DXMATRIX nv2aModelView[4] = {};
+	bool useNv2aBlendMatrices =
+		g_BetaConfig.ff_nv2a_blend_matrices &&
+		!d3d8TransformState.IsVertexBlendModelViewManaged() &&
+		currentVertexBlend <= X_D3DVBF_4WEIGHTS4MATRICES &&
+		currentNrBlendMatrices > 1 &&
+		currentNrBlendMatrices <= 4;
+	const bool captureNv2aBlendMatrices =
+		g_RenderTraceEnabled &&
+		currentVertexBlend <= X_D3DVBF_4WEIGHTS4MATRICES &&
+		currentNrBlendMatrices > 1 &&
+		currentNrBlendMatrices <= 4;
+	if (useNv2aBlendMatrices || captureNv2aBlendMatrices) {
+		for (unsigned i = 0; i < currentNrBlendMatrices; ++i) {
+			memcpy(
+				&nv2aModelView[i],
+				HLE_get_NV2A_vertex_constant_float4_ptr(
+					NV_IGRAPH_XF_XFCTX_MMAT0 + i * 8),
+				sizeof(nv2aModelView[i]));
+		}
+
+		if (useNv2aBlendMatrices) {
+			static D3DXMATRIX s_LastNv2aModelView[4] = {};
+			static unsigned s_LastNv2aMatrixCount = 0;
+			const size_t matrixBytes =
+				currentNrBlendMatrices * sizeof(nv2aModelView[0]);
+			if (s_LastNv2aMatrixCount != currentNrBlendMatrices ||
+				memcmp(s_LastNv2aModelView, nv2aModelView, matrixBytes) != 0) {
+				memcpy(s_LastNv2aModelView, nv2aModelView, matrixBytes);
+				s_LastNv2aMatrixCount = currentNrBlendMatrices;
+				transformDirty = true;
+			}
+		}
+	}
 
 	if (!transformDirty && !nonTransformDirty && !gpuInvalid) {
 		return;
@@ -6782,15 +8657,19 @@ void UpdateFixedFunctionVertexShaderState()
 		const int transformSlots = sizeof(Transforms) / slotSize;
 		const int totalSlots = (sizeof(FixedFunctionVertexShaderState) + slotSize - 1) / slotSize;
 		const int restSlots = totalSlots - transformSlots;
-		g_pD3DDevice->SetVertexShaderConstantF(0, (float*)&ffShaderState.Transforms, transformSlots);
-		g_pD3DDevice->SetVertexShaderConstantF(transformSlots,
+		g_FFLastTransformUploadResult =
+			CxbxSetVertexShaderConstantF(
+				0,
+				(float*)&ffShaderState.Transforms,
+				transformSlots);
+		g_FFLastRestUploadResult = CxbxSetVertexShaderConstantF(transformSlots,
 			(const float*)(((const uint8_t*)&ffShaderState) + sizeof(Transforms)), restSlots);
+		++g_FFUploadSerial;
 		g_FFRestInvalid = false;
 		return;
 	}
 
 	extern xbox::X_VERTEXATTRIBUTEFORMAT* GetXboxVertexAttributeFormat(); // TMP glue
-	using namespace xbox;
 
 	// fullRebuild = true when render states, lights, materials, or non-world transforms changed.
 	// When only the world matrix changed, we skip all the expensive non-transform computation.
@@ -6798,10 +8677,13 @@ void UpdateFixedFunctionVertexShaderState()
 
 	// Cached vertex blend matrix count (only changes with render state, i.e. fullRebuild)
 	static unsigned s_NrBlendMatrices = 1;
+	static DWORD s_VertexBlend = xbox::X_D3DVBF_DISABLE;
 
 	if (fullRebuild) {
 		// Vertex blending
-		auto VertexBlend = XboxRenderStates.GetXboxRenderState(X_D3DRS_VERTEXBLEND);
+		auto VertexBlend = currentVertexBlend;
+		s_VertexBlend = VertexBlend;
+		RenderTrace_RecordFixedFunctionVertexBlend(VertexBlend);
 		// Xbox and host D3DVERTEXBLENDFLAGS :
 		//     D3DVBF_DISABLE           = 0 : 1 matrix,   0 weights => final weight 1
 		//     D3DVBF_1WEIGHTS          = 1 : 2 matrices, 1 weights => final weight calculated
@@ -6818,9 +8700,11 @@ void UpdateFixedFunctionVertexShaderState()
 		ffShaderState.Modes.VertexBlend_NrOfMatrices = (float)s_NrBlendMatrices;
 		ffShaderState.Modes.VertexBlend_CalcLastWeight = (float)CalcLastBlendWeight;
 
-		// SetVertexBlendModelView supplies a projection/viewport composite for
-		// multi-matrix draws. Use the extracted projection only for those draws;
-		// later fixed-function passes keep the title's logical projection.
+		// SetVertexBlendModelView writes a composite matrix directly to the
+		// Xbox hardware without replacing the title's logical projection
+		// transform. Use its derived projection only for the corresponding
+		// multi-matrix blend draws, then fall back to the logical transform for
+		// later fixed-function effects such as projected ground shadows.
 		const D3DMATRIX* activeProjection =
 			&d3d8TransformState.Transforms[X_D3DTS_PROJECTION];
 		if (s_NrBlendMatrices > 1) {
@@ -6845,14 +8729,22 @@ void UpdateFixedFunctionVertexShaderState()
 		// Point sprites aren't lit - 'each point is always rendered with constant colors.'
 		// https://docs.microsoft.com/en-us/windows/win32/direct3d9/point-sprites
 		bool PointSpriteEnable = XboxRenderStates.GetXboxRenderState(X_D3DRS_POINTSPRITEENABLE);
-		bool LightingEnable = XboxRenderStates.GetXboxRenderState(X_D3DRS_LIGHTING);
+		bool LightingEnable =
+			XboxRenderStates.GetXboxRenderState(X_D3DRS_LIGHTING);
+		if (g_BetaConfig.ct_debug_disable_lighting) {
+			LightingEnable = false;
+		}
 		ffShaderState.Modes.Lighting = LightingEnable && !PointSpriteEnable;
 		ffShaderState.Modes.TwoSidedLighting = (float)XboxRenderStates.GetXboxRenderState(X_D3DRS_TWOSIDEDLIGHTING);
 		ffShaderState.Modes.LocalViewer = (float)XboxRenderStates.GetXboxRenderState(X_D3DRS_LOCALVIEWER);
-		// Crazy Taxi's camera-space reflection-vector convention is opposite
-		// D3D9's fixed-function host convention before its scale/bias matrix.
+		// Crazy Taxi High Roller's 2-D environment maps use the Xbox
+		// camera-space reflection Y convention. D3D9's fixed-function host
+		// path expects the opposite sign before the title's scale/bias texture
+		// matrix, otherwise the taxi shell samples the dark half of the map.
+		// Keep this title-scoped so other Chihiro games retain their current
+		// reflection-vector behavior.
 		ffShaderState.ReflectionVectorYSign =
-			g_ChihiroCrazyTaxiGame ? -1.0f : 1.0f;
+			g_jvs_game_type == JvsGameType::CrazyTaxi ? -1.0f : 1.0f;
 
 		// Material sources
 		bool ColorVertex = XboxRenderStates.GetXboxRenderState(X_D3DRS_COLORVERTEX) != FALSE;
@@ -6963,10 +8855,40 @@ void UpdateFixedFunctionVertexShaderState()
 		ffShaderState.Modes.NormalizeNormals = (float)XboxRenderStates.GetXboxRenderState(X_D3DRS_NORMALIZENORMALS);
 	} // end fullRebuild
 
-	// WorldView/WorldViewIT — recompute whenever transforms or blend matrix count changed
+	// WorldView/WorldViewIT — recompute whenever transforms or blend matrix count changed.
+	// Multi-matrix fixed-function draws use the NV2A matrix palette because it
+	// also covers SetVertexBlendModelView updates that bypass SetTransform.
 	for (unsigned i = 0; i < s_NrBlendMatrices; i++) {
-		D3DXMatrixTranspose((D3DXMATRIX*)&ffShaderState.Transforms.WorldView[i], (D3DXMATRIX*)d3d8TransformState.GetWorldView(i));
-		D3DXMatrixTranspose((D3DXMATRIX*)&ffShaderState.Transforms.WorldViewInverseTranspose[i], (D3DXMATRIX*)d3d8TransformState.GetWorldViewInverseTranspose(i));
+		if (useNv2aBlendMatrices) {
+			memcpy(
+				&ffShaderState.Transforms.WorldView[i],
+				&nv2aModelView[i],
+				sizeof(nv2aModelView[i]));
+
+			D3DXMATRIX logicalWorldView;
+			D3DXMatrixTranspose(&logicalWorldView, &nv2aModelView[i]);
+			D3DXMatrixInverse(
+				reinterpret_cast<D3DXMATRIX*>(
+					&ffShaderState.Transforms.WorldViewInverseTranspose[i]),
+				nullptr,
+				&logicalWorldView);
+		}
+		else {
+			D3DXMatrixTranspose((D3DXMATRIX*)&ffShaderState.Transforms.WorldView[i], (D3DXMATRIX*)d3d8TransformState.GetWorldView(i));
+			D3DXMatrixTranspose((D3DXMATRIX*)&ffShaderState.Transforms.WorldViewInverseTranspose[i], (D3DXMATRIX*)d3d8TransformState.GetWorldViewInverseTranspose(i));
+		}
+	}
+	RenderTrace_RecordFixedFunctionBlendMatrices(
+		false,
+		s_VertexBlend,
+		s_NrBlendMatrices,
+		reinterpret_cast<const float*>(&ffShaderState.Transforms.WorldView[0]));
+	if (captureNv2aBlendMatrices) {
+		RenderTrace_RecordFixedFunctionBlendMatrices(
+			true,
+			s_VertexBlend,
+			s_NrBlendMatrices,
+			reinterpret_cast<const float*>(&nv2aModelView[0]));
 	}
 
 	// === Upload to GPU ===
@@ -6977,7 +8899,12 @@ void UpdateFixedFunctionVertexShaderState()
 	const int restOffset = transformSlots; // register index where non-transform data starts
 
 	// Upload transforms (always needed when we reach this point — either transforms changed or fullRebuild)
-	g_pD3DDevice->SetVertexShaderConstantF(0, (float*)&ffShaderState.Transforms, transformSlots);
+	g_FFLastTransformUploadResult =
+		CxbxSetVertexShaderConstantF(
+			0,
+			(float*)&ffShaderState.Transforms,
+			transformSlots);
+	bool uploadedRest = false;
 
 	// Upload rest only when it may have changed (fullRebuild or GPU invalidated)
 	if (fullRebuild || gpuInvalid) {
@@ -6987,11 +8914,20 @@ void UpdateFixedFunctionVertexShaderState()
 		const size_t restSize = sizeof(FixedFunctionVertexShaderState) - sizeof(Transforms);
 
 		if (gpuInvalid || !s_restValid || memcmp(restPtr, s_lastRestData, restSize) != 0) {
-			g_pD3DDevice->SetVertexShaderConstantF(restOffset, (const float*)restPtr, restSlots);
+			g_FFLastRestUploadResult =
+				CxbxSetVertexShaderConstantF(
+					restOffset,
+					(const float*)restPtr,
+					restSlots);
+			uploadedRest = true;
 			memcpy(s_lastRestData, restPtr, restSize);
 			s_restValid = true;
 		}
 	}
+	if (!uploadedRest) {
+		g_FFLastRestUploadResult = S_FALSE;
+	}
+	++g_FFUploadSerial;
 	g_FFRestInvalid = false;
 }
 
@@ -8016,8 +9952,10 @@ struct CxbxRenderTracePositionBounds {
 	bool hasBounds;
 	float minX;
 	float minY;
+	float minZ;
 	float maxX;
 	float maxY;
+	float maxZ;
 };
 
 struct CxbxRenderTraceTexCoordBounds {
@@ -8198,7 +10136,8 @@ static bool CxbxRenderTraceTryReadElementXY(
 	UINT vertexStride,
 	const D3DVERTEXELEMENT9& element,
 	float* x,
-	float* y)
+	float* y,
+	float* z = nullptr)
 {
 	if (vertexData == nullptr || vertexStride <= element.Offset) {
 		return false;
@@ -8209,36 +10148,66 @@ static bool CxbxRenderTraceTryReadElementXY(
 	case D3DDECLTYPE_FLOAT1:
 		*x = reinterpret_cast<const float*>(elementData)[0];
 		*y = 0.0f;
+		if (z != nullptr) {
+			*z = 0.0f;
+		}
 		return true;
 	case D3DDECLTYPE_FLOAT2:
+		*x = reinterpret_cast<const float*>(elementData)[0];
+		*y = reinterpret_cast<const float*>(elementData)[1];
+		if (z != nullptr) {
+			*z = 0.0f;
+		}
+		return true;
 	case D3DDECLTYPE_FLOAT3:
 	case D3DDECLTYPE_FLOAT4:
 		*x = reinterpret_cast<const float*>(elementData)[0];
 		*y = reinterpret_cast<const float*>(elementData)[1];
+		if (z != nullptr) {
+			*z = reinterpret_cast<const float*>(elementData)[2];
+		}
 		return true;
 	case D3DDECLTYPE_SHORT2:
 		*x = static_cast<float>(reinterpret_cast<const int16_t*>(elementData)[0]);
 		*y = static_cast<float>(reinterpret_cast<const int16_t*>(elementData)[1]);
+		if (z != nullptr) {
+			*z = 0.0f;
+		}
 		return true;
 	case D3DDECLTYPE_SHORT4:
 		*x = static_cast<float>(reinterpret_cast<const int16_t*>(elementData)[0]);
 		*y = static_cast<float>(reinterpret_cast<const int16_t*>(elementData)[1]);
+		if (z != nullptr) {
+			*z = static_cast<float>(reinterpret_cast<const int16_t*>(elementData)[2]);
+		}
 		return true;
 	case D3DDECLTYPE_SHORT2N:
 		*x = static_cast<float>(reinterpret_cast<const int16_t*>(elementData)[0]) / 32767.0f;
 		*y = static_cast<float>(reinterpret_cast<const int16_t*>(elementData)[1]) / 32767.0f;
+		if (z != nullptr) {
+			*z = 0.0f;
+		}
 		return true;
 	case D3DDECLTYPE_SHORT4N:
 		*x = static_cast<float>(reinterpret_cast<const int16_t*>(elementData)[0]) / 32767.0f;
 		*y = static_cast<float>(reinterpret_cast<const int16_t*>(elementData)[1]) / 32767.0f;
+		if (z != nullptr) {
+			*z = static_cast<float>(reinterpret_cast<const int16_t*>(elementData)[2]) / 32767.0f;
+		}
 		return true;
 	case D3DDECLTYPE_UBYTE4:
 		*x = static_cast<float>(elementData[0]);
 		*y = static_cast<float>(elementData[1]);
+		if (z != nullptr) {
+			*z = static_cast<float>(elementData[2]);
+		}
 		return true;
 	case D3DDECLTYPE_UBYTE4N:
 		*x = static_cast<float>(elementData[0]) / 255.0f;
 		*y = static_cast<float>(elementData[1]) / 255.0f;
+		if (z != nullptr) {
+			*z = static_cast<float>(elementData[2]) / 255.0f;
+		}
 		return true;
 	default:
 		return false;
@@ -8319,8 +10288,10 @@ static CxbxRenderTracePositionBounds CxbxRenderTraceComputePositionBounds(
 
 	float minX = 0.0f;
 	float minY = 0.0f;
+	float minZ = 0.0f;
 	float maxX = 0.0f;
 	float maxY = 0.0f;
+	float maxZ = 0.0f;
 	bool havePoint = false;
 
 	auto updateBounds = [&](UINT vertexIndex) {
@@ -8330,26 +10301,31 @@ static CxbxRenderTracePositionBounds CxbxRenderTraceComputePositionBounds(
 
 		float x = 0.0f;
 		float y = 0.0f;
+		float z = 0.0f;
 		if (!CxbxRenderTraceTryReadElementXY(
 			static_cast<const uint8_t*>(vertexData) + (static_cast<size_t>(vertexIndex) * vertexStride),
 			vertexStride,
 			positionElement,
 			&x,
-			&y)) {
+			&y,
+			&z)) {
 			return;
 		}
 
 		if (!havePoint) {
 			minX = maxX = x;
 			minY = maxY = y;
+			minZ = maxZ = z;
 			havePoint = true;
 			return;
 		}
 
 		minX = std::min(minX, x);
 		minY = std::min(minY, y);
+		minZ = std::min(minZ, z);
 		maxX = std::max(maxX, x);
 		maxY = std::max(maxY, y);
+		maxZ = std::max(maxZ, z);
 	};
 
 	if (indexData != nullptr && indexCount != 0) {
@@ -8371,8 +10347,10 @@ static CxbxRenderTracePositionBounds CxbxRenderTraceComputePositionBounds(
 	bounds.hasBounds = true;
 	bounds.minX = minX;
 	bounds.minY = minY;
+	bounds.minZ = minZ;
 	bounds.maxX = maxX;
 	bounds.maxY = maxY;
+	bounds.maxZ = maxZ;
 	return bounds;
 }
 
@@ -8538,7 +10516,395 @@ static CxbxRenderTraceDiffuseColorBounds CxbxRenderTraceComputeDiffuseColorBound
 	return bounds;
 }
 
+static void OutRunDrawProbeCaptureCurrentGeometry(UINT vertexCount)
+{
+	if (!g_OutRunDrawProbeCaptureActive ||
+		g_OutRunDrawProbe == nullptr ||
+		g_OutRunDrawOrdinal <= 0 ||
+		g_OutRunDrawOrdinal > kOutRunDrawProbeRecordCount) {
+		return;
+	}
+
+	OutRunDrawProbeRecord& record =
+		g_OutRunDrawProbe->captureRecords[g_OutRunDrawOrdinal - 1];
+	record.geometryVertexCount = static_cast<LONG>(vertexCount);
+	record.hostStreamStride = 0;
+	record.hostStreamOffset = 0;
+	record.texCoordElementType = -1;
+	record.texCoordElementOffset = -1;
+	record.diffuseElementType = -1;
+	record.diffuseElementOffset = -1;
+	record.positionBoundsValid = 0;
+	record.minPositionX = 0.0f;
+	record.minPositionY = 0.0f;
+	record.minPositionZ = 0.0f;
+	record.maxPositionX = 0.0f;
+	record.maxPositionY = 0.0f;
+	record.maxPositionZ = 0.0f;
+	record.texCoordBoundsValid = 0;
+	record.minU = 0.0f;
+	record.minV = 0.0f;
+	record.maxU = 0.0f;
+	record.maxV = 0.0f;
+	record.diffuseBoundsValid = 0;
+	record.minDiffuseR = 0;
+	record.minDiffuseG = 0;
+	record.minDiffuseB = 0;
+	record.minDiffuseA = 0;
+	record.maxDiffuseR = 0;
+	record.maxDiffuseG = 0;
+	record.maxDiffuseB = 0;
+	record.maxDiffuseA = 0;
+	record.textureScaleU = 1.0f;
+	record.textureScaleV = 1.0f;
+	memset(record.immediateFirstDwords, 0, sizeof(record.immediateFirstDwords));
+
+	float textureScale[4] = {};
+	if (SUCCEEDED(g_pD3DDevice->GetVertexShaderConstantF(
+			CXBX_D3DVS_TEXTURES_SCALE_BASE,
+			textureScale,
+			1))) {
+		record.textureScaleU = textureScale[0];
+		record.textureScaleV = textureScale[1];
+	}
+
+	D3DVERTEXELEMENT9 texCoordElement = {};
+	if (CxbxRenderTraceTryGetTexCoord0Element(&texCoordElement)) {
+		record.texCoordElementType =
+			static_cast<LONG>(texCoordElement.Type);
+		record.texCoordElementOffset =
+			static_cast<LONG>(texCoordElement.Offset);
+	}
+	D3DVERTEXELEMENT9 diffuseElement = {};
+	if (CxbxRenderTraceTryGetDiffuseColorElement(&diffuseElement)) {
+		record.diffuseElementType =
+			static_cast<LONG>(diffuseElement.Type);
+		record.diffuseElementOffset =
+			static_cast<LONG>(diffuseElement.Offset);
+	}
+
+	IDirect3DVertexBuffer9* vertexBuffer = nullptr;
+	UINT streamOffset = 0;
+	UINT streamStride = 0;
+	if (FAILED(g_pD3DDevice->GetStreamSource(
+			0,
+			&vertexBuffer,
+			&streamOffset,
+			&streamStride)) ||
+		vertexBuffer == nullptr ||
+		streamStride == 0 ||
+		vertexCount == 0) {
+		if (vertexBuffer != nullptr) {
+			vertexBuffer->Release();
+		}
+		return;
+	}
+
+	record.hostStreamStride = static_cast<LONG>(streamStride);
+	record.hostStreamOffset = static_cast<LONG>(streamOffset);
+
+	D3DVERTEXBUFFER_DESC desc = {};
+	const size_t requestedBytes =
+		static_cast<size_t>(vertexCount) * streamStride;
+	const size_t availableBytes =
+		SUCCEEDED(vertexBuffer->GetDesc(&desc)) && desc.Size > streamOffset
+			? static_cast<size_t>(desc.Size - streamOffset)
+			: 0;
+	const size_t lockBytes = std::min(requestedBytes, availableBytes);
+	const UINT readableVertexCount =
+		static_cast<UINT>(lockBytes / streamStride);
+	void* vertexData = nullptr;
+	if (readableVertexCount != 0 &&
+		SUCCEEDED(vertexBuffer->Lock(
+			streamOffset,
+			static_cast<UINT>(readableVertexCount * streamStride),
+			&vertexData,
+			D3DLOCK_READONLY)) &&
+		vertexData != nullptr) {
+		const auto positionBounds =
+			CxbxRenderTraceComputePositionBounds(
+				vertexData,
+				streamStride,
+				readableVertexCount,
+				nullptr,
+				0);
+		record.positionBoundsValid = positionBounds.hasBounds ? 1 : 0;
+		record.minPositionX = positionBounds.minX;
+		record.minPositionY = positionBounds.minY;
+		record.minPositionZ = positionBounds.minZ;
+		record.maxPositionX = positionBounds.maxX;
+		record.maxPositionY = positionBounds.maxY;
+		record.maxPositionZ = positionBounds.maxZ;
+
+		const auto texCoordBounds =
+			CxbxRenderTraceComputeTexCoord0Bounds(
+				vertexData,
+				streamStride,
+				readableVertexCount,
+				nullptr,
+				0);
+		record.texCoordBoundsValid = texCoordBounds.hasBounds ? 1 : 0;
+		record.minU = texCoordBounds.minU;
+		record.minV = texCoordBounds.minV;
+		record.maxU = texCoordBounds.maxU;
+		record.maxV = texCoordBounds.maxV;
+
+		const auto diffuseBounds =
+			CxbxRenderTraceComputeDiffuseColorBounds(
+				vertexData,
+				streamStride,
+				readableVertexCount,
+				nullptr,
+				0);
+		record.diffuseBoundsValid = diffuseBounds.hasBounds ? 1 : 0;
+		record.minDiffuseR = static_cast<LONG>(diffuseBounds.minR);
+		record.minDiffuseG = static_cast<LONG>(diffuseBounds.minG);
+		record.minDiffuseB = static_cast<LONG>(diffuseBounds.minB);
+		record.minDiffuseA = static_cast<LONG>(diffuseBounds.minA);
+		record.maxDiffuseR = static_cast<LONG>(diffuseBounds.maxR);
+		record.maxDiffuseG = static_cast<LONG>(diffuseBounds.maxG);
+		record.maxDiffuseB = static_cast<LONG>(diffuseBounds.maxB);
+		record.maxDiffuseA = static_cast<LONG>(diffuseBounds.maxA);
+		vertexBuffer->Unlock();
+	}
+
+	vertexBuffer->Release();
+}
+
+static void OutRunDrawProbeCaptureImmediateGeometry(
+	const void* vertexData,
+	UINT streamStride,
+	UINT vertexCount)
+{
+	if (!g_OutRunDrawProbeCaptureActive ||
+		g_OutRunDrawProbe == nullptr ||
+		g_OutRunDrawOrdinal <= 0 ||
+		g_OutRunDrawOrdinal > kOutRunDrawProbeRecordCount) {
+		return;
+	}
+
+	OutRunDrawProbeRecord& record =
+		g_OutRunDrawProbe->captureRecords[g_OutRunDrawOrdinal - 1];
+	record.geometryVertexCount = static_cast<LONG>(vertexCount);
+	record.hostStreamStride = static_cast<LONG>(streamStride);
+	record.hostStreamOffset = 0;
+	record.texCoordElementType = -1;
+	record.texCoordElementOffset = -1;
+	record.diffuseElementType = -1;
+	record.diffuseElementOffset = -1;
+	record.positionBoundsValid = 0;
+	record.minPositionX = 0.0f;
+	record.minPositionY = 0.0f;
+	record.minPositionZ = 0.0f;
+	record.maxPositionX = 0.0f;
+	record.maxPositionY = 0.0f;
+	record.maxPositionZ = 0.0f;
+	record.texCoordBoundsValid = 0;
+	record.minU = 0.0f;
+	record.minV = 0.0f;
+	record.maxU = 0.0f;
+	record.maxV = 0.0f;
+	record.diffuseBoundsValid = 0;
+	record.minDiffuseR = 0;
+	record.minDiffuseG = 0;
+	record.minDiffuseB = 0;
+	record.minDiffuseA = 0;
+	record.maxDiffuseR = 0;
+	record.maxDiffuseG = 0;
+	record.maxDiffuseB = 0;
+	record.maxDiffuseA = 0;
+	record.textureScaleU = 1.0f;
+	record.textureScaleV = 1.0f;
+
+	float textureScale[4] = {};
+	if (SUCCEEDED(g_pD3DDevice->GetVertexShaderConstantF(
+			CXBX_D3DVS_TEXTURES_SCALE_BASE,
+			textureScale,
+			1))) {
+		record.textureScaleU = textureScale[0];
+		record.textureScaleV = textureScale[1];
+	}
+
+	D3DVERTEXELEMENT9 texCoordElement = {};
+	if (CxbxRenderTraceTryGetTexCoord0Element(&texCoordElement)) {
+		record.texCoordElementType =
+			static_cast<LONG>(texCoordElement.Type);
+		record.texCoordElementOffset =
+			static_cast<LONG>(texCoordElement.Offset);
+	}
+	D3DVERTEXELEMENT9 diffuseElement = {};
+	if (CxbxRenderTraceTryGetDiffuseColorElement(&diffuseElement)) {
+		record.diffuseElementType =
+			static_cast<LONG>(diffuseElement.Type);
+		record.diffuseElementOffset =
+			static_cast<LONG>(diffuseElement.Offset);
+	}
+
+	if (vertexData == nullptr || streamStride == 0 || vertexCount == 0) {
+		return;
+	}
+	memcpy(
+		record.immediateFirstDwords,
+		vertexData,
+		std::min(
+			sizeof(record.immediateFirstDwords),
+			static_cast<size_t>(streamStride) * vertexCount));
+
+	const auto positionBounds =
+		CxbxRenderTraceComputePositionBounds(
+			vertexData,
+			streamStride,
+			vertexCount,
+			nullptr,
+			0);
+	record.positionBoundsValid = positionBounds.hasBounds ? 1 : 0;
+	record.minPositionX = positionBounds.minX;
+	record.minPositionY = positionBounds.minY;
+	record.minPositionZ = positionBounds.minZ;
+	record.maxPositionX = positionBounds.maxX;
+	record.maxPositionY = positionBounds.maxY;
+	record.maxPositionZ = positionBounds.maxZ;
+
+	const auto texCoordBounds =
+		CxbxRenderTraceComputeTexCoord0Bounds(
+			vertexData,
+			streamStride,
+			vertexCount,
+			nullptr,
+			0);
+	record.texCoordBoundsValid = texCoordBounds.hasBounds ? 1 : 0;
+	record.minU = texCoordBounds.minU;
+	record.minV = texCoordBounds.minV;
+	record.maxU = texCoordBounds.maxU;
+	record.maxV = texCoordBounds.maxV;
+
+	const auto diffuseBounds =
+		CxbxRenderTraceComputeDiffuseColorBounds(
+			vertexData,
+			streamStride,
+			vertexCount,
+			nullptr,
+			0);
+	record.diffuseBoundsValid = diffuseBounds.hasBounds ? 1 : 0;
+	record.minDiffuseR = static_cast<LONG>(diffuseBounds.minR);
+	record.minDiffuseG = static_cast<LONG>(diffuseBounds.minG);
+	record.minDiffuseB = static_cast<LONG>(diffuseBounds.minB);
+	record.minDiffuseA = static_cast<LONG>(diffuseBounds.minA);
+	record.maxDiffuseR = static_cast<LONG>(diffuseBounds.maxR);
+	record.maxDiffuseG = static_cast<LONG>(diffuseBounds.maxG);
+	record.maxDiffuseB = static_cast<LONG>(diffuseBounds.maxB);
+	record.maxDiffuseA = static_cast<LONG>(diffuseBounds.maxA);
+}
+
 static inline void CxbxPrepareHostDrawVertexShaderConstants();
+void CxbxUpdateHostTextures();
+void CxbxUpdateHostTextureScaling();
+
+static LONG CxbxTryGetXboxTextureData(
+	const xbox::X_D3DBaseTexture* texture)
+{
+	if (texture == nullptr) {
+		return 0;
+	}
+	__try {
+		return static_cast<LONG>(texture->Data);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return 0;
+	}
+}
+
+bool CxbxHasRecentCrazyTaxiDecodedMovieFrame()
+{
+	const DWORD lastFrameTick = static_cast<DWORD>(
+		InterlockedCompareExchange(
+			&g_CrazyTaxiMovieFrameLastTick, 0, 0));
+	// CRI conversion can run well below real time under Wine/Box32 and during
+	// shader compilation. Keep the most recently decoded frame available
+	// across those gaps; the resource-identity guard below suppresses the
+	// presentation surface once the stream is genuinely stale.
+	return lastFrameTick != 0 &&
+		GetTickCount() - lastFrameTick <= 1500;
+}
+
+static bool CxbxBindCrazyTaxiDecodedMovieTexture()
+{
+	if (g_pD3DDevice == nullptr ||
+		!CxbxHasRecentCrazyTaxiDecodedMovieFrame() ||
+		InterlockedCompareExchange(
+			&g_CrazyTaxiMovieFrameGeneration, 0, 0) == 0) {
+		return false;
+	}
+
+	bool bound = false;
+	AcquireSRWLockExclusive(&g_CrazyTaxiMovieFrameLock);
+	const LONG generation =
+		InterlockedCompareExchange(
+			&g_CrazyTaxiMovieFrameGeneration, 0, 0);
+	const uint32_t width = g_CrazyTaxiMovieFrameWidth;
+	const uint32_t height = g_CrazyTaxiMovieFrameHeight;
+	const size_t expectedByteCount =
+		static_cast<size_t>(width) * height * sizeof(uint32_t);
+
+	if (width != 0 && height != 0 &&
+		g_CrazyTaxiMovieFramePixels.size() >= expectedByteCount) {
+		if (g_CrazyTaxiMovieHostTexture == nullptr ||
+			g_CrazyTaxiMovieHostTextureWidth != width ||
+			g_CrazyTaxiMovieHostTextureHeight != height) {
+			g_CrazyTaxiMovieHostTexture.Reset();
+			g_CrazyTaxiMovieFrameUploadedGeneration = 0;
+			IDirect3DTexture* texture = nullptr;
+			if (SUCCEEDED(g_pD3DDevice->CreateTexture(
+					width,
+					height,
+					1,
+					0,
+					D3DFMT_A8R8G8B8,
+					D3DPOOL_MANAGED,
+					&texture,
+					nullptr))) {
+				g_CrazyTaxiMovieHostTexture.Attach(texture);
+				g_CrazyTaxiMovieHostTextureWidth = width;
+				g_CrazyTaxiMovieHostTextureHeight = height;
+			}
+		}
+
+		if (g_CrazyTaxiMovieHostTexture != nullptr &&
+			g_CrazyTaxiMovieFrameUploadedGeneration != generation) {
+			D3DLOCKED_RECT locked{};
+			if (SUCCEEDED(g_CrazyTaxiMovieHostTexture->LockRect(
+					0, &locked, nullptr, 0))) {
+				const uint8_t* source =
+					g_CrazyTaxiMovieFramePixels.data();
+				auto* destination =
+					static_cast<uint8_t*>(locked.pBits);
+				const size_t rowBytes =
+					static_cast<size_t>(width) *
+					sizeof(uint32_t);
+				for (uint32_t row = 0; row < height; ++row) {
+					memcpy(
+						destination +
+							static_cast<size_t>(row) *
+								locked.Pitch,
+						source +
+							static_cast<size_t>(row) *
+								rowBytes,
+						rowBytes);
+				}
+				g_CrazyTaxiMovieHostTexture->UnlockRect(0);
+				g_CrazyTaxiMovieFrameUploadedGeneration =
+					generation;
+			}
+		}
+
+		if (g_CrazyTaxiMovieHostTexture != nullptr) {
+			bound = SUCCEEDED(g_pD3DDevice->SetTexture(
+				0, g_CrazyTaxiMovieHostTexture.Get()));
+		}
+	}
+	ReleaseSRWLockExclusive(&g_CrazyTaxiMovieFrameLock);
+	return bound;
+}
 
 // Requires assigned pXboxIndexData
 // Called by D3DDevice_DrawIndexedVertices and EmuExecutePushBufferRaw (twice)
@@ -8577,18 +10943,48 @@ void CxbxDrawIndexed(CxbxDrawContext &DrawContext)
 		primCount *= TRIANGLES_PER_QUAD;
 	}
 
+	if (g_RenderTraceEnabled) {
+		UINT restartIndexCount = 0;
+		for (UINT index = 0; index < DrawContext.dwVertexCount; ++index) {
+			if (DrawContext.pXboxIndexData[index] == 0xFFFFu) {
+				++restartIndexCount;
+			}
+		}
+		RenderTrace_RecordIndexData(
+			DrawContext.dwVertexCount,
+			CacheEntry.LowIndex,
+			CacheEntry.HighIndex,
+			restartIndexCount,
+			static_cast<INT>(DrawContext.dwBaseVertexIndex));
+	}
+
 	// See https://docs.microsoft.com/en-us/windows/win32/direct3d9/rendering-from-vertex-and-index-buffers
 	// for an explanation on the function of the BaseVertexIndex, MinVertexIndex, NumVertices and StartIndex arguments.
 	CxbxPrepareHostDrawVertexShaderConstants();
-	HRESULT hRet = g_pD3DDevice->DrawIndexedPrimitive(
-		/* PrimitiveType = */EmuXB2PC_D3DPrimitiveType(DrawContext.XboxPrimitiveType),
-		/* BaseVertexIndex, = */-CacheEntry.LowIndex, // Base vertex index has been accounted for in the stream conversion, now we need to "un-offset" the index buffer
-		/* MinVertexIndex = */CacheEntry.LowIndex,
-		/* NumVertices = */(CacheEntry.HighIndex - CacheEntry.LowIndex) + 1,
-		/* startIndex = DrawContext.dwStartVertex = */0,
-		primCount);
+	const D3DPRIMITIVETYPE hostPrimitiveType =
+		EmuXB2PC_D3DPrimitiveType(DrawContext.XboxPrimitiveType);
+	const bool skipOutRunDraw = OutRunDrawProbeShouldSkipDraw(
+		1,
+		hostPrimitiveType,
+		DrawContext.XboxPrimitiveType,
+		primCount,
+		DrawContext.dwVertexCount,
+		DrawContext.dwStartVertex,
+		0);
+	OutRunDrawProbeCaptureCurrentGeometry(
+		(CacheEntry.HighIndex - CacheEntry.LowIndex) + 1);
+	HRESULT hRet = D3D_OK;
+	if (!skipOutRunDraw) {
+		hRet = g_pD3DDevice->DrawIndexedPrimitive(
+			/* PrimitiveType = */hostPrimitiveType,
+			/* BaseVertexIndex, = */-CacheEntry.LowIndex, // Base vertex index has been accounted for in the stream conversion, now we need to "un-offset" the index buffer
+			/* MinVertexIndex = */CacheEntry.LowIndex,
+			/* NumVertices = */(CacheEntry.HighIndex - CacheEntry.LowIndex) + 1,
+			/* startIndex = DrawContext.dwStartVertex = */0,
+			primCount);
+	}
 	DEBUG_D3DRESULT(hRet, "g_pD3DDevice->DrawIndexedPrimitive");
-	RenderTrace_RecordDraw(true, false, EmuXB2PC_D3DPrimitiveType(DrawContext.XboxPrimitiveType), primCount, hRet, false, 0, false, 0.0f, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0.0f, 0.0f, false, 0, 0, 0, 0, 0, 0, 0, 0);
+	RenderTrace_RecordDraw(true, false, hostPrimitiveType, primCount, hRet, false, 0, false, 0.0f, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0.0f, 0.0f, false, 0, 0, 0, 0, 0, 0, 0, 0);
 
 	g_dwPrimPerFrame += primCount;
 	if (DrawContext.XboxPrimitiveType == xbox::X_D3DPT_LINELOOP) {
@@ -8627,6 +11023,109 @@ void CxbxDrawPrimitiveUP(CxbxDrawContext &DrawContext)
 	assert(DrawContext.dwBaseVertexIndex == 0); // No IndexBase under Draw*UP
 
 	VertexBufferConverter.Apply(&DrawContext);
+
+	if (g_CrazyTaxiPendingTexturedQuadTexture != nullptr) {
+		InterlockedIncrement(&g_CrazyTaxiTextureBridgePendingChecks);
+		InterlockedExchange(
+			&g_CrazyTaxiTextureBridgeLastShader,
+			static_cast<LONG>(g_Xbox_VertexShader_Handle));
+		InterlockedExchange(
+			&g_CrazyTaxiTextureBridgeLastPrimitiveType,
+			static_cast<LONG>(DrawContext.XboxPrimitiveType));
+		InterlockedExchange(
+			&g_CrazyTaxiTextureBridgeLastVertexCount,
+			static_cast<LONG>(DrawContext.dwVertexCount));
+	}
+	const bool isCrazyTaxiTexturedQuad =
+		g_CrazyTaxiPendingTexturedQuadTexture != nullptr &&
+		g_CrazyTaxiPendingTexturedQuadDraws != 0 &&
+		g_Xbox_VertexShader_Handle == 0x000000C4 &&
+		DrawContext.XboxPrimitiveType ==
+			static_cast<xbox::X_D3DPRIMITIVETYPE>(6) &&
+		DrawContext.dwVertexCount == 4;
+	if (isCrazyTaxiTexturedQuad) {
+		// Crazy Taxi submits its Sofdec presentation quad through an inline
+		// push buffer, so it can reach CxbxDrawPrimitiveUP without passing
+		// through the D3DDevice_DrawVerticesUP wrapper. Its helper emits two
+		// matching full-screen triangle strips, with unrelated inline draws
+		// possible between the texture bind and these quads. Apply the
+		// title-local handoff only to that exact signature and keep it armed
+		// for both strips.
+		auto* texturedQuadTexture =
+			g_CrazyTaxiPendingTexturedQuadTexture;
+		g_pXbox_SetTexture[0] = texturedQuadTexture;
+		CxbxUpdateNativeD3DResources();
+		// The inline-push-buffer state update can leave the mirrored Xbox
+		// pointer cleared even though the host resource refresh above saw the
+		// correct texture. Restore both mirrors at the final draw boundary.
+		g_pXbox_SetTexture[0] = texturedQuadTexture;
+		CxbxUpdateHostTextures();
+		CxbxUpdateHostTextureScaling();
+		InterlockedIncrement(&g_CrazyTaxiTextureBridgeMatchCount);
+		if (--g_CrazyTaxiPendingTexturedQuadDraws == 0) {
+			g_CrazyTaxiPendingTexturedQuadTexture = nullptr;
+		}
+	}
+	const LONG crazyTaxiTextureAddress =
+		InterlockedCompareExchange(
+			&g_CrazyTaxiTextureBridgeLastTexture, 0, 0);
+	const bool isCrazyTaxiMoviePresentationSignature =
+		g_jvs_game_type == JvsGameType::CrazyTaxi &&
+		crazyTaxiTextureAddress != 0 &&
+		g_Xbox_VertexShader_Handle == 0x000000C4 &&
+		DrawContext.dwVertexCount == 4 &&
+		(DrawContext.XboxPrimitiveType ==
+			static_cast<xbox::X_D3DPRIMITIVETYPE>(6) ||
+		 DrawContext.XboxPrimitiveType == xbox::X_D3DPT_QUADLIST);
+	const bool hasRecentCrazyTaxiMovieFrame =
+		CxbxHasRecentCrazyTaxiDecodedMovieFrame();
+	const bool isCrazyTaxiMoviePresentationDraw =
+		isCrazyTaxiMoviePresentationSignature &&
+		hasRecentCrazyTaxiMovieFrame;
+	if (isCrazyTaxiMoviePresentationDraw) {
+		// Crazy Taxi presents each Sofdec frame with two inline strips and then
+		// a quad-list copy into its 320x240 composition target. The quad-list
+		// pass used to miss the title-local texture bridge, so it sampled a
+		// cleared texture and the later composition pass replaced the visible
+		// movie with black. Rebind the same protected descriptor and decoded
+		// host frame for every exact C4 four-vertex presentation pass.
+		auto* movieTexture =
+			reinterpret_cast<xbox::X_D3DBaseTexture*>(
+				static_cast<uintptr_t>(
+					static_cast<uint32_t>(
+						crazyTaxiTextureAddress)));
+		g_pXbox_SetTexture[0] = movieTexture;
+		CxbxUpdateNativeD3DResources();
+		g_pXbox_SetTexture[0] = movieTexture;
+		CxbxUpdateHostTextures();
+		CxbxUpdateHostTextureScaling();
+		if (CxbxBindCrazyTaxiDecodedMovieTexture()) {
+			InterlockedExchange(
+				&g_CrazyTaxiMovieGuestTextureData,
+				CxbxTryGetXboxTextureData(movieTexture));
+		}
+	}
+	const LONG currentCrazyTaxiTextureData =
+		isCrazyTaxiMoviePresentationSignature
+			? CxbxTryGetXboxTextureData(g_pXbox_SetTexture[0])
+			: 0;
+	const LONG crazyTaxiMovieTextureData =
+		InterlockedCompareExchange(
+			&g_CrazyTaxiMovieGuestTextureData, 0, 0);
+	// Crazy Taxi recycles the Sofdec presentation texture descriptor for
+	// ordinary title and game quads after a movie ends. Suppressing every
+	// later C4 four-vertex draw that shares that guest address therefore
+	// blanks the title screen (only the separately rendered credit counter
+	// remains). Keep the exact signature calculation for diagnostics, but
+	// do not discard a draw merely because its descriptor was previously
+	// used by the movie bridge.
+	const bool suppressCrazyTaxiRecycledMovieDraw = false;
+	const bool suppressStaleCrazyTaxiMovieDraw =
+		isCrazyTaxiMoviePresentationSignature &&
+		suppressCrazyTaxiRecycledMovieDraw &&
+		!hasRecentCrazyTaxiMovieFrame &&
+		crazyTaxiMovieTextureData != 0 &&
+		currentCrazyTaxiTextureData == crazyTaxiMovieTextureData;
 	if (DrawContext.XboxPrimitiveType == xbox::X_D3DPT_QUADLIST) {
 		// LOG_TEST_CASE("X_D3DPT_QUADLIST"); // test-case : X-Marbles and XDK Sample PlayField
 		// Draw quadlists using a single 'quad-to-triangle mapping' index buffer :
@@ -8636,16 +11135,29 @@ void CxbxDrawPrimitiveUP(CxbxDrawContext &DrawContext)
 
 		// Draw indexed triangles instead of quads
 		CxbxPrepareHostDrawVertexShaderConstants();
-		HRESULT hRet = g_pD3DDevice->DrawIndexedPrimitiveUP(
-			/*PrimitiveType=*/D3DPT_TRIANGLELIST,
-			/*MinVertexIndex=*/0, // Always 0 for converted quadlist data
-			/*NumVertices=*/DrawContext.dwVertexCount,
+		const bool skipOutRunDraw =
+			suppressStaleCrazyTaxiMovieDraw ||
+			OutRunDrawProbeShouldSkipDraw(
+			2,
+			D3DPT_TRIANGLELIST,
+			DrawContext.XboxPrimitiveType,
 			PrimitiveCount,
-			pIndexData,
-			/*IndexDataFormat=*/D3DFMT_INDEX16,
-			DrawContext.pHostVertexStreamZeroData,
-			DrawContext.uiHostVertexStreamZeroStride
-		);
+			DrawContext.dwVertexCount,
+			DrawContext.dwStartVertex,
+			DrawContext.uiHostVertexStreamZeroStride);
+		HRESULT hRet = D3D_OK;
+		if (!skipOutRunDraw) {
+			hRet = g_pD3DDevice->DrawIndexedPrimitiveUP(
+				/*PrimitiveType=*/D3DPT_TRIANGLELIST,
+				/*MinVertexIndex=*/0, // Always 0 for converted quadlist data
+				/*NumVertices=*/DrawContext.dwVertexCount,
+				PrimitiveCount,
+				pIndexData,
+				/*IndexDataFormat=*/D3DFMT_INDEX16,
+				DrawContext.pHostVertexStreamZeroData,
+				DrawContext.uiHostVertexStreamZeroStride
+			);
+		}
 		DEBUG_D3DRESULT(hRet, "g_pD3DDevice->DrawIndexedPrimitieUP(X_D3DPT_QUADLIST)");
 		if (g_RenderTraceEnabled) {
 			const size_t vertexDataSize = static_cast<size_t>(DrawContext.dwVertexCount) * DrawContext.uiHostVertexStreamZeroStride;
@@ -8707,12 +11219,31 @@ void CxbxDrawPrimitiveUP(CxbxDrawContext &DrawContext)
 	else {
 		// Primitives other than X_D3DPT_QUADLIST can be drawn using one DrawPrimitiveUP call :
 		CxbxPrepareHostDrawVertexShaderConstants();
-		HRESULT hRet = g_pD3DDevice->DrawPrimitiveUP(
-			EmuXB2PC_D3DPrimitiveType(DrawContext.XboxPrimitiveType),
+		const D3DPRIMITIVETYPE hostPrimitiveType =
+			EmuXB2PC_D3DPrimitiveType(DrawContext.XboxPrimitiveType);
+		const bool skipProbeDraw =
+			suppressStaleCrazyTaxiMovieDraw ||
+			OutRunDrawProbeShouldSkipDraw(
+			3,
+			hostPrimitiveType,
+			DrawContext.XboxPrimitiveType,
 			DrawContext.dwHostPrimitiveCount,
+			DrawContext.dwVertexCount,
+			DrawContext.dwStartVertex,
+			DrawContext.uiHostVertexStreamZeroStride);
+		OutRunDrawProbeCaptureImmediateGeometry(
 			DrawContext.pHostVertexStreamZeroData,
-			DrawContext.uiHostVertexStreamZeroStride
-		);
+			DrawContext.uiHostVertexStreamZeroStride,
+			DrawContext.dwVertexCount);
+		HRESULT hRet = D3D_OK;
+		if (!skipProbeDraw) {
+			hRet = g_pD3DDevice->DrawPrimitiveUP(
+				hostPrimitiveType,
+				DrawContext.dwHostPrimitiveCount,
+				DrawContext.pHostVertexStreamZeroData,
+				DrawContext.uiHostVertexStreamZeroStride
+			);
+		}
 		DEBUG_D3DRESULT(hRet, "g_pD3DDevice->DrawPrimitiveUP");
 		if (g_RenderTraceEnabled) {
 			const size_t vertexDataSize = static_cast<size_t>(DrawContext.dwVertexCount) * DrawContext.uiHostVertexStreamZeroStride;
@@ -8742,7 +11273,7 @@ void CxbxDrawPrimitiveUP(CxbxDrawContext &DrawContext)
 			RenderTrace_RecordDraw(
 				false,
 				true,
-				EmuXB2PC_D3DPrimitiveType(DrawContext.XboxPrimitiveType),
+				hostPrimitiveType,
 				DrawContext.dwHostPrimitiveCount,
 				hRet,
 				true,
@@ -9091,7 +11622,7 @@ void CxbxUpdateHostTextureScaling()
 	static std::array<std::array<float, 4>, xbox::X_D3DTS_STAGECOUNT> s_lastTexcoordScales = {};
 	if (texcoordScales != s_lastTexcoordScales) {
 		s_lastTexcoordScales = texcoordScales;
-		g_pD3DDevice->SetVertexShaderConstantF(CXBX_D3DVS_TEXTURES_SCALE_BASE, (float*)texcoordScales.data(), CXBX_D3DVS_TEXTURES_SCALE_SIZE);
+		CxbxSetVertexShaderConstantF(CXBX_D3DVS_TEXTURES_SCALE_BASE, (float*)texcoordScales.data(), CXBX_D3DVS_TEXTURES_SCALE_SIZE);
 	}
 }
 
@@ -9107,7 +11638,7 @@ void CxbxUpdateDirtyVertexShaderConstants(const float* constants, bool* dirty) {
 		else if (batchStartIndex != -1 && !dirty[i]) {
 			// Finish the batch
 			int count = i - batchStartIndex;
-			g_pD3DDevice->SetVertexShaderConstantF(batchStartIndex, &constants[batchStartIndex * 4], count);
+			CxbxSetVertexShaderConstantF(batchStartIndex, &constants[batchStartIndex * 4], count);
 			batchStartIndex = -1;
 		}
 
@@ -9118,7 +11649,7 @@ void CxbxUpdateDirtyVertexShaderConstants(const float* constants, bool* dirty) {
 	// Send the final batch
 	if (batchStartIndex != -1) {
 		int count = X_D3DVS_CONSTREG_COUNT - batchStartIndex;
-		g_pD3DDevice->SetVertexShaderConstantF(batchStartIndex, &constants[batchStartIndex * 4], count);
+		CxbxSetVertexShaderConstantF(batchStartIndex, &constants[batchStartIndex * 4], count);
 	}
 }
 
@@ -9410,7 +11941,7 @@ void CxbxUpdateHostVertexShaderConstants()
 				if (!isXboxConstants)
 					s_cacheValid = false;
 				if (!g_BetaConfig.vsh_constant_delta_upload || !s_cacheValid) {
-					g_pD3DDevice->SetVertexShaderConstantF(0, local_constants, X_D3DVS_CONSTREG_COUNT);
+					CxbxSetVertexShaderConstantF(0, local_constants, X_D3DVS_CONSTREG_COUNT);
 					memcpy(s_lastUploaded, local_constants, sizeof(s_lastUploaded));
 					s_cacheValid = true;
 				} else {
@@ -9423,7 +11954,7 @@ void CxbxUpdateHostVertexShaderConstants()
 						}
 						if (!changed && batchStart >= 0) {
 							int count = i - batchStart;
-							g_pD3DDevice->SetVertexShaderConstantF(batchStart, &local_constants[batchStart * 4], count);
+							CxbxSetVertexShaderConstantF(batchStart, &local_constants[batchStart * 4], count);
 							memcpy(&s_lastUploaded[batchStart * 4], &local_constants[batchStart * 4], count * 4 * sizeof(float));
 							batchStart = -1;
 						}
@@ -9468,13 +11999,59 @@ void CxbxUpdateHostVertexShaderConstants()
 	static float s_lastFogStuff[4] = {-1, -1, -1, -1};
 	if (memcmp(fogStuff, s_lastFogStuff, sizeof(fogStuff)) != 0) {
 		memcpy(s_lastFogStuff, fogStuff, sizeof(fogStuff));
-		g_pD3DDevice->SetVertexShaderConstantF(CXBX_D3DVS_CONSTREG_FOGINFO, fogStuff, 1);
+		CxbxSetVertexShaderConstantF(CXBX_D3DVS_CONSTREG_FOGINFO, fogStuff, 1);
 	}
 }
 
 static inline void CxbxPrepareHostDrawVertexShaderConstants()
 {
+	const bool traceFixedFunction =
+		g_RenderTraceEnabled &&
+		g_Xbox_VertexShaderMode == VertexShaderMode::FixedFunction &&
+		g_UseFixedFunctionVertexShader;
+	const bool transformWasDirty = traceFixedFunction && g_FFTransformDirty;
+	const bool nonTransformWasDirty = traceFixedFunction && g_FFNonTransformDirty;
+	const bool gpuWasInvalid = traceFixedFunction && g_FFRestInvalid;
 	CxbxUpdateHostVertexShaderConstants();
+	if (traceFixedFunction) {
+		constexpr UINT totalSlots =
+			(sizeof(FixedFunctionVertexShaderState) + 15) / 16;
+		float hostConstants[totalSlots * 4] = {};
+		const HRESULT getResult =
+			g_pD3DDevice->GetVertexShaderConstantF(
+				0,
+				hostConstants,
+				totalSlots);
+		RenderTrace_RecordFixedFunctionState(
+			&ffShaderState,
+			sizeof(ffShaderState),
+			hostConstants,
+			totalSlots * 4,
+			getResult,
+			g_FFLastTransformUploadResult,
+			g_FFLastRestUploadResult,
+			g_FFUploadSerial,
+			transformWasDirty,
+			nonTransformWasDirty,
+			gpuWasInvalid);
+	}
+	else if (g_RenderTraceEnabled &&
+		g_Xbox_VertexShaderMode == VertexShaderMode::Passthrough &&
+		g_bUsePassthroughHLSL) {
+		constexpr UINT hostRegisterCount =
+			CXBX_D3DVS_CONSTREG_FOGINFO + 1;
+		float hostConstants[hostRegisterCount * 4] = {};
+		const HRESULT getResult =
+			g_pD3DDevice->GetVertexShaderConstantF(
+				0,
+				hostConstants,
+				hostRegisterCount);
+		RenderTrace_RecordVertexConstantState(
+			static_cast<DWORD>(g_Xbox_VertexShaderMode),
+			hostConstants,
+			hostRegisterCount,
+			getResult);
+	}
 }
 
 void CxbxUpdateHostViewport() {
@@ -9614,6 +12191,21 @@ void CxbxUpdateNativeD3DResources()
 	}
 
 	CxbxUpdateHostVertexShader();
+	UINT vertexShaderInputStride = 0;
+	UINT vertexShaderInputOffset = 0;
+	if (g_Xbox_SetVertexShaderInput_Count > 0) {
+		xbox::X_STREAMINPUT& vertexShaderInput = GetXboxVertexStreamInput(0);
+		vertexShaderInputStride = vertexShaderInput.Stride;
+		vertexShaderInputOffset = vertexShaderInput.Offset;
+	}
+	RenderTrace_RecordVertexShaderDetails(
+		g_Xbox_VertexShaderMode == VertexShaderMode::ShaderProgram,
+		g_ActiveXboxVertexShaderKey,
+		g_ActiveXboxVertexShaderCacheHash,
+		g_ActiveXboxVertexShaderUsesIndexedBoneConstants,
+		g_Xbox_SetVertexShaderInput_Count,
+		vertexShaderInputStride,
+		vertexShaderInputOffset);
 	if (usesXboxVertexConstants && g_ActiveXboxVertexShaderUsesIndexedBoneConstants) {
 		bool hadPendingPushBufferWork = g_XboxPushBufferSubmissionPending;
 		bool kickoffSubmittedPushBufferWork = CxbxKickOffXboxPushBuffer();
@@ -9980,14 +12572,25 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_DrawVertices)
 			// for an explanation on the function of the BaseVertexIndex, MinVertexIndex, NumVertices and StartIndex arguments.
 			// Emulate drawing quads by drawing each quad with two indexed triangles :
 			CxbxPrepareHostDrawVertexShaderConstants();
-			HRESULT hRet = g_pD3DDevice->DrawIndexedPrimitive(
-				/*PrimitiveType=*/D3DPT_TRIANGLELIST,
-				/*BaseVertexIndex=*/0, // Base vertex index has been accounted for in the stream conversion
-				/*MinVertexIndex=*/0,
-				NumVertices,
-				/*startIndex=*/0,
-				primCount
-			);
+			const bool skipOutRunDraw = OutRunDrawProbeShouldSkipDraw(
+				4,
+				D3DPT_TRIANGLELIST,
+				DrawContext.XboxPrimitiveType,
+				primCount,
+				DrawContext.dwVertexCount,
+				DrawContext.dwStartVertex,
+				DrawContext.uiHostVertexStreamZeroStride);
+			HRESULT hRet = D3D_OK;
+			if (!skipOutRunDraw) {
+				hRet = g_pD3DDevice->DrawIndexedPrimitive(
+					/*PrimitiveType=*/D3DPT_TRIANGLELIST,
+					/*BaseVertexIndex=*/0, // Base vertex index has been accounted for in the stream conversion
+					/*MinVertexIndex=*/0,
+					NumVertices,
+					/*startIndex=*/0,
+					primCount
+				);
+			}
 			DEBUG_D3DRESULT(hRet, "g_pD3DDevice->DrawIndexedPrimitive(X_D3DPT_QUADLIST)");
 			RenderTrace_RecordDraw(true, false, D3DPT_TRIANGLELIST, primCount, hRet, false, 0, false, 0.0f, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0.0f, 0.0f, false, 0, 0, 0, 0, 0, 0, 0, 0);
 
@@ -9996,13 +12599,26 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_DrawVertices)
 		else {
 			// if (StartVertex > 0) LOG_TEST_CASE("StartVertex > 0 (non-quad)"); // Verified test case : XDK Sample (PlayField)
 			CxbxPrepareHostDrawVertexShaderConstants();
-			HRESULT hRet = g_pD3DDevice->DrawPrimitive(
-				EmuXB2PC_D3DPrimitiveType(DrawContext.XboxPrimitiveType),
-				/*StartVertex=*/0, // Start vertex has been accounted for in the stream conversion
-				DrawContext.dwHostPrimitiveCount
-			);
+			const D3DPRIMITIVETYPE hostPrimitiveType =
+				EmuXB2PC_D3DPrimitiveType(DrawContext.XboxPrimitiveType);
+			const bool skipOutRunDraw = OutRunDrawProbeShouldSkipDraw(
+				5,
+				hostPrimitiveType,
+				DrawContext.XboxPrimitiveType,
+				DrawContext.dwHostPrimitiveCount,
+				DrawContext.dwVertexCount,
+				DrawContext.dwStartVertex,
+				DrawContext.uiHostVertexStreamZeroStride);
+			HRESULT hRet = D3D_OK;
+			if (!skipOutRunDraw) {
+				hRet = g_pD3DDevice->DrawPrimitive(
+					hostPrimitiveType,
+					/*StartVertex=*/0, // Start vertex has been accounted for in the stream conversion
+					DrawContext.dwHostPrimitiveCount
+				);
+			}
 			DEBUG_D3DRESULT(hRet, "g_pD3DDevice->DrawPrimitive");
-			RenderTrace_RecordDraw(false, false, EmuXB2PC_D3DPrimitiveType(DrawContext.XboxPrimitiveType), DrawContext.dwHostPrimitiveCount, hRet, false, 0, false, 0.0f, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0.0f, 0.0f, false, 0, 0, 0, 0, 0, 0, 0, 0);
+			RenderTrace_RecordDraw(false, false, hostPrimitiveType, DrawContext.dwHostPrimitiveCount, hRet, false, 0, false, 0.0f, 0.0f, 0.0f, 0.0f, false, 0.0f, 0.0f, 0.0f, 0.0f, false, 0, 0, 0, 0, 0, 0, 0, 0);
 
 			g_dwPrimPerFrame += DrawContext.dwHostPrimitiveCount;
 			if (DrawContext.XboxPrimitiveType == X_D3DPT_LINELOOP) {
@@ -10192,45 +12808,81 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_DrawIndexedVerticesUP)
 			pHostIndexData = pXboxIndexData;
 		}
 
+		if (g_RenderTraceEnabled) {
+			UINT restartIndexCount = 0;
+			for (UINT index = 0; index < VertexCount; ++index) {
+				if (pXboxIndexData[index] == 0xFFFFu) {
+					++restartIndexCount;
+				}
+			}
+			RenderTrace_RecordIndexData(
+				VertexCount,
+				DrawContext.LowIndex,
+				DrawContext.HighIndex,
+				restartIndexCount,
+				0);
+		}
+
 		CxbxPrepareHostDrawVertexShaderConstants();
-		HRESULT hRet = g_pD3DDevice->DrawIndexedPrimitiveUP(
-			/*PrimitiveType=*/EmuXB2PC_D3DPrimitiveType(DrawContext.XboxPrimitiveType),
-			/*MinVertexIndex=*/DrawContext.LowIndex,
-			/*NumVertexIndices=*/(DrawContext.HighIndex - DrawContext.LowIndex) + 1,
+		const D3DPRIMITIVETYPE hostPrimitiveType =
+			EmuXB2PC_D3DPrimitiveType(DrawContext.XboxPrimitiveType);
+		const bool skipOutRunDraw = OutRunDrawProbeShouldSkipDraw(
+			6,
+			hostPrimitiveType,
+			DrawContext.XboxPrimitiveType,
 			PrimitiveCount,
-			pHostIndexData,
-			/*IndexDataFormat=*/D3DFMT_INDEX16,
-			DrawContext.pHostVertexStreamZeroData,
-			DrawContext.uiHostVertexStreamZeroStride
-		);
+			DrawContext.NumVerticesToUse,
+			DrawContext.dwStartVertex,
+			DrawContext.uiHostVertexStreamZeroStride);
+		HRESULT hRet = D3D_OK;
+		if (!skipOutRunDraw) {
+			hRet = g_pD3DDevice->DrawIndexedPrimitiveUP(
+				/*PrimitiveType=*/hostPrimitiveType,
+				/*MinVertexIndex=*/DrawContext.LowIndex,
+				/*NumVertexIndices=*/(DrawContext.HighIndex - DrawContext.LowIndex) + 1,
+				PrimitiveCount,
+				pHostIndexData,
+				/*IndexDataFormat=*/D3DFMT_INDEX16,
+				DrawContext.pHostVertexStreamZeroData,
+				DrawContext.uiHostVertexStreamZeroStride
+			);
+		}
 		DEBUG_D3DRESULT(hRet, "g_pD3DDevice->DrawIndexedPrimitiveUP");
 		if (g_RenderTraceEnabled) {
-			const D3DPRIMITIVETYPE hostPrimitiveType = EmuXB2PC_D3DPrimitiveType(DrawContext.XboxPrimitiveType);
-			const size_t vertexDataSize = static_cast<size_t>(DrawContext.dwVertexCount) * DrawContext.uiHostVertexStreamZeroStride;
+			// DrawIndexedVerticesUP's VertexCount is the number of indices, not
+			// the number of vertices in the converted UP stream. The converter
+			// only retains the contiguous LowIndex..HighIndex range, so hashing
+			// VertexCount vertices can read beyond that allocation (VC3 reaches
+			// this with a 19-index draw) and turn diagnostics into a host AV.
+			const UINT tracedVertexCount = DrawContext.NumVerticesToUse;
+			const size_t vertexDataSize = static_cast<size_t>(tracedVertexCount) * DrawContext.uiHostVertexStreamZeroStride;
 			const size_t indexDataSize = CxbxRenderTracePrimitiveIndexCount(hostPrimitiveType, PrimitiveCount) * sizeof(INDEX16);
 			const unsigned long long geometryHash = CxbxRenderTraceGeometryHash(
 				DrawContext.pHostVertexStreamZeroData,
 				vertexDataSize,
 				pHostIndexData,
 				indexDataSize);
+			// The converted UP stream starts at LowIndex, while the supplied
+			// indices retain their original values. Walk the retained range
+			// directly for bounds instead of indexing it with absolute values.
 			const auto positionBounds = CxbxRenderTraceComputePositionBounds(
 				DrawContext.pHostVertexStreamZeroData,
 				DrawContext.uiHostVertexStreamZeroStride,
-				DrawContext.dwVertexCount,
-				pHostIndexData,
-				CxbxRenderTracePrimitiveIndexCount(hostPrimitiveType, PrimitiveCount));
+				tracedVertexCount,
+				nullptr,
+				0);
 			const auto texCoordBounds = CxbxRenderTraceComputeTexCoord0Bounds(
 				DrawContext.pHostVertexStreamZeroData,
 				DrawContext.uiHostVertexStreamZeroStride,
-				DrawContext.dwVertexCount,
-				pHostIndexData,
-				CxbxRenderTracePrimitiveIndexCount(hostPrimitiveType, PrimitiveCount));
+				tracedVertexCount,
+				nullptr,
+				0);
 			const auto diffuseColorBounds = CxbxRenderTraceComputeDiffuseColorBounds(
 				DrawContext.pHostVertexStreamZeroData,
 				DrawContext.uiHostVertexStreamZeroStride,
-				DrawContext.dwVertexCount,
-				pHostIndexData,
-				CxbxRenderTracePrimitiveIndexCount(hostPrimitiveType, PrimitiveCount));
+				tracedVertexCount,
+				nullptr,
+				0);
 			RenderTrace_RecordDraw(
 				true,
 				true,
@@ -11172,7 +13824,10 @@ static D3DXMATRIX CxbxBuildProjectionViewportMatrix(
 	viewportTransform._43 = viewport.MinZ;
 
 	D3DXMATRIX projectionViewport;
-	D3DXMatrixMultiply(&projectionViewport, &projection, &viewportTransform);
+	D3DXMatrixMultiply(
+		&projectionViewport,
+		&projection,
+		&viewportTransform);
 	return projectionViewport;
 }
 
@@ -11187,11 +13842,17 @@ static bool CxbxExtractProjectionMatrix(
 		CxbxBuildProjectionViewportMatrix(identity, viewport);
 
 	D3DXMATRIX inverseViewport;
-	if (D3DXMatrixInverse(&inverseViewport, nullptr, &viewportTransform) == nullptr) {
+	if (D3DXMatrixInverse(
+			&inverseViewport,
+			nullptr,
+			&viewportTransform) == nullptr) {
 		return false;
 	}
 
-	D3DXMatrixMultiply(&projection, &projectionViewport, &inverseViewport);
+	D3DXMatrixMultiply(
+		&projection,
+		&projectionViewport,
+		&inverseViewport);
 	return true;
 }
 
@@ -11405,6 +14066,13 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_SetVertexBlendModelView)
 	CONST D3DMATRIX *pProjectionViewport
 )
 {
+	LOG_FUNC_BEGIN
+		LOG_FUNC_ARG(Count)
+		LOG_FUNC_ARG(pModelViews)
+		LOG_FUNC_ARG(pInverseModelViews)
+		LOG_FUNC_ARG(pProjectionViewport)
+		LOG_FUNC_END;
+
 	d3d8TransformState.SetVertexBlendModelView(
 		Count,
 		pModelViews,
@@ -11419,9 +14087,6 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_SetVertexBlendModelView)
 			d3d8TransformState.SetVertexBlendProjection(
 				reinterpret_cast<const D3DMATRIX*>(&projection));
 		}
-	}
-	else {
-		d3d8TransformState.SetVertexBlendProjection(nullptr);
 	}
 
 	g_FFTransformDirty = true;

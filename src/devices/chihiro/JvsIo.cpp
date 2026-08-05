@@ -29,6 +29,7 @@
 #include <cstdarg>
 #include <ctime>
 #include <string>
+#include "core\kernel\init\CxbxKrnl.h"
 
 JvsIo* g_pJvsIo;
 
@@ -39,6 +40,7 @@ JvsIo* g_pJvsIo;
 #if defined(_DEBUG)
 static void GolfJvsIoLog(const char* fmt, ...)
 {
+	if (!CxbxrKrnlDebugLoggingEnabled()) return;
 	FILE* file = fopen("C:\\temp\\golf_jvs_io.log", "a");
 	if (!file) return;
 	va_list args;
@@ -49,17 +51,17 @@ static void GolfJvsIoLog(const char* fmt, ...)
 	fclose(file);
 }
 #else
-#define GolfJvsIoLog(...) do {} while(0)
+#define GolfJvsIoLog(...) do {} while (0)
 #endif
 
 // ============================================================================
 // JVS logging
 // ============================================================================
-#if defined(JVS_LOG) && defined(_DEBUG)
+#if defined(_DEBUG)
 FILE* g_JvsLogFile = nullptr;
 static ULONGLONG g_JvsLogStartMs = 0;
 
-void JvsLog(const char* fmt, ...)
+void JvsLogWrite(const char* fmt, ...)
 {
 	if (!g_JvsLogFile) return;
 	va_list args;
@@ -77,6 +79,7 @@ static ULONGLONG JvsElapsedMs()
 
 void JvsIo::OpenLog(const std::string& dataFilePath)
 {
+	if (!CxbxrKrnlDebugLoggingEnabled()) return;
 	if (!dataFilePath.empty()) {
 		std::string path = dataFilePath + "\\jvs_io.log";
 		g_JvsLogFile = fopen(path.c_str(), "wt");
@@ -93,7 +96,7 @@ void JvsIo::OpenLog(const std::string& dataFilePath)
 		CommandFormatRevision, JvsVersion, CommunicationVersion);
 }
 #else
-void JvsIo::OpenLog(const std::string& /*dataFilePath*/) {}
+void JvsIo::OpenLog(const std::string&) {}
 #endif
 
 // Returns a human-readable name for a JVS command byte
@@ -138,6 +141,7 @@ static HANDLE g_jvs_file_mapping = nullptr;
 void* g_jvs_view_ptr = nullptr;
 static bool g_coin_pressed_prev[JVS_MAX_PLAYERS] = { false };
 JvsGameType g_jvs_game_type = JvsGameType::Generic;
+std::atomic<uint8_t> g_jvs_general_output_bank0 { 0 };
 // We will emulate SEGA 837-13551 IO Board
 JvsIo::JvsIo(uint8_t* sense)
 {
@@ -265,6 +269,17 @@ void JvsIo::Update()
 		// Channel assignments are game-specific.
 		uint8_t* analog_base = static_cast<uint8_t*>(g_jvs_view_ptr) + 12;
 		switch (g_jvs_game_type) {
+			case JvsGameType::CrazyTaxi:
+				// TP page semantics:
+				//   byte[0] = gas, byte[1] = wheel, byte[3] = brake.
+				// Crazy Taxi reads wheel, gas and brake on JVS channels 0-2.
+				// Its input normalization in sub_89530 grows both pedal values
+				// from the calibrated minimum to maximum, so do not invert them.
+				Inputs.analog[0].value = expand8to16(analog_base[1]); // wheel
+				Inputs.analog[1].value = expand8to16(analog_base[0]); // gas
+				Inputs.analog[2].value = expand8to16(analog_base[3]); // brake
+				Inputs.analog[3].value = expand8to16(analog_base[2]);
+				break;
 			case JvsGameType::SegaGolfClub:
 				// sub_82EE0 reads *(WORD*)(record+14) = ch3 for club swing.
 				// JVS channel 3 = analog[2] in the response.
@@ -277,17 +292,18 @@ void JvsIo::Update()
 			case JvsGameType::WanganMT1:
 			case JvsGameType::WanganMT2:
 				// WMMT analog layout (confirmed via JVS trace):
-				//   analog[0] = steering  <- byte[1]
-				//   analog[1] = accel     <- byte[0]
-				//   analog[2] = brake     <- byte[3]
-				//   analog[3] = unused    <- byte[2]
+				//   analog[0] = steering  <- byte[0]
+				//   analog[1] = accel     <- byte[1]
+				//   analog[2] = brake     <- byte[2]
+				//   analog[3] = unused    <- byte[3]
 				Inputs.analog[0].value = expand8to16(analog_base[0]); // steering
 				Inputs.analog[1].value = expand8to16(analog_base[1]); // accel
 				Inputs.analog[2].value = expand8to16(analog_base[2]); // brake
 				Inputs.analog[3].value = expand8to16(analog_base[3]);
 				break;
 			default:
-				// Generic: channel N maps straight from byte N
+				// Generic TP page order is gas, wheel, unused, brake.
+				// Reorder it to native wheel, gas, brake, unused channels.
 				Inputs.analog[0].value = expand8to16(analog_base[1]);
 				Inputs.analog[1].value = expand8to16(analog_base[0]);
 				Inputs.analog[2].value = expand8to16(analog_base[3]);
@@ -426,7 +442,15 @@ int JvsIo::Jvs_Command_14_GetCapabilities()
 			analogBits = 16;
 			gpoCount   =  6;
 			break;
-		// TODO: case JvsGameType::GhostSquad: ...
+		case JvsGameType::GhostSquad:
+			// Ghost Squad uses the stock SEGA 837-13551 declaration:
+			// two players, 14 switches, eight 10-bit gun axes and 20 GPOs.
+			// Keep this explicit so future generic-board changes cannot alter
+			// the light-gun cabinet's enumeration contract.
+			buttons    = 14;
+			analogBits = 10;
+			gpoCount   = 20;
+			break;
 		default: // JvsGameType::Generic — use the defaults above
 			break;
 	}
@@ -643,7 +667,9 @@ int JvsIo::Jvs_Command_32_GeneralPurposeOutput(uint8_t* data)
 
 	ResponseBuffer.push_back(ReportCode::Handled);
 
-	// TODO: Handle output
+	if (banks > 0) {
+		g_jvs_general_output_bank0.store(data[2], std::memory_order_relaxed);
+	}
 
 	// Input data size is 1 byte indicating the number of banks, followed by one byte per bank
 	return 1 + banks;
@@ -947,7 +973,7 @@ size_t JvsIo::ReceivePacket(uint8_t* buffer)
 	printf("\n");
 #endif
 	// Log outgoing response
-#if defined(JVS_LOG) && defined(_DEBUG)
+#if defined(_DEBUG)
 	if (g_JvsLogFile && total_packet_size > 0) {
 		JvsLog("[+%llums] ", JvsElapsedMs());
 		LogPacketHex("ReceivePacket <-", buffer_start, total_packet_size);

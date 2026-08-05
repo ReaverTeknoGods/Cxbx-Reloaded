@@ -52,6 +52,7 @@ enum {
 	BOOT_SKIP_ANIMATION = 1 << 2,
 	BOOT_RUN_DASHBOARD =  1 << 3,
 	BOOT_QUICK_REBOOT =   1 << 4,
+	BOOT_CHIHIRO_TEST =   1 << 5,
 };
 
 // ******************************************************************

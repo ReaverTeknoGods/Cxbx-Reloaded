@@ -67,7 +67,7 @@ public:
 		// D3DCompiler and its CRT math helpers then raise host-side floating
 		// traps during otherwise valid shader compilation. Masking alone is
 		// insufficient when the guest left a pending x87/SSE status bit set:
-		// The host can surface that stale state as STATUS_FLOAT_MULTIPLE_TRAPS at
+		// Wine can surface that stale state as STATUS_FLOAT_MULTIPLE_TRAPS at
 		// the first compiler CRT operation. Start the host call with both
 		// exception families masked and their pending flags cleared.
 		_mm_setcsr((m_guestMxcsr | _MM_MASK_MASK) & ~_MM_EXCEPT_MASK);
@@ -336,9 +336,14 @@ static bool EnsureShaderCacheDir()
 		}
 	}
 
-	// Open log file in the per-game shader cache dir
-	std::string logPath = g_ShaderCacheDir + "\\shader_cache.log";
-	g_ShaderCacheLogFile = fopen(logPath.c_str(), "wt");
+	// Bytecode caching stays enabled in production, but its verbose text log
+	// and HLSL dumps follow the same per-game diagnostic switch as the kernel.
+#if defined(_DEBUG)
+	if (CxbxrKrnlDebugLoggingEnabled()) {
+		std::string logPath = g_ShaderCacheDir + "\\shader_cache.log";
+		g_ShaderCacheLogFile = fopen(logPath.c_str(), "wt");
+	}
+#endif
 	// Init perf trace log alongside the shader cache log
 	if (g_PerfTraceEnabled) {
 		std::string perfLogPath = g_ShaderCacheDir + "\\perf_trace.log";
@@ -396,7 +401,7 @@ static std::string GetShaderHlslPath(uint64_t hash, const char* profile, const c
 // Subsequent calls for the same hash are no-ops (file presence is the guard).
 static void DumpShaderSource(uint64_t hash, const char* profile, const std::string& hlsl)
 {
-	if (g_ShaderCacheDir.empty()) return;
+	if (g_ShaderCacheDir.empty() || !CxbxrKrnlDebugLoggingEnabled()) return;
 	std::string path = GetShaderHlslPath(hash, profile, "Dumped");
 	if (std::filesystem::exists(path)) return; // already dumped
 	std::ofstream f(path);

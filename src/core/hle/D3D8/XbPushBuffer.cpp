@@ -47,6 +47,26 @@ const char *NV2AMethodToString(DWORD dwMethod); // forward
 
 static void DbgDumpMesh(WORD *pIndexData, DWORD dwCount);
 
+extern thread_local bool g_HlePgraphDrawActive;
+
+class ScopedHlePgraphDrawOrigin
+{
+public:
+	ScopedHlePgraphDrawOrigin()
+		: m_previous(g_HlePgraphDrawActive)
+	{
+		g_HlePgraphDrawActive = true;
+	}
+
+	~ScopedHlePgraphDrawOrigin()
+	{
+		g_HlePgraphDrawActive = m_previous;
+	}
+
+private:
+	bool m_previous;
+};
+
 void EmuExecutePushBuffer
 (
 	xbox::X_D3DPushBuffer       *pPushBuffer,
@@ -110,9 +130,14 @@ DWORD CxbxGetStrideFromVertexDeclaration(CxbxVertexDeclaration* pCxbxVertexDecla
 		//LOG_TEST_CASE("Non-FVF Vertex Shaders not yet (completely) supported for PushBuffer emulation!");
 
 		if (pCxbxVertexDeclaration->NumberOfVertexStreams == 1) {
-			// Inline arrays still contain Xbox vertex data. Host element types can
-			// be wider after conversion, so using HostVertexStride here shifts every
-			// vertex after the first to the wrong DWORD (notably OutRun 2 shadows).
+			// The inline array still contains Xbox vertex data. Its stride must
+			// therefore be calculated from the Xbox declaration, not from the
+			// converted host declaration. Host types can be wider (for example,
+			// NORMPACKED3 expands from 4 bytes to FLOAT3 / 12 bytes), and using
+			// HostVertexStride here makes every vertex after the first start at
+			// the wrong DWORD.
+			//
+			// Note: This assumes that the only stream in use is stream zero.
 			const CxbxVertexShaderStreamInfo& stream =
 				pCxbxVertexDeclaration->VertexStreams[0];
 			for (DWORD elementIndex = 0;
@@ -141,38 +166,30 @@ DWORD CxbxGetStrideFromVertexDeclaration(CxbxVertexDeclaration* pCxbxVertexDecla
 }
 
 // Draw mode counters for diagnostic
-#if defined(_DEBUG)
 volatile uint32_t s_drawArraysCount = 0;
 volatile uint32_t s_drawInlineBufferCount = 0;
 volatile uint32_t s_drawInlineArrayCount = 0;
 volatile uint32_t s_drawInlineElementsCount = 0;
-#endif
 
 void HLE_draw_arrays(NV2AState *d)
 {
-#if defined(_DEBUG)
 	s_drawArraysCount++;
 	if ((s_drawArraysCount & 0xFF) == 1) {
 		LOG_TEST_CASE("HLE_draw_arrays");
 	}
-#endif
 }
 
 void HLE_draw_inline_buffer(NV2AState *d)
 {
-#if defined(_DEBUG)
 	s_drawInlineBufferCount++;
 	if ((s_drawInlineBufferCount & 0xFF) == 1) {
 		LOG_TEST_CASE("HLE_draw_inline_buffer");
 	}
-#endif
 }
 
 void HLE_draw_inline_array(NV2AState *d)
 {
-#if defined(_DEBUG)
 	s_drawInlineArrayCount++;
-#endif
 	PGRAPHState *pg = &d->pgraph;
 
 	//DWORD vertex data array, 
@@ -195,6 +212,7 @@ void HLE_draw_inline_array(NV2AState *d)
 			DrawContext.pXboxVertexStreamZeroData = pg->inline_array;
 			DrawContext.uiXboxVertexStreamZeroStride = dwVertexStride;
 
+			ScopedHlePgraphDrawOrigin drawOrigin;
 			CxbxDrawPrimitiveUP(DrawContext);
 		}
 	}
@@ -202,9 +220,7 @@ void HLE_draw_inline_array(NV2AState *d)
 
 void HLE_draw_inline_elements(NV2AState *d)
 {
-#if defined(_DEBUG)
 	s_drawInlineElementsCount++;
-#endif
 	PGRAPHState *pg = &d->pgraph;
 
 	unsigned int uiIndexCount = pg->inline_elements_length;
@@ -214,6 +230,7 @@ void HLE_draw_inline_elements(NV2AState *d)
 	DrawContext.dwVertexCount = uiIndexCount;
 	DrawContext.pXboxIndexData = d->pgraph.inline_elements;
 
+	ScopedHlePgraphDrawOrigin drawOrigin;
 	CxbxDrawIndexed(DrawContext);
 }
 
@@ -308,6 +325,44 @@ uint32_t HLE_read_NV2A_pgraph_register(const int reg)
 	NV2AState* dev = g_NV2A->GetDeviceState();
 	PGRAPHState *pg = &(dev->pgraph);
 	return pg->regs[reg];
+}
+
+uintptr_t HLE_get_NV2A_texture_data_address(unsigned stage)
+{
+	if (stage >= NV2A_MAX_TEXTURES) {
+		return 0;
+	}
+
+	NV2AState* dev = g_NV2A->GetDeviceState();
+	PGRAPHState* pg = &dev->pgraph;
+	const uint32_t format =
+		pg->regs[NV_PGRAPH_TEXFMT0 + stage * sizeof(uint32_t)];
+	const bool selectDmaB =
+		(format & NV_PGRAPH_TEXFMT0_CONTEXT_DMA) != 0;
+	const xbox::addr_xt dmaObjectAddress =
+		selectDmaB ? pg->dma_b : pg->dma_a;
+	if (dmaObjectAddress >= dev->pramin.ramin_size) {
+		return 0;
+	}
+
+	const uint32_t* dmaObject = reinterpret_cast<const uint32_t*>(
+		dev->pramin.ramin_ptr + dmaObjectAddress);
+	const uint32_t flags = dmaObject[0];
+	const uint32_t limit = dmaObject[1];
+	const uint32_t frame = dmaObject[2];
+	const uint32_t dmaAddress =
+		((frame & NV_DMA_ADDRESS) |
+			GET_MASK(flags, NV_DMA_ADJUST)) &
+		0x07FFFFFF;
+	const uint32_t textureOffset =
+		pg->regs[NV_PGRAPH_TEXOFFSET0 + stage * sizeof(uint32_t)];
+	if (textureOffset >= limit ||
+		dmaAddress + textureOffset >= PHYSICAL_MAP_SIZE) {
+		return 0;
+	}
+
+	return reinterpret_cast<uintptr_t>(
+		dev->vram_ptr + dmaAddress + textureOffset);
 }
 
 float *HLE_get_NV2A_vertex_attribute_value_pointer(unsigned slot)

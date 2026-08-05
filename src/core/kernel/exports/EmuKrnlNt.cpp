@@ -50,6 +50,8 @@ namespace NtDll
 #include "core\kernel\memory-manager\VMManager.h" // For g_VMManager
 #include "core\kernel\support\NativeHandle.h"
 #include "common/PerfTrace.h"
+#include "common/RenderTrace.h"
+#include "common/BetaConfig.h"
 #include "devices\Xbox.h"
 #include "CxbxDebugger.h"
 
@@ -196,6 +198,15 @@ XBSYSAPI EXPORTNUM(187) xbox::ntstatus_xt NTAPI xbox::NtClose
 )
 {
 	LOG_FUNC_ONE_ARG(Handle);
+	const void* CallerAddress = _ReturnAddress();
+	const PKTHREAD CurrentThread = KeGetCurrentThread();
+	BetaTrace_Record(
+		"FILE_CLOSE_ENTER",
+		"caller=%p guest=%08X xbox_file=%08X",
+		CallerAddress,
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+			reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(Handle)));
 
 	ntstatus_xt result = X_STATUS_SUCCESS;
 
@@ -224,6 +235,14 @@ XBSYSAPI EXPORTNUM(187) xbox::ntstatus_xt NTAPI xbox::NtClose
 		result = NtDll::NtClose(Handle);
 	}
 
+	BetaTrace_Record(
+		"FILE_CLOSE_EXIT",
+		"caller=%p guest=%08X xbox_file=%08X result=%08X",
+		CallerAddress,
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+			reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(Handle)),
+		static_cast<unsigned int>(result));
 	RETURN(result);
 }
 
@@ -348,8 +367,185 @@ XBSYSAPI EXPORTNUM(190) xbox::ntstatus_xt NTAPI xbox::NtCreateFile
 )
 {
 	LOG_FORWARD("IoCreateFile");
+	const void* CallerAddress = _ReturnAddress();
+	const PKTHREAD CurrentThread = KeGetCurrentThread();
+	const PSTRING ObjectName =
+		ObjectAttributes != nullptr ? ObjectAttributes->ObjectName : nullptr;
+	const bool IsSfd =
+		ObjectName != nullptr &&
+		ObjectName->Buffer != nullptr &&
+		ObjectName->Length >= 4 &&
+		_strnicmp(
+			ObjectName->Buffer + ObjectName->Length - 4,
+			".sfd",
+			4) == 0;
+	const bool IsDecodedImage =
+		ObjectName != nullptr &&
+		ObjectName->Buffer != nullptr &&
+		ObjectName->Length >= 4 &&
+		(_strnicmp(
+			ObjectName->Buffer + ObjectName->Length - 4,
+			".png",
+			4) == 0 ||
+		 _strnicmp(
+			ObjectName->Buffer + ObjectName->Length - 4,
+			".bmp",
+			4) == 0 ||
+		 _strnicmp(
+			ObjectName->Buffer + ObjectName->Length - 4,
+			".dds",
+			4) == 0);
+	BetaTrace_Record(
+		"FILE_NT_OPEN_ENTER",
+		"caller=%p guest=%08X desired=%08X share=%08X disposition=%u options=%08X path=\"%.*s\"",
+		CallerAddress,
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+			reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+		static_cast<unsigned int>(DesiredAccess),
+		static_cast<unsigned int>(ShareAccess),
+		static_cast<unsigned int>(CreateDisposition),
+		static_cast<unsigned int>(CreateOptions),
+		ObjectName != nullptr ? static_cast<int>(ObjectName->Length) : 0,
+		ObjectName != nullptr && ObjectName->Buffer != nullptr
+			? ObjectName->Buffer
+			: "");
+	if (IsSfd) {
+		const std::uint32_t* CallFrame =
+			reinterpret_cast<const std::uint32_t*>(
+				_AddressOfReturnAddress());
+		BetaTrace_Record(
+			"FILE_GUEST_STACK",
+			"caller=%p guest=%08X frame=%p w16=%08X w17=%08X w18=%08X w19=%08X w20=%08X w21=%08X w22=%08X w23=%08X w24=%08X w25=%08X w26=%08X w27=%08X w28=%08X w29=%08X w30=%08X w31=%08X",
+			CallerAddress,
+			static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+				reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+			CallFrame,
+			static_cast<unsigned int>(CallFrame[16]),
+			static_cast<unsigned int>(CallFrame[17]),
+			static_cast<unsigned int>(CallFrame[18]),
+			static_cast<unsigned int>(CallFrame[19]),
+			static_cast<unsigned int>(CallFrame[20]),
+			static_cast<unsigned int>(CallFrame[21]),
+			static_cast<unsigned int>(CallFrame[22]),
+			static_cast<unsigned int>(CallFrame[23]),
+			static_cast<unsigned int>(CallFrame[24]),
+			static_cast<unsigned int>(CallFrame[25]),
+			static_cast<unsigned int>(CallFrame[26]),
+			static_cast<unsigned int>(CallFrame[27]),
+			static_cast<unsigned int>(CallFrame[28]),
+			static_cast<unsigned int>(CallFrame[29]),
+			static_cast<unsigned int>(CallFrame[30]),
+			static_cast<unsigned int>(CallFrame[31]));
+	}
+	if (IsDecodedImage && g_BetaConfig.scheduler_io_trace &&
+		g_BetaConfig.scheduler_io_file_trace) {
+		void* BackTrace[16] = {};
+		const USHORT BackTraceCount = CaptureStackBackTrace(
+			0,
+			static_cast<DWORD>(_countof(BackTrace)),
+			BackTrace,
+			nullptr);
+		BetaTrace_Record(
+			"FILE_IMG_BT",
+			"path=\"%.*s\" count=%u bt=%p,%p,%p,%p,%p,%p,%p,%p,%p,%p,%p,%p,%p,%p,%p,%p",
+			static_cast<int>(ObjectName->Length),
+			ObjectName->Buffer,
+			static_cast<unsigned int>(BackTraceCount),
+			BackTrace[0],
+			BackTrace[1],
+			BackTrace[2],
+			BackTrace[3],
+			BackTrace[4],
+			BackTrace[5],
+			BackTrace[6],
+			BackTrace[7],
+			BackTrace[8],
+			BackTrace[9],
+			BackTrace[10],
+			BackTrace[11],
+			BackTrace[12],
+			BackTrace[13],
+			BackTrace[14],
+			BackTrace[15]);
+
+		const std::uint32_t* CallFrame =
+			reinterpret_cast<const std::uint32_t*>(
+				_AddressOfReturnAddress());
+		char StackWords[768] = {};
+		std::size_t StackWordsLength = 0;
+		for (unsigned int Index = 0;
+			 Index < 48 && StackWordsLength < sizeof(StackWords);
+			 ++Index) {
+			const int Written = snprintf(
+				StackWords + StackWordsLength,
+				sizeof(StackWords) - StackWordsLength,
+				"%s%02u=%08X",
+				Index == 0 ? "" : ",",
+				Index,
+				static_cast<unsigned int>(CallFrame[Index]));
+			if (Written <= 0 ||
+				static_cast<std::size_t>(Written) >=
+					sizeof(StackWords) - StackWordsLength) {
+				break;
+			}
+			StackWordsLength += static_cast<std::size_t>(Written);
+		}
+		BetaTrace_Record(
+			"FILE_IMG_SP",
+			"path=\"%.*s\" frame=%p words=%s",
+			static_cast<int>(ObjectName->Length),
+			ObjectName->Buffer,
+			CallFrame,
+			StackWords);
+
+		char UpperStackWords[900] = {};
+		std::size_t UpperStackWordsLength = 0;
+		for (unsigned int Index = 48;
+			 Index < 112 &&
+			 UpperStackWordsLength < sizeof(UpperStackWords);
+			 ++Index) {
+			const int Written = snprintf(
+				UpperStackWords + UpperStackWordsLength,
+				sizeof(UpperStackWords) - UpperStackWordsLength,
+				"%s%03u=%08X",
+				Index == 48 ? "" : ",",
+				Index,
+				static_cast<unsigned int>(CallFrame[Index]));
+			if (Written <= 0 ||
+				static_cast<std::size_t>(Written) >=
+					sizeof(UpperStackWords) - UpperStackWordsLength) {
+				break;
+			}
+			UpperStackWordsLength += static_cast<std::size_t>(Written);
+		}
+		BetaTrace_Record(
+			"FILE_IMG_SP2",
+			"path=\"%.*s\" frame=%p words=%s",
+			static_cast<int>(ObjectName->Length),
+			ObjectName->Buffer,
+			CallFrame,
+			UpperStackWords);
+		BetaTrace_Record(
+			"FILE_IMG_CALL",
+			"path=\"%.*s\" w112=%08X w113=%08X w114=%08X w115=%08X w116=%08X w117=%08X w118=%08X w119=%08X w120=%08X w121=%08X w122=%08X w123=%08X w124=%08X",
+			static_cast<int>(ObjectName->Length),
+			ObjectName->Buffer,
+			static_cast<unsigned int>(CallFrame[112]),
+			static_cast<unsigned int>(CallFrame[113]),
+			static_cast<unsigned int>(CallFrame[114]),
+			static_cast<unsigned int>(CallFrame[115]),
+			static_cast<unsigned int>(CallFrame[116]),
+			static_cast<unsigned int>(CallFrame[117]),
+			static_cast<unsigned int>(CallFrame[118]),
+			static_cast<unsigned int>(CallFrame[119]),
+			static_cast<unsigned int>(CallFrame[120]),
+			static_cast<unsigned int>(CallFrame[121]),
+			static_cast<unsigned int>(CallFrame[122]),
+			static_cast<unsigned int>(CallFrame[123]),
+			static_cast<unsigned int>(CallFrame[124]));
+	}
 	/* Call the I/O Function */
-	return xbox::IoCreateFile(
+	const ntstatus_xt Result = xbox::IoCreateFile(
 		FileHandle,
 		DesiredAccess,
 		ObjectAttributes,
@@ -360,6 +556,24 @@ XBSYSAPI EXPORTNUM(190) xbox::ntstatus_xt NTAPI xbox::NtCreateFile
 		CreateDisposition,
 		CreateOptions,
 		0);
+	BetaTrace_Record(
+		"FILE_NT_OPEN_EXIT",
+		"caller=%p guest=%08X result=%08X xbox_file=%08X",
+		CallerAddress,
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+			reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+		static_cast<unsigned int>(Result),
+		FileHandle != nullptr
+			? static_cast<unsigned int>(
+				reinterpret_cast<ULONG_PTR>(*FileHandle))
+			: 0U);
+	RenderTrace_RecordFileOpen(
+		ObjectName != nullptr && ObjectName->Buffer != nullptr
+			? ObjectName->Buffer
+			: "",
+		ObjectName != nullptr ? ObjectName->Length : 0,
+		static_cast<LONG>(Result));
+	return Result;
 }
 
 // ******************************************************************
@@ -1067,8 +1281,25 @@ XBSYSAPI EXPORTNUM(202) xbox::ntstatus_xt NTAPI xbox::NtOpenFile
 )
 {
 	LOG_FORWARD("IoCreateFile");
-
-	return xbox::IoCreateFile(
+	const void* CallerAddress = _ReturnAddress();
+	const PKTHREAD CurrentThread = KeGetCurrentThread();
+	const PSTRING ObjectName =
+		ObjectAttributes != nullptr ? ObjectAttributes->ObjectName : nullptr;
+	BetaTrace_Record(
+		"FILE_NT_OPEN_ENTER",
+		"caller=%p guest=%08X desired=%08X share=%08X disposition=%u options=%08X path=\"%.*s\"",
+		CallerAddress,
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+			reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+		static_cast<unsigned int>(DesiredAccess),
+		static_cast<unsigned int>(ShareAccess),
+		static_cast<unsigned int>(FILE_OPEN),
+		static_cast<unsigned int>(OpenOptions),
+		ObjectName != nullptr ? static_cast<int>(ObjectName->Length) : 0,
+		ObjectName != nullptr && ObjectName->Buffer != nullptr
+			? ObjectName->Buffer
+			: "");
+	const ntstatus_xt Result = xbox::IoCreateFile(
 		FileHandle,
 		DesiredAccess,
 		ObjectAttributes,
@@ -1079,6 +1310,24 @@ XBSYSAPI EXPORTNUM(202) xbox::ntstatus_xt NTAPI xbox::NtOpenFile
 		/*Disposition=*/FILE_OPEN,
 		/*CreateOptions=*/OpenOptions,
 		/*Options=*/0);
+	BetaTrace_Record(
+		"FILE_NT_OPEN_EXIT",
+		"caller=%p guest=%08X result=%08X xbox_file=%08X",
+		CallerAddress,
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+			reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+		static_cast<unsigned int>(Result),
+		FileHandle != nullptr
+			? static_cast<unsigned int>(
+				reinterpret_cast<ULONG_PTR>(*FileHandle))
+			: 0U);
+	RenderTrace_RecordFileOpen(
+		ObjectName != nullptr && ObjectName->Buffer != nullptr
+			? ObjectName->Buffer
+			: "",
+		ObjectName != nullptr ? ObjectName->Length : 0,
+		static_cast<LONG>(Result));
+	return Result;
 }
 
 // ******************************************************************
@@ -1209,6 +1458,20 @@ XBSYSAPI EXPORTNUM(207) xbox::ntstatus_xt NTAPI xbox::NtQueryDirectoryFile
 	IN  boolean_xt                     RestartScan
 )
 {
+	if (g_BetaConfig.scheduler_io_trace) {
+		BetaTrace_Record(
+			"FILE_DIR_ENTER",
+			"caller=%p xbox_file=%08X class=%u restart=%u mask=\"%.*s\"",
+			_ReturnAddress(),
+			static_cast<unsigned int>(
+				reinterpret_cast<ULONG_PTR>(FileHandle)),
+			static_cast<unsigned int>(FileInformationClass),
+			static_cast<unsigned int>(RestartScan),
+			FileMask != nullptr ? static_cast<int>(FileMask->Length) : 0,
+			FileMask != nullptr && FileMask->Buffer != nullptr
+				? FileMask->Buffer
+				: "");
+	}
 	LOG_FUNC_BEGIN
 		LOG_FUNC_ARG(FileHandle)
 		LOG_FUNC_ARG(Event)
@@ -1306,6 +1569,31 @@ XBSYSAPI EXPORTNUM(207) xbox::ntstatus_xt NTAPI xbox::NtQueryDirectoryFile
 
 	ObfDereferenceObject(FileObject);
 
+	if (g_BetaConfig.scheduler_io_trace) {
+		BetaTrace_Record(
+			"FILE_DIR_EXIT",
+			"caller=%p xbox_file=%08X result=%08X iosb_status=%08X iosb_info=%08X name_length=%u name=\"%.*s\"",
+			_ReturnAddress(),
+			static_cast<unsigned int>(
+				reinterpret_cast<ULONG_PTR>(FileHandle)),
+			static_cast<unsigned int>(ret),
+			IoStatusBlock != nullptr
+				? static_cast<unsigned int>(IoStatusBlock->Status)
+				: 0U,
+			IoStatusBlock != nullptr
+				? static_cast<unsigned int>(IoStatusBlock->Information)
+				: 0U,
+			FileInformation != nullptr
+				? static_cast<unsigned int>(FileInformation->FileNameLength)
+				: 0U,
+			FileInformation != nullptr
+				? static_cast<int>(FileInformation->FileNameLength)
+				: 0,
+			FileInformation != nullptr
+				? FileInformation->FileName
+				: "");
+	}
+
 	RETURN(ret);
 }
 
@@ -1372,6 +1660,23 @@ XBSYSAPI EXPORTNUM(210) xbox::ntstatus_xt NTAPI xbox::NtQueryFullAttributesFile
 	OUT xbox::PFILE_NETWORK_OPEN_INFORMATION   FileInformation
 )
 {
+	const PSTRING ObjectName =
+		ObjectAttributes != nullptr ? ObjectAttributes->ObjectName : nullptr;
+	if (g_BetaConfig.scheduler_io_trace) {
+		BetaTrace_Record(
+			"FILE_ATTR_ENTER",
+			"caller=%p attributes=%08X path=\"%.*s\"",
+			_ReturnAddress(),
+			ObjectAttributes != nullptr
+				? static_cast<unsigned int>(ObjectAttributes->Attributes)
+				: 0U,
+			ObjectName != nullptr
+				? static_cast<int>(ObjectName->Length)
+				: 0,
+			ObjectName != nullptr && ObjectName->Buffer != nullptr
+				? ObjectName->Buffer
+				: "");
+	}
 	LOG_FUNC_BEGIN
 		LOG_FUNC_ARG(ObjectAttributes)
 		LOG_FUNC_ARG_OUT(FileInformation)
@@ -1397,10 +1702,48 @@ XBSYSAPI EXPORTNUM(210) xbox::ntstatus_xt NTAPI xbox::NtQueryFullAttributesFile
 	if (OpenPacket.ParseCheck == false) {
 		/* Parse failed */
 		//DPRINT("IopQueryAttributesFile failed for '%wZ' with 0x%lx\n", ObjectAttributes->ObjectName, result);
+		if (g_BetaConfig.scheduler_io_trace) {
+			BetaTrace_Record(
+				"FILE_ATTR_EXIT",
+				"caller=%p result=%08X parsed=0 path=\"%.*s\"",
+				_ReturnAddress(),
+				static_cast<unsigned int>(result),
+				ObjectName != nullptr
+					? static_cast<int>(ObjectName->Length)
+					: 0,
+				ObjectName != nullptr && ObjectName->Buffer != nullptr
+					? ObjectName->Buffer
+					: "");
+		}
 		RETURN(result);
 	}
 	else {
 		result = OpenPacket.FinalStatus;
+	}
+
+	if (g_BetaConfig.scheduler_io_trace) {
+		BetaTrace_Record(
+			"FILE_ATTR_EXIT",
+			"caller=%p result=%08X parsed=1 attributes=%08X size=%08X%08X path=\"%.*s\"",
+			_ReturnAddress(),
+			static_cast<unsigned int>(result),
+			FileInformation != nullptr
+				? static_cast<unsigned int>(FileInformation->FileAttributes)
+				: 0U,
+			FileInformation != nullptr
+				? static_cast<unsigned int>(
+					FileInformation->EndOfFile.u.HighPart)
+				: 0U,
+			FileInformation != nullptr
+				? static_cast<unsigned int>(
+					FileInformation->EndOfFile.u.LowPart)
+				: 0U,
+			ObjectName != nullptr
+				? static_cast<int>(ObjectName->Length)
+				: 0,
+			ObjectName != nullptr && ObjectName->Buffer != nullptr
+				? ObjectName->Buffer
+				: "");
 	}
 
 	RETURN(result);
@@ -1941,6 +2284,8 @@ XBSYSAPI EXPORTNUM(219) xbox::ntstatus_xt NTAPI xbox::NtReadFile
 		LOG_FUNC_ARG(Length)
 		LOG_FUNC_ARG(ByteOffset)
 		LOG_FUNC_END;
+	const void* CallerAddress = _ReturnAddress();
+	const PKTHREAD CurrentThread = KeGetCurrentThread();
 
 	// Halo...
 	//    if(ByteOffset != 0 && ByteOffset->QuadPart == 0x00120800)
@@ -1990,6 +2335,24 @@ XBSYSAPI EXPORTNUM(219) xbox::ntstatus_xt NTAPI xbox::NtReadFile
 	// TODO: Start irp work here...
 
 	if (const auto& nFileHandle = GetObjectNativeHandle(FileObject)) {
+		const long long TraceOffset =
+			ByteOffset != nullptr ? ByteOffset->QuadPart : -1;
+		BetaTrace_Record(
+			"READ_ENTER",
+			"caller=%p guest=%08X xbox_file=%08X native_file=%p event=%p apc=%p context=%p iosb=%p buffer=%p length=%u offset=%lld",
+			CallerAddress,
+			static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+				reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+			static_cast<unsigned int>(
+				reinterpret_cast<ULONG_PTR>(FileHandle)),
+			*nFileHandle,
+			Event,
+			ApcRoutine,
+			ApcContext,
+			IoStatusBlock,
+			Buffer,
+			static_cast<unsigned int>(Length),
+			TraceOffset);
 		result = NtDll::NtReadFile(
 			*nFileHandle,
 			Event,
@@ -2000,6 +2363,25 @@ XBSYSAPI EXPORTNUM(219) xbox::ntstatus_xt NTAPI xbox::NtReadFile
 			Length,
 			(NtDll::LARGE_INTEGER*)ByteOffset,
 			/*Key=*/nullptr);
+		BetaTrace_Record(
+			"READ_EXIT",
+			"caller=%p guest=%08X xbox_file=%08X native_file=%p event=%p length=%u offset=%lld result=%08X iosb_status=%08X iosb_info=%u",
+			CallerAddress,
+			static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+				reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+			static_cast<unsigned int>(
+				reinterpret_cast<ULONG_PTR>(FileHandle)),
+			*nFileHandle,
+			Event,
+			static_cast<unsigned int>(Length),
+			TraceOffset,
+			static_cast<unsigned int>(result),
+			IoStatusBlock != nullptr
+				? static_cast<unsigned int>(IoStatusBlock->Status)
+				: 0U,
+			IoStatusBlock != nullptr
+				? static_cast<unsigned int>(IoStatusBlock->Information)
+				: 0U);
 
 		if (FAILED(result)) {
 			EmuLog(LOG_LEVEL::WARNING, "NtReadFile Failed! (0x%.08X)", result);
@@ -2637,8 +3019,20 @@ XBSYSAPI EXPORTNUM(233) xbox::ntstatus_xt NTAPI xbox::NtWaitForSingleObject
 )
 {
 	LOG_FORWARD("NtWaitForMultipleObjectsEx");
+	const void* CallerAddress = _ReturnAddress();
+	const PKTHREAD CurrentThread = KeGetCurrentThread();
 
-	return xbox::NtWaitForMultipleObjectsEx(
+	BetaTrace_Record(
+		"NT_WAIT_ENTER",
+		"caller=%p guest=%08X handle=%p alertable=%u timeout_ptr=%p timeout=%lld ex=0",
+		CallerAddress,
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+			reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+		Handle,
+		static_cast<unsigned int>(Alertable),
+		Timeout,
+		Timeout != nullptr ? Timeout->QuadPart : 0);
+	const ntstatus_xt Result = xbox::NtWaitForMultipleObjectsEx(
 		/*Count=*/1,
 		&Handle,
 		/*WaitType=*/WaitAll,
@@ -2646,6 +3040,15 @@ XBSYSAPI EXPORTNUM(233) xbox::ntstatus_xt NTAPI xbox::NtWaitForSingleObject
 		Alertable,
 		Timeout
 	);
+	BetaTrace_Record(
+		"NT_WAIT_EXIT",
+		"caller=%p guest=%08X handle=%p result=%08X ex=0",
+		CallerAddress,
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+			reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+		Handle,
+		static_cast<unsigned int>(Result));
+	return Result;
 }
 
 // ******************************************************************
@@ -2660,8 +3063,21 @@ XBSYSAPI EXPORTNUM(234) xbox::ntstatus_xt NTAPI xbox::NtWaitForSingleObjectEx
 )
 {
 	LOG_FORWARD("NtWaitForMultipleObjectsEx");
+	const void* CallerAddress = _ReturnAddress();
+	const PKTHREAD CurrentThread = KeGetCurrentThread();
 
-	return xbox::NtWaitForMultipleObjectsEx(
+	BetaTrace_Record(
+		"NT_WAIT_ENTER",
+		"caller=%p guest=%08X handle=%p alertable=%u mode=%u timeout_ptr=%p timeout=%lld ex=1",
+		CallerAddress,
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+			reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+		Handle,
+		static_cast<unsigned int>(Alertable),
+		static_cast<unsigned int>(WaitMode),
+		Timeout,
+		Timeout != nullptr ? Timeout->QuadPart : 0);
+	const ntstatus_xt Result = xbox::NtWaitForMultipleObjectsEx(
 		/*Count=*/1,
 		&Handle,
 		/*WaitType=*/WaitAll,
@@ -2669,6 +3085,15 @@ XBSYSAPI EXPORTNUM(234) xbox::ntstatus_xt NTAPI xbox::NtWaitForSingleObjectEx
 		Alertable,
 		Timeout
 	);
+	BetaTrace_Record(
+		"NT_WAIT_EXIT",
+		"caller=%p guest=%08X handle=%p result=%08X ex=1",
+		CallerAddress,
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+			reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+		Handle,
+		static_cast<unsigned int>(Result));
+	return Result;
 }
 
 // ******************************************************************
@@ -2882,4 +3307,3 @@ XBSYSAPI EXPORTNUM(238) xbox::void_xt NTAPI xbox::NtYieldExecution()
 
 	NtDll::NtYieldExecution();
 }
-

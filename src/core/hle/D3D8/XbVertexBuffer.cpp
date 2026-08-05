@@ -38,6 +38,7 @@
 #include "core\hle\D3D8\XbVertexBuffer.h"
 #include "core\hle\D3D8\XbConvert.h"
 #include "common\PerfTrace.h"
+#include "common\RenderTrace.h"
 
 #include <imgui.h>
 
@@ -387,6 +388,25 @@ void CxbxVertexBufferConverter::ConvertStream
     const uint64_t vertexDataHash = ComputeHash(pXboxVertexData, xboxVertexDataSize);
     const uint64_t pVertexShaderSteamInfoHash = pVertexShaderStreamInfo != nullptr ? ComputeHash(pVertexShaderStreamInfo->VertexElements,
             sizeof(pVertexShaderStreamInfo->VertexElements[0]) * pVertexShaderStreamInfo->NumberOfVertexElements) : 0;
+
+    if (g_RenderTraceEnabled && pVertexShaderStreamInfo != nullptr) {
+        for (UINT elementIndex = 0;
+             elementIndex < pVertexShaderStreamInfo->NumberOfVertexElements;
+             ++elementIndex) {
+            const CxbxVertexShaderStreamElement& element =
+                pVertexShaderStreamInfo->VertexElements[elementIndex];
+            if (element.XboxRegister == xbox::X_D3DVSDE_BLENDWEIGHT &&
+                element.XboxType == xbox::X_D3DVSDT_PBYTE4) {
+                RenderTrace_RecordPackedByte4(
+                    element.XboxRegister,
+                    vertexDataHash,
+                    uiVertexCount,
+                    uiXboxVertexStride,
+                    element.XboxOffset,
+                    pXboxVertexData);
+            }
+        }
+    }
 
     // Lookup implicity inserts a new entry if not exists, so this always works
     CxbxPatchedStream& patchedStream = GetPatchedStream(vertexDataHash, pVertexShaderSteamInfoHash);
@@ -760,7 +780,7 @@ void CxbxSetVertexAttribute(int Register, FLOAT a, FLOAT b, FLOAT c, FLOAT d)
 	// This allows us to implement Xbox functionality where SetVertexData4f can be used to specify attributes
 	// not present in the vertex declaration.
 	// We use range 193 and up to store these values, as Xbox shaders stop at c192!
-	g_pD3DDevice->SetVertexShaderConstantF(CXBX_D3DVS_CONSTREG_VREGDEFAULTS_BASE + Register, attribute_floats, 1);
+	CxbxSetVertexShaderConstantF(CXBX_D3DVS_CONSTREG_VREGDEFAULTS_BASE + Register, attribute_floats, 1);
 }
 
 void CxbxImpl_Begin(xbox::X_D3DPRIMITIVETYPE PrimitiveType)

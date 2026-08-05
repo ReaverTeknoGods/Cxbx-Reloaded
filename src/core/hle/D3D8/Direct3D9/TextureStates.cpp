@@ -27,6 +27,7 @@
 #define LOG_PREFIX CXBXR_MODULE::D3DST
 
 #include "TextureStates.h"
+#include "common/BetaConfig.h"
 #include "common/RenderTrace.h"
 #include "core\kernel\init\CxbxKrnl.h"
 #include "core\kernel\support\Emu.h"
@@ -190,13 +191,14 @@ void XboxTextureStateConverter::Apply()
                 continue;
             }
 
-			// Texgen and texture-transform flags are consumed by Cxbx's HLSL
-			// fixed-function vertex shader. Rebuild its non-transform state when
-			// either Xbox state changes instead of reusing stale coordinates.
-			if (State == xbox::X_D3DTSS_TEXCOORDINDEX ||
-				State == xbox::X_D3DTSS_TEXTURETRANSFORMFLAGS) {
-				CxbxInvalidateFixedFunctionNonTransformState();
-			}
+            // Texgen and texture-transform flags are consumed by Cxbx's HLSL
+            // fixed-function vertex shader. Rebuild its non-transform state
+            // whenever either Xbox state changes instead of reusing stale
+            // generated coordinates from a previous draw.
+            if (State == xbox::X_D3DTSS_TEXCOORDINDEX ||
+                State == xbox::X_D3DTSS_TEXTURETRANSFORMFLAGS) {
+                CxbxInvalidateFixedFunctionNonTransformState();
+            }
 
             switch (State) {
                 // These types map 1:1 but have some unsupported values
@@ -346,6 +348,34 @@ void XboxTextureStateConverter::Apply()
         RenderTrace_RecordTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
 
         // no need to actually copy here, since it was handled in the loop above
+    }
+
+    // Diagnostic comparison for Crazy Taxi's blocky city façades. This is
+    // disabled by default and intentionally applied after the title's normal
+    // sampler states, so a runtime beta.ini can test whether the artifact is
+    // caused by selecting an excessively coarse mip level.
+    if (g_BetaConfig.ct_debug_mip_lod_bias >= -8 &&
+        g_BetaConfig.ct_debug_mip_lod_bias <= 8) {
+        const float lodBias =
+            static_cast<float>(g_BetaConfig.ct_debug_mip_lod_bias);
+        DWORD lodBiasBits = 0;
+        static_assert(sizeof(lodBiasBits) == sizeof(lodBias));
+        memcpy(&lodBiasBits, &lodBias, sizeof(lodBiasBits));
+        for (DWORD stage = 0; stage < xbox::X_D3DTS_STAGECOUNT; ++stage) {
+            g_pD3DDevice->SetSamplerState(
+                stage,
+                D3DSAMP_MIPMAPLODBIAS,
+                lodBiasBits);
+            // A very negative bias still permits automatic mip selection.
+            // Reserve the -8 diagnostic value for a decisive level-zero
+            // comparison while investigating Crazy Taxi's façade atlases.
+            if (g_BetaConfig.ct_debug_mip_lod_bias == -8) {
+                g_pD3DDevice->SetSamplerState(
+                    stage,
+                    D3DSAMP_MIPFILTER,
+                    D3DTEXF_NONE);
+            }
+        }
     }
 }
 

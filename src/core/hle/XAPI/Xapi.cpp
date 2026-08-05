@@ -29,6 +29,7 @@
 
 #include <core\kernel\exports\xboxkrnl.h>
 #include "core\hle\XAPI\Xapi.h"
+#include "common/BetaConfig.h"
 #include "common/cxbxr.hpp"
 
 #include "common\input\SdlJoystick.h"
@@ -41,6 +42,7 @@
 #include "core\kernel\exports\EmuKrnlKi.h"
 #include "core\kernel\support\EmuFile.h"
 #include "core\kernel\support\NativeHandle.h"
+#include "devices\chihiro\JvsIo.h"
 #include "EmuShared.h"
 #include "core\hle\Intercept.hpp"
 #include "Windef.h"
@@ -64,6 +66,79 @@ xbox::char_xt g_AltLett_MU = 0;
 xbox::ulong_xt *g_XapiMountedMUs = &g_Mounted_MUs;
 xbox::char_xt *g_XapiAltLett_MU = &g_AltLett_MU;
 std::recursive_mutex g_MuLock;
+
+static std::atomic<xbox::PXPP_DEVICE_TYPE> g_arcadeBypassDeviceType { nullptr };
+static std::atomic<bool> g_arcadeBypassReported { false };
+
+static bool TryCompleteArcadeGamepadInitialization(
+	xbox::PXPP_DEVICE_TYPE deviceType,
+	xbox::PDWORD insertions,
+	xbox::PDWORD removals)
+{
+	const bool bypassWmmt = g_BetaConfig.wmmt_gamepad_init_bypass != 0;
+	const bool bypassCrazyTaxi =
+		g_BetaConfig.ct_gamepad_init_bypass != 0 &&
+		g_jvs_game_type == JvsGameType::CrazyTaxi;
+	if (!bypassWmmt && !bypassCrazyTaxi) {
+		return false;
+	}
+	if (!bypassCrazyTaxi && deviceType != g_DeviceType_Gamepad) {
+		return false;
+	}
+
+	auto observedDevice =
+		g_arcadeBypassDeviceType.load(std::memory_order_acquire);
+	if (observedDevice != deviceType) {
+		if (g_arcadeBypassDeviceType.compare_exchange_strong(
+				observedDevice,
+				deviceType,
+				std::memory_order_acq_rel)) {
+			g_arcadeBypassReported.store(false, std::memory_order_release);
+		}
+		else if (observedDevice != deviceType) {
+			return false;
+		}
+	}
+
+	bool expected = false;
+	if (!g_arcadeBypassReported.compare_exchange_strong(
+			expected,
+			true,
+			std::memory_order_acq_rel)) {
+		return false;
+	}
+
+	// Some Chihiro arcade titles poll XGetDeviceChanges until an enumeration
+	// event arrives before proceeding to their JVS initialization. There is no
+	// Xbox gamepad on these cabinets, so report one transient completion event
+	// after CXBXR's normal USB initialization window. XGetDevices remains
+	// authoritative and still returns no pad.
+	*insertions = 1;
+	*removals = 0;
+	EmuLog(
+		LOG_LEVEL::INFO,
+		"Reported one transient arcade device-enumeration event (%s)",
+		bypassCrazyTaxi ? "Crazy Taxi" : "WMMT");
+	return true;
+}
+
+static void MaybeYieldWmmtGamepadPoll(xbox::PXPP_DEVICE_TYPE deviceType)
+{
+	if (deviceType != g_DeviceType_Gamepad ||
+		g_BetaConfig.wmmt_device_poll_yield_ms <= 0 ||
+		(g_BetaConfig.wmmt_gamepad_init_bypass &&
+			g_arcadeBypassReported.load(std::memory_order_acquire))) {
+		return;
+	}
+
+	// WMMT1/2 can poll XGetDeviceChanges continuously while their other guest
+	// workers initialize. Native Windows pre-empts that loop, but Wine/Box32
+	// can let it monopolize the translated CPU long enough to starve rendering
+	// and timing. Keep the workaround opt-in and bounded so desktop behavior
+	// remains unchanged by default.
+	Sleep(static_cast<DWORD>((std::min)(
+		g_BetaConfig.wmmt_device_poll_yield_ms, 100)));
+}
 
 #ifdef CXBXR_EMU
 
@@ -563,6 +638,7 @@ xbox::bool_xt WINAPI xbox::EMUPATCH(XGetDeviceChanges)
 		*pdwInsertions = 0;
 		*pdwRemovals = 0;
 		g_bXppGuard = false;
+		MaybeYieldWmmtGamepadPoll(DeviceType);
 		RETURN(FALSE);
 	}
 
@@ -582,6 +658,11 @@ xbox::bool_xt WINAPI xbox::EMUPATCH(XGetDeviceChanges)
 
     if(!DeviceType->ChangeConnected)
     {
+		if (TryCompleteArcadeGamepadInitialization(
+				DeviceType, pdwInsertions, pdwRemovals)) {
+			g_bXppGuard = false;
+			RETURN(TRUE);
+		}
         *pdwInsertions = 0;
         *pdwRemovals = 0;
     }
@@ -605,8 +686,9 @@ xbox::bool_xt WINAPI xbox::EMUPATCH(XGetDeviceChanges)
         ret = (*pdwInsertions | *pdwRemovals) ? TRUE : FALSE;
 
 		xbox::KfLowerIrql(oldIrql);
-    }
+	}
 	g_bXppGuard = false;
+	MaybeYieldWmmtGamepadPoll(DeviceType);
 
 	RETURN(ret);
 }

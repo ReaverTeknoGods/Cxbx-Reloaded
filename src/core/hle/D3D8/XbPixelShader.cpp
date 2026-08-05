@@ -50,6 +50,8 @@
 #include "common/FilePaths.hpp" // For szFilePath_CxbxReloaded_Exe
 #include "common/PerfTrace.h"
 #include "common/RenderTrace.h"
+#include "common/BetaConfig.h"
+#include "devices/chihiro/JvsIo.h"
 
 #include <assert.h> // assert()
 #include <process.h>
@@ -1015,9 +1017,11 @@ void UpdateFixedFunctionPixelShaderState()
 {
 	using namespace FixedFunctionPixelShader;
 
-	// Each scalar member is alignas(16), so the upload contains padding. Clear
-	// the complete buffer first; otherwise an uninitialised padding float can
-	// be a signalling NaN and trip host D3D9 validation or the shader compiler.
+	// Each scalar member is alignas(16), so the structure contains three
+	// padding floats after most values. Zero the complete upload buffer before
+	// assigning live state; otherwise uninitialised padding can contain a
+	// signalling NaN and Wine's D3D9 constant validation raises
+	// STATUS_FLOAT_MULTIPLE_TRAPS while inspecting it.
 	FixedFunctionPixelShaderState ffPsState{};
 	ffPsState.TextureFactor = (D3DXVECTOR4)((D3DXCOLOR)(XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_TEXTUREFACTOR)));
 	ffPsState.SpecularEnable = XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_SPECULARENABLE);
@@ -1027,6 +1031,20 @@ void UpdateFixedFunctionPixelShaderState()
 	ffPsState.FogDensity = XboxRenderStates.GetXboxRenderStateAsFloat(xbox::_X_D3DRENDERSTATETYPE::X_D3DRS_FOGDENSITY);
 	ffPsState.FogStart = XboxRenderStates.GetXboxRenderStateAsFloat(xbox::_X_D3DRENDERSTATETYPE::X_D3DRS_FOGSTART);
 	ffPsState.FogEnd = XboxRenderStates.GetXboxRenderStateAsFloat(xbox::_X_D3DRENDERSTATETYPE::X_D3DRS_FOGEND);
+	if (g_jvs_game_type == JvsGameType::CrazyTaxi &&
+		g_BetaConfig.ct_debug_fog_mode == 1) {
+		// Crazy Taxi supplies EXP fog with a negative-zero density alongside
+		// negative start/end distances. The native D3D9 state converter already
+		// normalizes negative start/end values, but the fixed-function shader
+		// path consumes the raw Xbox values and consequently computes a fog
+		// factor of exactly one. Force a linear, positive-distance comparison
+		// here to determine whether that missing fog exposes its monochrome
+		// façade-dither atlases.
+		ffPsState.FogTableMode = D3DFOG_LINEAR;
+		ffPsState.FogDensity = std::abs(ffPsState.FogDensity);
+		ffPsState.FogStart = std::abs(ffPsState.FogStart);
+		ffPsState.FogEnd = std::abs(ffPsState.FogEnd);
+	}
 	// Texture state
 	for (int i = 0; i < xbox::X_D3DTS_STAGECOUNT; i++) {
 
@@ -1045,7 +1063,7 @@ void UpdateFixedFunctionPixelShaderState()
 	}
 
 	const int size = (sizeof(FixedFunctionPixelShaderState) + 16 - 1) / 16;
-	g_pD3DDevice->SetPixelShaderConstantF(0, (float*)&ffPsState, size);
+	CxbxSetPixelShaderConstantF(0, (float*)&ffPsState, size);
 }
 
 bool g_UseFixedFunctionPixelShader = true;
@@ -1258,5 +1276,5 @@ void DxbxUpdateActivePixelShader() // NOPATCH
   // Assume all constants are in use (this is much easier than tracking them for no other purpose than to skip a few here)
   // Read the color from the corresponding render state slot :
   // Set all host constant values using a single call:
-  g_pD3DDevice->SetPixelShaderConstantF(0, reinterpret_cast<const float*>(fColor), PSH_XBOX_CONSTANT_MAX);
+  CxbxSetPixelShaderConstantF(0, reinterpret_cast<const float*>(fColor), PSH_XBOX_CONSTANT_MAX);
 }

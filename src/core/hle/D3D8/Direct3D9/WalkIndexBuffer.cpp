@@ -6,6 +6,7 @@
 //#include <nmmintrin.h> // SSE4.2
 //#include <immintrin.h> // AVX
 #include "common\util\CPUID.h"
+#include "common\win32\WineEnv.h"
 #include "WalkIndexBuffer.h"
 
 // Walk an index buffer to find the minimum and maximum indices
@@ -78,7 +79,12 @@ void(*WalkIndexBuffer)(INDEX16 &, INDEX16 &, INDEX16 *, DWORD) =
 [](INDEX16 &LowIndex, INDEX16 &HighIndex, INDEX16 *pIndexData, DWORD dwIndexCount)
 {
 	SimdCaps supports;
-	if (supports.SSE41())
+	// Box64 currently exposes SSE4.1 through CPUID but does not translate
+	// PHMINPOSUW in its dynarec path. Selecting this implementation under Wine
+	// therefore raises STATUS_FLOAT_MULTIPLE_TRAPS once a title submits a large
+	// enough index buffer. Keep the scalar implementation for Wine/Box64 while
+	// retaining the native fast path on Windows.
+	if (!isWineEnv() && supports.SSE41())
 		WalkIndexBuffer = WalkIndexBuffer_SSE41;
 	else
 		WalkIndexBuffer = WalkIndexBuffer_NoSIMD;

@@ -24,3 +24,4 @@ IF ERRORLEVEL 1 (
 
 ECHO.
 ECHO Build successful! Output in build\bin\%CONFIG%\
+xcopy C:\Users\DubaiRyzen\Documents\GitHub\Cxbx-Reloaded\build\bin\Release\* /S /Y C:\Users\DubaiRyzen\Documents\GitHub\TeknoParrotUI\bin\x86\Debug\cxbxr\

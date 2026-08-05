@@ -122,6 +122,11 @@ private:
     uint8_t buffer_900000[512] = {};   // 0x900000 read buffer (sys response) = MAME read_buffer
     uint8_t buffer_900200[512] = {};   // 0x900200 write buffer (sys command) = MAME write_buffer
 
+    // Offset 0 shared buffer: when DRAM base (port 0x4084) is 0, the game
+    // uses offset 0 for both reads and writes instead of 0x900000/0x900200.
+    uint8_t buffer_offset0[512] = {};
+    bool m_offset0Pending = false;
+
     // Shadow response buffer: holds the last processed command response.
     // Game clears buffer_900000 before kicking 0x4026, so we re-deliver
     // the response from this shadow buffer on the kick or on read.

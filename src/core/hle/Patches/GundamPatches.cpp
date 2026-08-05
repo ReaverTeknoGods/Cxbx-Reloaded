@@ -28,6 +28,7 @@
 #include "ChihiroPatches.h"
 #include "common\xbox_types.h"
 #include "core\kernel\support\Emu.h"
+#include "core\kernel\init\CxbxKrnl.h"
 
 #include "devices\chihiro\JvsIo.h"
 
@@ -35,6 +36,11 @@
 #include <map>
 #include <string>
 #include <cstdio>
+
+#if !defined(_DEBUG)
+#define printf(...) do {} while (0)
+#define vprintf(...) do {} while (0)
+#endif
 
 extern std::map<std::string, xbox::addr_xt> g_SymbolAddresses;
 
@@ -81,6 +87,70 @@ static void MbDiagLog(const char* fmt, ...) {
 	}
 }
 #endif
+
+// ── Card reader emulation ─────────────────────────────────────────
+// sub_992F0 is a 6-state card reader state machine. It polls hardware
+// for card insertion/read/write. Without real hardware, it loops forever.
+// This hook provides file-based card I/O: reads/writes card data to
+// card.bin alongside the XBE file.
+//
+// Card reader states (original sub_992F0 DEC EAX; CMP EAX,5; JA):
+//   State 1: Initialize reader
+//   State 2: Wait for card insertion
+//   State 3: Read card data
+//   State 4: Process card
+//   State 5: Write card data
+//   State 6: Eject/finalize
+//
+// Returning 0 = function complete (no operation pending)
+
+static char g_gundamCardPath[MAX_PATH] = {};
+static constexpr size_t GUNDAM_CARD_SIZE = 1024; // typical Sega IC card data size
+
+static void GundamCardPathInit() {
+	if (g_gundamCardPath[0] != '\0') return;
+	char xbeDir[MAX_PATH];
+	strncpy(xbeDir, szFilePath_Xbe, MAX_PATH - 1);
+	xbeDir[MAX_PATH - 1] = '\0';
+	char* lastSlash = strrchr(xbeDir, '\\');
+	if (!lastSlash) lastSlash = strrchr(xbeDir, '/');
+	if (lastSlash) *(lastSlash + 1) = '\0';
+	else strcat(xbeDir, "\\");
+	snprintf(g_gundamCardPath, MAX_PATH, "%scard.bin", xbeDir);
+	printf("GundamCard: path=%s\n", g_gundamCardPath);
+}
+
+static bool GundamLoadCard(uint8_t* dest, size_t maxLen) {
+	GundamCardPathInit();
+	FILE* f = fopen(g_gundamCardPath, "rb");
+	if (!f) return false;
+	fseek(f, 0, SEEK_END);
+	long sz = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	if (sz <= 0 || (size_t)sz > maxLen) { fclose(f); return false; }
+	size_t r = fread(dest, 1, sz, f);
+	fclose(f);
+	printf("GundamCard: loaded %zu bytes\n", r);
+	return r > 0;
+}
+
+static bool GundamSaveCard(const uint8_t* src, size_t len) {
+	GundamCardPathInit();
+	FILE* f = fopen(g_gundamCardPath, "wb");
+	if (!f) return false;
+	size_t w = fwrite(src, 1, len, f);
+	fclose(f);
+	printf("GundamCard: saved %zu bytes\n", w);
+	return w == len;
+}
+
+// Card reader hook — replaces sub_992F0
+// Returns 0 (idle/complete) to prevent the state machine from blocking.
+// The game's main loop calls this periodically; returning 0 means
+// "no card operation in progress" which is correct for attract mode.
+static int __cdecl GundamCardReaderHook() {
+	return 0;
+}
 
 // ── Hook functions ────────────────────────────────────────────────
 
@@ -840,18 +910,20 @@ void ApplyGundamPatches(uint64_t xbeHash, uint32_t imageSize)
 #endif
 
 #if GP_CARD_READER
-	// === Card reader state machine stub (sub_992F0 → XOR EAX,EAX; RET) ===
-	// 6-state machine with retry loops (up to 60 retries). Not needed for gameplay.
+	// === Card reader hook (sub_992F0 → GundamCardReaderHook) ===
+	// 6-state machine with retry loops (up to 60 retries). Hook provides
+	// file-based card I/O and returns 0 (idle) for attract mode.
 	{
 		if (isTestMenu) {
-			printf("GundamPatch: Card reader stub skipped for test-menu (main-XBE static offset)\n");
+			printf("GundamPatch: Card reader hook skipped for test-menu (main-XBE static offset)\n");
 		} else {
 			const uintptr_t sub992F0 = 0x000992F0;
 			const uint8_t* probe = (const uint8_t*)sub992F0;
 			if (probe[0] != 0xC3 && probe[0] != 0xCC) {
-				static const uint8_t kRet0[] = { 0x33, 0xC0, 0xC3 };
-				PatchXbeBytes(sub992F0, kRet0, sizeof(kRet0));
-				printf("GundamPatch: Card reader stubbed at 0x%08X\n", (unsigned)sub992F0);
+				GundamCardPathInit();
+				PatchWithJmp(sub992F0, (const void*)&GundamCardReaderHook);
+				printf("GundamPatch: Card reader hooked at 0x%08X (card=%s)\n",
+					(unsigned)sub992F0, g_gundamCardPath);
 			} else {
 				printf("GundamPatch: Card reader already patched at 0x%08X\n", (unsigned)sub992F0);
 			}

@@ -95,7 +95,7 @@ typedef struct _baseboard_state_t {
 
 	uint8_t GetPINSA()
 	{
-		uint8_t PINSA = 0b11101111; // 1 = Off, 0 = On
+		uint8_t PINSA = 0b11111111; // 1 = Off, 0 = On
 
 		// Dip Switches 1-3 are set on PINSA bits 0-2
 		PINSA &= ~ (DipSwitch[0] ? 1 : 0);
@@ -126,6 +126,53 @@ typedef struct _baseboard_state_t {
 baseboard_state_t ChihiroBaseBoardState = {};
 DWORD* g_pPINSA = nullptr; // Qc PINSA Register: Contains Filter Board DIP Switches + Test/Service buttons
 DWORD* g_pPINSB = nullptr; // Qc PINSB Register: Contains JVS Sense Pin state 
+extern int g_ChihiroMjGame; // 0=none, 1=MJ2, 2=MJ3, 3=MJ3 Evolution
+
+namespace
+{
+	DWORD* ResolveMovEaxRegister(uintptr_t readerAddress, const uint8_t* suffix, size_t suffixSize)
+	{
+		const uint8_t* const code = reinterpret_cast<const uint8_t*>(readerAddress);
+		if (code[0] != 0xA1 || std::memcmp(code + 5, suffix, suffixSize) != 0) {
+			return nullptr;
+		}
+
+		uint32_t registerAddress = 0;
+		std::memcpy(&registerAddress, code + 1, sizeof(registerAddress));
+		return reinterpret_cast<DWORD*>(registerAddress);
+	}
+
+	void ResolveMj3EvolutionPins()
+	{
+		if (g_ChihiroMjGame != 3 || (g_pPINSA != nullptr && g_pPINSB != nullptr)) {
+			return;
+		}
+
+		// MJ3 Evolution's JVS 4832 variation is not covered by the current
+		// symbol database xrefs. Recover the two registers from its tiny,
+		// byte-validated accessors instead of hard-coding the data addresses.
+		static const uint8_t pinsASuffix[] = { 0xC3 };
+		static const uint8_t pinsBSuffix[] = {
+			0x83, 0xF8, 0xFF, 0x75, 0x03, 0x33, 0xC0, 0xC3
+		};
+		DWORD* const resolvedPINSA =
+			ResolveMovEaxRegister(0x00378140, pinsASuffix, sizeof(pinsASuffix));
+		DWORD* const resolvedPINSB =
+			ResolveMovEaxRegister(0x00378150, pinsBSuffix, sizeof(pinsBSuffix));
+
+		if (g_pPINSA == nullptr) {
+			g_pPINSA = resolvedPINSA;
+		}
+		if (g_pPINSB == nullptr) {
+			g_pPINSB = resolvedPINSB;
+		}
+
+		JvsLog(
+			"JVS_Init: MJ3 Evolution pin fallback PINSA=0x%08X PINSB=0x%08X\n",
+			static_cast<unsigned>(reinterpret_cast<uintptr_t>(g_pPINSA)),
+			static_cast<unsigned>(reinterpret_cast<uintptr_t>(g_pPINSB)));
+	}
+}
 
 bool JVS_LoadFile(std::string path, mio::mmap_sink& data)
 {
@@ -228,6 +275,7 @@ void JVS_Init()
 	static int JvsSendCommandVersion = -1;
 	g_pPINSA = (DWORD*)GetXboxSymbolPointer("JVS_g_pPINSA");
 	g_pPINSB = (DWORD*)GetXboxSymbolPointer("JVS_g_pPINSB");
+	ResolveMj3EvolutionPins();
 
 	auto JvsSendCommandOffset1 = (uintptr_t)GetXboxSymbolPointer("JVS_SendCommand");
 	auto JvsSendCommandOffset2 = (uintptr_t)GetXboxSymbolPointer("JVS_SendCommand2");
@@ -247,6 +295,11 @@ void JVS_Init()
 
 	// Set state to a sane initial default
 	ChihiroBaseBoardState.Reset();
+	if (g_ChihiroMjGame == 3) {
+		// MJ3 Evolution accepts filter-board video masks 0x12/0x16 only:
+		// switches 2 and 4 must be on (switch 3 selects the resolution).
+		ChihiroBaseBoardState.DipSwitch[1] = true;
+	}
 
 	// Auto-Patch Chihiro Region Flag to match the desired game
 	uint8_t &region = (uint8_t &)g_BaseBoardQcFirmware[0x1F00];
@@ -629,6 +682,56 @@ DWORD WINAPI xbox::EMUPATCH(JvsScFirmwareUpload)
 	RETURN(0);
 }
 
+namespace
+{
+	std::mutex g_MidiReceiveMutex;
+	std::vector<uint8_t> g_MidiReceiveQueue;
+	uint8_t g_WanganSteeringStatusLogged = 0xFF;
+	bool g_MidiNoDataLogged = false;
+
+	bool IsWanganPeripheral()
+	{
+		return g_jvs_game_type == JvsGameType::WanganMT1 ||
+			g_jvs_game_type == JvsGameType::WanganMT2;
+	}
+
+	void LogMidiPacket(const char* direction, const uint8_t* data, DWORD length)
+	{
+#if !defined(_DEBUG)
+		(void)direction;
+		(void)data;
+		(void)length;
+		return;
+#else
+		if (!g_JvsLogFile) {
+			return;
+		}
+
+		char bytes[(3 * 64) + 1] = {};
+		size_t offset = 0;
+		const DWORD loggedLength = (std::min)(length, 64UL);
+		for (DWORD i = 0; i < loggedLength && offset < sizeof(bytes); ++i) {
+			const int written = snprintf(
+				bytes + offset,
+				sizeof(bytes) - offset,
+				i == 0 ? "%02X" : " %02X",
+				data[i]);
+			if (written <= 0) {
+				break;
+			}
+			offset += static_cast<size_t>(written);
+		}
+
+		JvsLog(
+			"JvsSc%sMidi: %u-byte payload [%s]%s\n",
+			direction,
+			length,
+			bytes,
+			length > loggedLength ? " ..." : "");
+#endif
+	}
+}
+
 DWORD WINAPI xbox::EMUPATCH(JvsScReceiveMidi)
 (
 	DWORD a1,
@@ -642,10 +745,46 @@ DWORD WINAPI xbox::EMUPATCH(JvsScReceiveMidi)
 		LOG_FUNC_ARG(a3)
 		LOG_FUNC_END
 
-	JvsLog("JvsScReceiveMidi: a1=0x%08X a2=0x%08X a3=0x%08X [UNIMPLEMENTED]\n", a1, a2, a3);
-	LOG_UNIMPLEMENTED();
+	// JvsScReceiveMidi receives into the buffer at a1 and uses a2 as an
+	// in/out byte-count pointer. Returning success without changing the count
+	// made callers consume the entire uninitialised receive buffer (WMMT1/2
+	// request 0x40 bytes on every poll).
+	if (a2 == 0) {
+		RETURN(static_cast<DWORD>(-1));
+	}
 
-	RETURN(0);
+	DWORD* const byteCount = reinterpret_cast<DWORD*>(a2);
+	const DWORD capacity = *byteCount;
+	*byteCount = 0;
+
+	if (IsWanganPeripheral() && a1 != 0 && capacity != 0) {
+		std::lock_guard<std::mutex> lock(g_MidiReceiveMutex);
+		if (!g_MidiReceiveQueue.empty()) {
+			const DWORD copyLength = (std::min)(
+				capacity,
+				static_cast<DWORD>(g_MidiReceiveQueue.size()));
+			uint8_t* const destination = reinterpret_cast<uint8_t*>(a1);
+			memcpy(destination, g_MidiReceiveQueue.data(), copyLength);
+			g_MidiReceiveQueue.erase(
+				g_MidiReceiveQueue.begin(),
+				g_MidiReceiveQueue.begin() + copyLength);
+			*byteCount = copyLength;
+			g_MidiNoDataLogged = false;
+			LogMidiPacket("Receive", destination, copyLength);
+			RETURN(0);
+		}
+		if (!g_MidiNoDataLogged) {
+			JvsLog(
+				"JvsScReceiveMidi: waiting for WMMT steering data "
+				"(buffer=0x%08X capacity=%u flags=0x%08X)\n",
+				a1,
+				capacity,
+				a3);
+			g_MidiNoDataLogged = true;
+		}
+	}
+
+	RETURN(static_cast<DWORD>(-1));
 }
 
 DWORD WINAPI xbox::EMUPATCH(JvsScSendMidi)
@@ -658,11 +797,54 @@ DWORD WINAPI xbox::EMUPATCH(JvsScSendMidi)
 	LOG_FUNC_BEGIN
 		LOG_FUNC_ARG(a1)
 		LOG_FUNC_ARG(a2)
-		LOG_FUNC_ARG(a3)
+	LOG_FUNC_ARG(a3)
 		LOG_FUNC_END
 
-	JvsLog("JvsScSendMidi: a1=0x%08X a2=0x%08X a3=0x%08X [UNIMPLEMENTED]\n", a1, a2, a3);
-	LOG_UNIMPLEMENTED();
+	const uint8_t* const data = reinterpret_cast<const uint8_t*>(a1);
+	if (data != nullptr && a2 != 0) {
+		LogMidiPacket("Send", data, a2);
+
+		// WMMT1/2 use the SC MIDI path for the steering/force-feedback
+		// controller. The game sends a 10-byte FF FF-prefixed controller
+		// packet and expects a six-byte status reply. Bit 7 of JVS general
+		// output bank 0 is the controller enable line: enabled reports C01,
+		// disabled reports C06. WMMT2 toggles this line during HANDLE CHECK,
+		// so a fixed C01 response leaves the check running forever.
+		if (IsWanganPeripheral() &&
+			a2 >= 10 &&
+			data[0] == 0xFF &&
+			data[1] == 0xFF) {
+			// V307's controller reports ready continuously; V322 added a
+			// cabinet self-test which expects the status to follow its output
+			// enable line.
+			const bool steeringEnabled =
+				g_jvs_game_type == JvsGameType::WanganMT1 ||
+				(g_jvs_general_output_bank0.load(std::memory_order_relaxed) &
+					0x80) != 0;
+			const uint8_t wanganSteeringReady[] = {
+				'C',
+				'0',
+				static_cast<uint8_t>(steeringEnabled ? '1' : '6'),
+				0x00,
+				0x00,
+				0x00
+			};
+			std::lock_guard<std::mutex> lock(g_MidiReceiveMutex);
+			// Keep at most one pending response so a temporarily stalled game
+			// cannot grow the queue without bound.
+			if (g_MidiReceiveQueue.empty()) {
+				g_MidiReceiveQueue.assign(
+					std::begin(wanganSteeringReady),
+					std::end(wanganSteeringReady));
+			}
+			if (g_WanganSteeringStatusLogged != wanganSteeringReady[2]) {
+				JvsLog(
+					"JvsScSendMidi: queued WMMT steering acknowledgement C0%c\n",
+					wanganSteeringReady[2]);
+				g_WanganSteeringStatusLogged = wanganSteeringReady[2];
+			}
+		}
+	}
 
 	RETURN(0);
 }
@@ -677,28 +859,14 @@ DWORD WINAPI xbox::EMUPATCH(JvsScSendMidi)
 // ============================================================================
 static HANDLE   g_YacPipe     = INVALID_HANDLE_VALUE;
 static uint8_t  g_YacWriteBuf[1024];
-static bool     g_YacInitialized = false;
-static std::mutex                      g_YacMutex;
-static std::vector<std::vector<uint8_t>> g_YacReads;
+static std::once_flag g_YacInitOnce;
+static std::mutex g_YacMutex;
+static std::vector<uint8_t> g_YacReadQueue;
+static bool g_YacNoDataLogged = false;
 
 static void YacReaderThread()
 {
 	SetCurrentThreadName("Chihiro YAC Reader");
-	g_YacPipe = CreateFileA(
-		"\\\\.\\pipe\\YACardEmu",
-		GENERIC_READ | GENERIC_WRITE,
-		0,              // no sharing
-		NULL,           // default security
-		OPEN_EXISTING,
-		FILE_FLAG_OVERLAPPED,
-		NULL);
-
-	if (g_YacPipe == INVALID_HANDLE_VALUE) {
-		JvsLog("YAC: failed to open pipe (error %u) — card reader disabled\n", GetLastError());
-		return;
-	}
-	JvsLog("YAC: connected to \\\\.\\pipe\\YACardEmu\n");
-
 	while (true) {
 		uint8_t buf[64];
 		DWORD   read = 0;
@@ -719,29 +887,56 @@ static void YacReaderThread()
 					GetOverlappedResult(g_YacPipe, &ol, &read, TRUE);
 					read = 0;
 				}
+			} else {
+				CloseHandle(ol.hEvent);
+				JvsLog("YAC: pipe read stopped (error %u)\n", err);
+				break;
 			}
 		}
 		CloseHandle(ol.hEvent);
 
 		if (read > 0) {
 			std::lock_guard<std::mutex> lock(g_YacMutex);
-			g_YacReads.push_back(std::vector<uint8_t>(buf, buf + read));
+			g_YacReadQueue.insert(g_YacReadQueue.end(), buf, buf + read);
+			g_YacNoDataLogged = false;
 		}
 	}
 }
 
-static void YacInit()
+static bool YacInit()
 {
-	if (!g_YacInitialized) {
-		g_YacInitialized = true;
+	if (!IsWanganPeripheral())
+		return false;
+
+	std::call_once(g_YacInitOnce, [] {
+		static constexpr char kYacPipeName[] = "\\\\.\\pipe\\YACardEmu";
+		g_YacPipe = CreateFileA(
+			kYacPipeName,
+			GENERIC_READ | GENERIC_WRITE,
+			0,
+			NULL,
+			OPEN_EXISTING,
+			FILE_FLAG_OVERLAPPED,
+			NULL);
+
+		if (g_YacPipe == INVALID_HANDLE_VALUE) {
+			JvsLog(
+				"YAC: failed to open %s (error %u); card reader disabled\n",
+				kYacPipeName,
+				GetLastError());
+			return;
+		}
+
+		JvsLog("YAC: connected to %s\n", kYacPipeName);
 		std::thread(YacReaderThread).detach();
-	}
+	});
+	return g_YacPipe != INVALID_HANDLE_VALUE;
 }
 
 DWORD WINAPI xbox::EMUPATCH(JvsScReceiveRs323c)
 (
 	PUCHAR Buffer,
-	DWORD Length,
+	PDWORD Length,
 	DWORD a3
 )
 {
@@ -751,19 +946,36 @@ DWORD WINAPI xbox::EMUPATCH(JvsScReceiveRs323c)
 		LOG_FUNC_ARG(a3)
 		LOG_FUNC_END
 
-	YacInit();
+	if (Length == nullptr)
+		return static_cast<DWORD>(-1);
+
+	const DWORD capacity = *Length;
+	*Length = 0;
+	if (Buffer == nullptr || capacity == 0 || !YacInit())
+		return static_cast<DWORD>(-1);
 
 	std::lock_guard<std::mutex> lock(g_YacMutex);
-	if (g_YacReads.empty()) {
-		JvsLog("JvsScReceiveRs323c: no data available\n");
-		return static_cast<DWORD>(-1);  // no data available
+	if (g_YacReadQueue.empty()) {
+		if (!g_YacNoDataLogged) {
+			JvsLog(
+				"JvsScReceiveRs323c: waiting for YACardEmu data "
+				"(capacity=%u flags=0x%08X)\n",
+				capacity,
+				a3);
+			g_YacNoDataLogged = true;
+		}
+		return static_cast<DWORD>(-1);
 	}
 
-	std::vector<uint8_t> pkt = std::move(g_YacReads.front());
-	g_YacReads.erase(g_YacReads.begin());
-
-	DWORD copyLen = (DWORD)pkt.size() < Length ? (DWORD)pkt.size() : Length;
-	memcpy(Buffer, pkt.data(), copyLen);
+	const DWORD copyLen = (std::min)(
+		capacity,
+		static_cast<DWORD>(g_YacReadQueue.size()));
+	memcpy(Buffer, g_YacReadQueue.data(), copyLen);
+	g_YacReadQueue.erase(
+		g_YacReadQueue.begin(),
+		g_YacReadQueue.begin() + copyLen);
+	*Length = copyLen;
+	g_YacNoDataLogged = false;
 	JvsLog("JvsScReceiveRs323c: received %u bytes from YACardEmu\n", copyLen);
 	return 0;
 }
@@ -782,10 +994,8 @@ DWORD WINAPI xbox::EMUPATCH(JvsScSendRs323c)
 		LOG_FUNC_ARG(a3)
 		LOG_FUNC_END
 
-	YacInit();
-
-	if (g_YacPipe == INVALID_HANDLE_VALUE) {
-		JvsLog("JvsScSendRs323c: pipe not connected — dropping %u bytes\n", Length);
+	if (Buffer == nullptr || Length == 0 || !YacInit()) {
+		JvsLog("JvsScSendRs323c: pipe not connected; dropping %u bytes\n", Length);
 		return static_cast<DWORD>(-1);
 	}
 

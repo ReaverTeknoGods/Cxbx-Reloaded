@@ -43,6 +43,9 @@ static constexpr char system_devkit[] = "devkit";
 static constexpr char system_chihiro[] = "chihiro";
 static constexpr char fullscreen[] = "fs";
 static constexpr char windowed[] = "win";
+static constexpr char perf_trace[] = "perf-trace";
+static constexpr char render_trace[] = "render-trace";
+static constexpr char full_trace[] = "full-trace";
 
 bool GenConfig(char** argv, int argc);
 size_t ConfigSize();

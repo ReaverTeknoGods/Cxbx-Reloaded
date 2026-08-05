@@ -38,6 +38,8 @@
 #include "core\kernel\support\Emu.h" // For EmuLog(LOG_LEVEL::WARNING, )
 #include "core\kernel\support\EmuFile.h" // For CxbxCreateSymbolicLink(), etc.
 #include "core/kernel/support/NativeHandle.h" // For Xbox objects to native handle and back
+#include "core\kernel\exports\EmuKrnlKe.h"
+#include "common/BetaConfig.h"
 #include "CxbxDebugger.h"
 
 static void IopClearStackLocation(IN xbox::PIO_STACK_LOCATION IoStackLocation)
@@ -414,6 +416,33 @@ XBSYSAPI EXPORTNUM(66) xbox::ntstatus_xt NTAPI xbox::IoCreateFile
 		LOG_FUNC_ARG_TYPE(CREATE_OPTION, CreateOptions)
 		LOG_FUNC_ARG(Options)
 		LOG_FUNC_END;
+	const void* CallerAddress = _ReturnAddress();
+	const PKTHREAD CurrentThread = KeGetCurrentThread();
+	const PSTRING TraceObjectName =
+		ObjectAttributes != nullptr ? ObjectAttributes->ObjectName : nullptr;
+	const int TraceObjectNameLength =
+		TraceObjectName != nullptr && TraceObjectName->Buffer != nullptr
+		? (TraceObjectName->Length < 511
+			? static_cast<int>(TraceObjectName->Length)
+			: 511)
+		: 0;
+	BetaTrace_Record(
+		"FILE_OPEN_ENTER",
+		"caller=%p guest=%08X root=%08X desired=%08X share=%08X disposition=%u create_options=%08X options=%08X path=\"%.*s\"",
+		CallerAddress,
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+			reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+		ObjectAttributes != nullptr
+			? static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+				ObjectAttributes->RootDirectory))
+			: 0,
+		static_cast<unsigned int>(DesiredAccess),
+		static_cast<unsigned int>(ShareAccess),
+		static_cast<unsigned int>(Disposition),
+		static_cast<unsigned int>(CreateOptions),
+		static_cast<unsigned int>(Options),
+		TraceObjectNameLength,
+		TraceObjectNameLength > 0 ? TraceObjectName->Buffer : "");
 
 	// TODO: This may need removal and use actual driver for Chihiro.
 	//       Check if there's another branch has chihiro support somewhere? I think nope.
@@ -421,6 +450,15 @@ XBSYSAPI EXPORTNUM(66) xbox::ntstatus_xt NTAPI xbox::IoCreateFile
 	if (g_bIsChihiro) {
 		if (strncmp(ObjectAttributes->ObjectName->Buffer, DriveMbcom.c_str(), DriveMbcom.length()) == 0) {
 			*FileHandle = CHIHIRO_MBCOM_HANDLE;
+			BetaTrace_Record(
+				"FILE_OPEN_EXIT",
+				"caller=%p guest=%08X result=%08X xbox_file=%08X special=chihiro_mbcom_drive",
+				CallerAddress,
+				static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+					reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+				static_cast<unsigned int>(X_STATUS_SUCCESS),
+				static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+					*FileHandle)));
 			return X_STATUS_SUCCESS;
 		}
 	}
@@ -504,6 +542,15 @@ XBSYSAPI EXPORTNUM(66) xbox::ntstatus_xt NTAPI xbox::IoCreateFile
 	if (g_bIsChihiro) {
 		if (strncmp(ObjectAttributes->ObjectName->Buffer, mbcom.c_str(), mbcom.length()) == 0) {
 			*FileHandle = CHIHIRO_MBCOM_HANDLE;
+			BetaTrace_Record(
+				"FILE_OPEN_EXIT",
+				"caller=%p guest=%08X result=%08X xbox_file=%08X special=chihiro_mbcom",
+				CallerAddress,
+				static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+					reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+				static_cast<unsigned int>(X_STATUS_SUCCESS),
+				static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+					*FileHandle)));
 			return X_STATUS_SUCCESS;
 		}
 	}
@@ -599,6 +646,23 @@ XBSYSAPI EXPORTNUM(66) xbox::ntstatus_xt NTAPI xbox::IoCreateFile
 			LOG_FUNC_ARG_RESULT(FileHandle)
 		LOG_FUNC_END_ARG_RESULT;
 	}
+	BetaTrace_Record(
+		"FILE_OPEN_EXIT",
+		"caller=%p guest=%08X result=%08X xbox_file=%08X iosb_status=%08X iosb_info=%u",
+		CallerAddress,
+		static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+			reinterpret_cast<PETHREAD>(CurrentThread)->UniqueThread)),
+		static_cast<unsigned int>(result),
+		X_NT_SUCCESS(result)
+			? static_cast<unsigned int>(reinterpret_cast<ULONG_PTR>(
+				*FileHandle))
+			: 0,
+		IoStatusBlock != nullptr
+			? static_cast<unsigned int>(IoStatusBlock->Status)
+			: 0,
+		IoStatusBlock != nullptr
+			? static_cast<unsigned int>(IoStatusBlock->Information)
+			: 0);
 
 	RETURN(result);
 }
@@ -1235,7 +1299,7 @@ xbox::ntstatus_xt IopQueryDeviceInformation
 	if (const auto& nhandle = GetObjectNativeHandle(FileObject)) {
 
 		NativeObjectAttributes nativeObjectAttributes;
-		NtDll::FILE_NETWORK_OPEN_INFORMATION nativeNetOpenInfo;
+		NtDll::FILE_NETWORK_OPEN_INFORMATION nativeNetOpenInfo{};
 		nativeObjectAttributes.wszObjectName[0] = NULL;
 		NtDll::RtlInitUnicodeString(&nativeObjectAttributes.NtUnicodeString, nativeObjectAttributes.wszObjectName);
 		// And initialize the NT ObjectAttributes with that :
@@ -1246,11 +1310,33 @@ xbox::ntstatus_xt IopQueryDeviceInformation
 			nativeObjectAttributes.NtObjAttrPtr,
 			&nativeNetOpenInfo);
 
-		// Convert Attributes to Xbox
-		NTToXboxFileInformation(&nativeNetOpenInfo, FileInformation, FileNetworkOpenInformation, sizeof(xbox::FILE_NETWORK_OPEN_INFORMATION));
+		// Wine can reject an empty path relative to an already-open file handle
+		// with STATUS_BAD_DEVICE_TYPE. Querying the same information directly
+		// from that handle is equivalent and is also supported by Windows.
+		if (FAILED(result)) {
+			NtDll::IO_STATUS_BLOCK ioStatusBlock{};
+			result = NtDll::NtQueryInformationFile(
+				*nhandle,
+				&ioStatusBlock,
+				&nativeNetOpenInfo,
+				sizeof(nativeNetOpenInfo),
+				NtDll::FileNetworkOpenInformation);
+		}
 
 		if (FAILED(result)) {
 			EmuLog(LOG_LEVEL::WARNING, "NtQueryFullAttributesFile failed! (0x%.08X)", result);
+		}
+		else {
+			// Convert Attributes to Xbox only after a native query succeeds.
+			result = NTToXboxFileInformation(
+				&nativeNetOpenInfo,
+				FileInformation,
+				FileNetworkOpenInformation,
+				sizeof(xbox::FILE_NETWORK_OPEN_INFORMATION));
+			if (ReturnedLength != nullptr && X_NT_SUCCESS(result)) {
+				*ReturnedLength =
+					sizeof(xbox::FILE_NETWORK_OPEN_INFORMATION);
+			}
 		}
 	}
 	else {

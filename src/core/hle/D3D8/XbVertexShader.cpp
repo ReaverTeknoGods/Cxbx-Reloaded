@@ -38,6 +38,7 @@
 #include "core\hle\D3D8\Direct3D9\Shader.h" // For g_ShaderSources
 #include "core\hle\D3D8\XbVertexBuffer.h" // For CxbxImpl_SetVertexData4f
 #include "core\hle\D3D8\XbVertexShader.h"
+#include "common\RenderTrace.h"
 #include "common/PerfTrace.h"
 #include "core\hle\D3D8\XbD3D8Logging.h" // For DEBUG_D3DRESULT
 #include "devices\xbox.h"
@@ -936,8 +937,14 @@ private:
 		if (slot.Offset >= CurrentXboxStreamEnd) {
 			pCurrentVertexShaderStreamInfo->HostVertexStride +=
 				static_cast<WORD>(slot.Offset - CurrentXboxStreamEnd);
+		} else {
+			// Overlapping declarations are legal enough to leave in their
+			// existing sequential host layout, but each element must still be
+			// read from its own declared Xbox offset.
+			LOG_TEST_CASE("Overlapping vertex declaration elements");
 		}
 
+		pCurrentVertexShaderStreamElementInfo->XboxRegister = (BYTE)VertexRegister;
 		pCurrentVertexShaderStreamElementInfo->XboxType = XboxVertexElementDataType;
 		pCurrentVertexShaderStreamElementInfo->XboxOffset = (WORD)slot.Offset;
 		pCurrentVertexShaderStreamElementInfo->XboxByteSize = XboxVertexElementByteSize;
@@ -1334,6 +1341,37 @@ CxbxVertexDeclaration* CxbxGetVertexDeclaration()
 
 		// Cache resulting declarations from given inputs
 		pCxbxVertexDeclaration->Key = XboxVertexAttributesKey;
+		for (UINT streamOrdinal = 0;
+			streamOrdinal < pCxbxVertexDeclaration->NumberOfVertexStreams;
+			++streamOrdinal) {
+			const CxbxVertexShaderStreamInfo& stream =
+				pCxbxVertexDeclaration->VertexStreams[streamOrdinal];
+			RenderTrace_RecordVertexDeclaration(
+				XboxVertexAttributesKey,
+				g_Xbox_VertexShaderMode == VertexShaderMode::FixedFunction,
+				streamOrdinal,
+				stream.XboxStreamIndex,
+				stream.NeedPatch != FALSE,
+				stream.HostVertexStride,
+				stream.NumberOfVertexElements);
+			for (UINT elementOrdinal = 0;
+				elementOrdinal < stream.NumberOfVertexElements;
+				++elementOrdinal) {
+				const CxbxVertexShaderStreamElement& element =
+					stream.VertexElements[elementOrdinal];
+				RenderTrace_RecordVertexDeclarationElement(
+					XboxVertexAttributesKey,
+					streamOrdinal,
+					elementOrdinal,
+					element.XboxRegister,
+					element.XboxOffset,
+					element.XboxType,
+					element.XboxByteSize,
+					element.HostOffset,
+					element.HostDataType,
+					element.HostByteSize);
+			}
+		}
 		RegisterCxbxVertexDeclaration(XboxVertexAttributesKey, pCxbxVertexDeclaration);
 	}
 
@@ -1361,7 +1399,7 @@ void CxbxUpdateHostVertexDeclaration()
 		for (int i = 0; i < X_VSH_MAX_ATTRIBUTES; i++) {
 			vertexDefaultFlags[i] = pCxbxVertexDeclaration->vRegisterInDeclaration[i] ? 0.0f : 1.0f;
 		}
-		g_pD3DDevice->SetVertexShaderConstantF(CXBX_D3DVS_CONSTREG_VREGDEFAULTS_FLAG_BASE, vertexDefaultFlags, CXBX_D3DVS_CONSTREG_VREGDEFAULTS_FLAG_SIZE);
+		CxbxSetVertexShaderConstantF(CXBX_D3DVS_CONSTREG_VREGDEFAULTS_FLAG_BASE, vertexDefaultFlags, CXBX_D3DVS_CONSTREG_VREGDEFAULTS_FLAG_SIZE);
 	}
 }
 

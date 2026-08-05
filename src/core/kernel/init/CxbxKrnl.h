@@ -192,6 +192,11 @@ extern char szFilePath_Xbe[xbox::max_path*2];
 // Returns the last Win32 error, in string format. Returns an empty string if there is no error.
 extern std::string CxbxGetLastErrorString(char * lpszFunction);
 
+// True only when the current launch explicitly enabled kernel diagnostics.
+// Android uses this to keep Release sessions quiet by default while retaining
+// TPUI's per-game troubleshooting toggle.
+bool CxbxrKrnlDebugLoggingEnabled();
+
 // The reason of having EmuLogOutputEx in LOG_TEST_CASE is to allow dump to log directly for any test cases triggered.
 // Which will make developers easier to note which applications has triggered quicker, easier, and doesn't require any individual log enabled to capture them.
 // NOTE: This #define is here rather than Logging.h, because it has a dependency on CxbxKrnl_Xbe

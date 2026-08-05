@@ -41,6 +41,37 @@
 #include "common/util/cliConverter.hpp"
 #include "common/util/cliConfig.hpp"
 
+namespace
+{
+	constexpr SIZE_T AndroidWineEmulationStackSize = 16 * 1024 * 1024;
+
+	struct AndroidWineEmulationContext
+	{
+		unsigned int reservedSystems;
+		blocks_reserved_t blocksReserved;
+	};
+
+	DWORD WINAPI AndroidWineEmulationThread(LPVOID parameter)
+	{
+		auto* context =
+			static_cast<AndroidWineEmulationContext*>(parameter);
+		CxbxKrnlEmulate(
+			context->reservedSystems,
+			context->blocksReserved);
+		return EXIT_SUCCESS;
+	}
+
+	bool UseAndroidWineEmulationStack()
+	{
+		char enabled[2] = {};
+		return GetEnvironmentVariableA(
+			"TP_ANDROID_CXBXR_LARGE_STACK",
+			enabled,
+			sizeof(enabled)) != 0 &&
+			enabled[0] == '1';
+	}
+}
+
 PCHAR*
 CommandLineToArgvA(
 	PCHAR CmdLine,
@@ -156,15 +187,19 @@ DWORD WINAPI Emulate(unsigned int reserved_systems, blocks_reserved_t blocks_res
 		return EXIT_FAILURE;
 	}
 
-	// Enable perf tracing if --perf-trace flag present
-	for (int i = 0; i < argc; i++) {
-		if (argv[i] && _stricmp(argv[i], "--perf-trace") == 0) {
-			g_PerfTraceEnabled = true;
-		}
-		if (argv[i] && _stricmp(argv[i], "--render-trace") == 0) {
-			g_RenderTraceEnabled = true;
-		}
-	}
+	// The CLI normalizes both /key and --key into the config map. Reading
+	// tracing from that map also preserves it across Chihiro QuickReboot.
+#if defined(_DEBUG)
+	g_FullTraceEnabled = cli_config::hasKey(cli_config::full_trace);
+	g_PerfTraceEnabled =
+		g_FullTraceEnabled || cli_config::hasKey(cli_config::perf_trace);
+	g_RenderTraceEnabled =
+		g_FullTraceEnabled || cli_config::hasKey(cli_config::render_trace);
+#else
+	g_FullTraceEnabled = false;
+	g_PerfTraceEnabled = false;
+	g_RenderTraceEnabled = false;
+#endif
 	LocalFree(argv);
 
 	/*! verify load argument is included */
@@ -198,7 +233,40 @@ DWORD WINAPI Emulate(unsigned int reserved_systems, blocks_reserved_t blocks_res
 		return EXIT_FAILURE;
 	}
 
-	CxbxKrnlEmulate(reserved_systems, blocks_reserved);
+	if (UseAndroidWineEmulationStack()) {
+		// Wine's WoW64 SEH dispatcher rejects an exception frame once CXBXR
+		// crosses the original host thread's stack limit. Keep the loader PE
+		// header unchanged because increasing its image stack reservation
+		// interferes with CXBXR's fixed low-address mappings. Instead, copy the
+		// reservation bitmap and run emulation on an explicitly larger stack.
+		AndroidWineEmulationContext context = {};
+		context.reservedSystems = reserved_systems;
+		memcpy(
+			context.blocksReserved,
+			blocks_reserved,
+			sizeof(context.blocksReserved));
+
+		HANDLE emulationThread = CreateThread(
+			nullptr,
+			AndroidWineEmulationStackSize,
+			AndroidWineEmulationThread,
+			&context,
+			STACK_SIZE_PARAM_IS_A_RESERVATION,
+			nullptr);
+		if (emulationThread == nullptr) {
+			PopupError(
+				nullptr,
+				"Could not create the Android Wine emulation thread.");
+			EmuShared::Cleanup();
+			return EXIT_FAILURE;
+		}
+
+		WaitForSingleObject(emulationThread, INFINITE);
+		CloseHandle(emulationThread);
+	}
+	else {
+		CxbxKrnlEmulate(reserved_systems, blocks_reserved);
+	}
 
 	// QoD debug: log normal exit
 #if defined(_DEBUG)

@@ -27,13 +27,16 @@
 #include "PatchUtil.h"
 #include "ChihiroPatches.h"
 #include "core\kernel\support\Emu.h"
+#include "core\kernel\init\CxbxKrnl.h"
 #include "devices\chihiro\JvsIo.h"
 #include <cstdio>
+#include <cstring>
 #include <Windows.h>
 #include <intrin.h>
 
 #if defined(_DEBUG)
 #define GOLF_LOG(fmt, ...) do { \
+	if (!CxbxrKrnlDebugLoggingEnabled()) break; \
 	FILE* _f = fopen("C:\\temp\\golf_patches.log", "a"); \
 	if (_f) { fprintf(_f, fmt "\n", ##__VA_ARGS__); fclose(_f); } \
 	printf(fmt "\n", ##__VA_ARGS__); \
@@ -44,11 +47,30 @@
 
 // ── Card file I/O ────────────────────────────────────────────────
 
-static const char g_golfCardPath[] = "C:\\arcade\\cxbx\\Sega Golf Club Network Pro Tour 2005 (Rev C)\\card.bin";
-static const char g_golfICCDCardPath[] = "C:\\arcade\\cxbx\\Sega Golf Club Network Pro Tour 2005 (Rev C)\\card_iccd.bin";
+static char g_golfCardPath[MAX_PATH] = {};
+static char g_golfICCDCardPath[MAX_PATH] = {};
 static volatile bool g_golfCardOpActive = false;  // set during card operations to suppress guardian writes
 
+// Build card file paths relative to the XBE directory
+static void GolfInitCardPaths() {
+	if (g_golfCardPath[0] != '\0') return; // already initialized
+	// Get directory of the loaded XBE
+	char xbeDir[MAX_PATH];
+	strncpy(xbeDir, szFilePath_Xbe, MAX_PATH - 1);
+	xbeDir[MAX_PATH - 1] = '\0';
+	// Strip filename to get directory
+	char* lastSlash = strrchr(xbeDir, '\\');
+	if (!lastSlash) lastSlash = strrchr(xbeDir, '/');
+	if (lastSlash) *(lastSlash + 1) = '\0';
+	else strcat(xbeDir, "\\");
+	snprintf(g_golfCardPath, MAX_PATH, "%scard.bin", xbeDir);
+	snprintf(g_golfICCDCardPath, MAX_PATH, "%scard_iccd.bin", xbeDir);
+	GOLF_LOG("[CARD] Card path: %s", g_golfCardPath);
+	GOLF_LOG("[CARD] ICCD path: %s", g_golfICCDCardPath);
+}
+
 static bool GolfLoadCard(uint8_t* dest, size_t maxLen) {
+	GolfInitCardPaths();
 	FILE* f = fopen(g_golfCardPath, "rb");
 	if (!f) return false;
 	fseek(f, 0, SEEK_END);
@@ -62,6 +84,7 @@ static bool GolfLoadCard(uint8_t* dest, size_t maxLen) {
 }
 
 static bool GolfSaveCard(const uint8_t* src, size_t len) {
+	GolfInitCardPaths();
 	FILE* f = fopen(g_golfCardPath, "wb");
 	if (!f) { GOLF_LOG("[CARD] Failed to open card.bin for writing"); return false; }
 	size_t w = fwrite(src, 1, len, f);
@@ -217,6 +240,7 @@ static void GolfICCDMakeEmptyTrack(uint8_t* track) {
 
 // Load ICCD card file into the search buffer (byte_676618)
 static bool GolfICCDLoadCard(uint8_t* searchBuf) {
+	GolfInitCardPaths();
 	memset(searchBuf, 0, ICCD_SEARCH_BUF_SIZE);
 
 	uint8_t fileData[ICCD_FILE_SIZE];
@@ -257,6 +281,7 @@ static bool GolfICCDLoadCard(uint8_t* searchBuf) {
 // Save card data to ICCD card file
 // writeData points to byte_677148 (write buffer: [0]=count, [4..]=track data)
 static bool GolfICCDSaveCard(const uint8_t* writeData) {
+	GolfInitCardPaths();
 	uint8_t fileData[ICCD_FILE_SIZE];
 
 	// Load existing file or create blank
@@ -1369,7 +1394,7 @@ void ApplyGolfPatches(uint64_t xbeHash, uint32_t imageSize)
 
 	// Write marker file so we know patches are running
 #if defined(_DEBUG)
-	{
+	if (CxbxrKrnlDebugLoggingEnabled()) {
 		FILE* f = fopen("C:\\temp\\golf_patches.log", "w");
 		if (f) { fprintf(f, "GolfPatch: start (imageSize=0x%X)\n", imageSize); fclose(f); }
 	}

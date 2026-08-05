@@ -67,11 +67,16 @@ extern uint32_t g_ChihiroBackbufferOverrideW;
 extern uint32_t g_ChihiroBackbufferOverrideH;
 
 // Apply patches for OutRun 2 / OutRun 2 SP.
+extern bool g_ChihiroOutRun2Game;
 bool IsOutRun2Xbe(uint64_t xbeHash);
 void ApplyOutRun2Patches(uint64_t xbeHash, uint32_t imageSize);
 
 // Apply patches for Quest of D.
 bool IsQuestOfDXbe(uint64_t xbeHash);
 void ApplyQuestOfDPatches(uint64_t xbeHash, uint32_t imageSize);
+
+// Apply patches for Ghost Squad.
+bool IsGhostSquadXbe(uint64_t xbeHash);
+void ApplyGhostSquadPatches(uint64_t xbeHash, uint32_t imageSize);
 
 #endif // CHIHIRO_PATCHES_H

@@ -166,7 +166,7 @@ DWORD WINAPI EMUPATCH(JvsScSendMidi)
 DWORD WINAPI EMUPATCH(JvsScReceiveRs323c)
 	(
 		PUCHAR Buffer,
-		DWORD Length,
+		PDWORD Length,
 		DWORD a3
 		);
 

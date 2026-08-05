@@ -41,6 +41,7 @@
 
 typedef struct _CxbxVertexShaderStreamElement
 {
+	BYTE XboxRegister; // Xbox vertex input register populated by this element
 	UINT XboxType; // The stream element data type (xbox)
 	WORD XboxOffset; // Byte offset of the element in the Xbox stream
 	UINT XboxByteSize; // The stream element data size (xbox)
@@ -246,6 +247,8 @@ inline xbox::X_D3DVertexShader *VshHandleToXboxVertexShader(DWORD Handle) { retu
 extern int GetXboxVertexDataComponentCount(int d3dvsdt);
 
 extern bool g_Xbox_VertexShader_IsFixedFunction;
+extern unsigned g_Xbox_SetVertexShaderInput_Count;
+
 extern CxbxVertexDeclaration* CxbxGetVertexDeclaration();
 extern xbox::X_STREAMINPUT& GetXboxVertexStreamInput(unsigned XboxStreamNumber);
 
