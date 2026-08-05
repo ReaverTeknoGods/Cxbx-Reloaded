@@ -56,7 +56,9 @@
 #include <clocale>
 #include <process.h>
 #include <sstream> // For std::ostringstream
+#if defined(_DEBUG)
 #include <dbghelp.h> // For MiniDumpWriteDump
+#endif
 
 #include "devices\EEPROMDevice.h" // For g_EEPROM
 #include "devices\Xbox.h" // For InitXboxHardware()
@@ -135,6 +137,7 @@ void SetupPerTitleKeys()
 
 }
 
+#if defined(_DEBUG)
 static void WriteCrashDump(EXCEPTION_POINTERS* ep, const char* tag)
 {
 	// Use Win32 API only — CRT/heap may be corrupted
@@ -190,6 +193,7 @@ static void WriteCrashDump(EXCEPTION_POINTERS* ep, const char* tag)
 		CloseHandle(hLog);
 	}
 }
+#endif
 
 xbox::void_xt NTAPI CxbxLaunchXbe(xbox::PVOID Entry)
 {
@@ -197,11 +201,15 @@ xbox::void_xt NTAPI CxbxLaunchXbe(xbox::PVOID Entry)
 	char msg[128];
 	sprintf_s(msg, sizeof(msg), "OEP = 0x%08X\n\nAttach debugger now, then click OK.", (DWORD)(uintptr_t)Entry);
 	//MessageBoxA(nullptr, msg, "Cxbx OEP Break", MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
+	#if defined(_DEBUG)
 	__try {
 		static_cast<void(*)()>(Entry)();
 	} __except(WriteCrashDump(GetExceptionInformation(), "seh"), EXCEPTION_CONTINUE_SEARCH) {
 		// SEH filter already wrote the dump; continue search for VEH/UEF handlers
 	}
+	#else
+	static_cast<void(*)()>(Entry)();
+	#endif
 	EmuLogInit(LOG_LEVEL::DEBUG, "XBE entry point returned");
 }
 

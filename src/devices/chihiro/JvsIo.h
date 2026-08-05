@@ -35,7 +35,7 @@
 #include <cstdio>
 #include <mutex>
 
-#ifdef JVS_LOG
+#if defined(JVS_LOG) && defined(_DEBUG)
 // Shared log function — writes to the jvs_io.log file opened by JvsIo::OpenLog()
 extern FILE* g_JvsLogFile;
 void JvsLog(const char* fmt, ...);

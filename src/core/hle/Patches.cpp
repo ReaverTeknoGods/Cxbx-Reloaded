@@ -536,6 +536,7 @@ void EmuInstallPatches()
 	uint64_t xbeHash = ComputeHash((void*)&CxbxKrnl_Xbe->m_Header, sizeof(Xbe::Header));
 	uint32_t titleId = CxbxKrnl_Xbe->m_Certificate.dwTitleId;
 
+#if defined(_DEBUG)
 	printf("EmuInstallPatches: titleId=0x%08X imageSize=0x%X hash=0x%016llX\n", titleId, imageSize, (unsigned long long)xbeHash);
 	{
 		FILE* f = fopen("C:\\temp\\patch_dispatch.log", "w");
@@ -547,6 +548,7 @@ void EmuInstallPatches()
 			fclose(f);
 		}
 	}
+#endif
 
 	ApplyJvsWatchdogPatch(imageSize);
 

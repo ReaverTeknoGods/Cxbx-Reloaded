@@ -35,11 +35,15 @@
 #include <Windows.h>
 #include <intrin.h>
 
+#if defined(_DEBUG)
 #define G2006_LOG(fmt, ...) do { \
 	FILE* _f = fopen("C:\\temp\\golf2006_patches.log", "a"); \
 	if (_f) { fprintf(_f, fmt "\n", ##__VA_ARGS__); fclose(_f); } \
 	printf(fmt "\n", ##__VA_ARGS__); \
 } while(0)
+#else
+#define G2006_LOG(...) do {} while(0)
+#endif
 
 // ── SGC2006 Address Constants ────────────────────────────────────
 
@@ -830,10 +834,12 @@ void ApplyGolf2006Patches(uint64_t xbeHash, uint32_t imageSize)
 	g_ChihiroBackbufferOverrideH = 600;
 
 	// Write marker file
+#if defined(_DEBUG)
 	{
 		FILE* f = fopen("C:\\temp\\golf2006_patches.log", "w");
 		if (f) { fprintf(f, "Golf2006: start (imageSize=0x%X)\n", imageSize); fclose(f); }
 	}
+#endif
 
 	// ══════════════════════════════════════════════════════════════
 	// SECTION 1: Pattern-based patches (shared Sega library code)

@@ -34,6 +34,7 @@
 // ******************************************************************
 
 /* PMC - card master control */
+#if defined(_DEBUG)
 static void NvPmcProbeLog(xbox::addr_xt addr, uint32_t value)
 {
 	static int probeLogCount = 0;
@@ -51,6 +52,7 @@ static void NvPmcProbeLog(xbox::addr_xt addr, uint32_t value)
 	fclose(logFile);
 	probeLogCount++;
 }
+#endif
 
 DEVICE_READ32(PMC)
 {
@@ -73,7 +75,9 @@ DEVICE_READ32(PMC)
 		break;
 	}
 
+#if defined(_DEBUG)
 	NvPmcProbeLog(addr, result);
+#endif
 	DEVICE_READ32_END(PMC);
 }
 
@@ -97,5 +101,4 @@ DEVICE_WRITE32(PMC)
 
 	DEVICE_WRITE32_END(PMC);
 }
-
 

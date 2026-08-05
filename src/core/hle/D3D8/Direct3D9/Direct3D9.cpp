@@ -2976,7 +2976,9 @@ void Direct3D_CreateDevice_End
         // At this point, g_pXbox_BackBufferSurface should now point to a valid render target
         // if it still doesn't, we cannot continue without crashing at draw time
         if (g_pXbox_BackBufferSurface == xbox::zeroptr) {
+#if defined(_DEBUG)
             LOG_TEST_CASE("Unable to determine default Xbox backbuffer (non-fatal for Chihiro)");
+#endif
             // Don't abort — Chihiro games may set the render target later
         }
 
@@ -3287,9 +3289,11 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(Direct3D_CreateDevice)
 
 	// Per-game backbuffer override (e.g. Chihiro golf games need 1024x768)
 	if (g_ChihiroBackbufferOverrideW && g_ChihiroBackbufferOverrideH) {
+#if defined(_DEBUG)
 		EmuLog(LOG_LEVEL::INFO, "Overriding Xbox backbuffer %ux%u -> %ux%u",
 			pPresentationParameters->BackBufferWidth, pPresentationParameters->BackBufferHeight,
 			g_ChihiroBackbufferOverrideW, g_ChihiroBackbufferOverrideH);
+#endif
 		pPresentationParameters->BackBufferWidth = g_ChihiroBackbufferOverrideW;
 		pPresentationParameters->BackBufferHeight = g_ChihiroBackbufferOverrideH;
 	}
@@ -5393,18 +5397,22 @@ __declspec(naked) xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap_0__LTCG_ea
 // ******************************************************************
 // * patch: D3DDevice_Swap
 // ******************************************************************
+#if defined(_DEBUG)
 volatile uint32_t g_D3DSwapCounter = 0; // diagnostic: counts D3DDevice_Swap calls
 volatile uint32_t g_D3DSwapLastCaller = 0; // diagnostic: last caller return address
 volatile uint32_t g_D3DSwapGrandCaller = 0; // diagnostic: grandparent caller
+#endif
 xbox::dword_xt WINAPI xbox::EMUPATCH(D3DDevice_Swap)
 (
 	dword_xt Flags
 )
 {
+#if defined(_DEBUG)
 	g_D3DSwapCounter++;
 	g_D3DSwapLastCaller = (uint32_t)_ReturnAddress();
 	// Stack: [ret=0x21EE7] [Flags=0] [grandparent_caller]
 	g_D3DSwapGrandCaller = *((uint32_t*)_AddressOfReturnAddress() + 2);
+#endif
 	LOG_FUNC_ONE_ARG(Flags);
 	// MJ2-specific: force resource loading completion in early Phase 2 swaps
 	if (g_ChihiroMjGame == 1) {

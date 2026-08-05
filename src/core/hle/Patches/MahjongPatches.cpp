@@ -37,11 +37,15 @@ extern std::map<std::string, xbox::addr_xt> g_SymbolAddresses;
 
 int g_ChihiroMjGame = 0;  // 0=none, 1=MJ2, 2=MJ3, 3=MJ3Evo
 
+#if defined(_DEBUG)
 #define MJ_LOG(fmt, ...) do { \
 	printf("MahjongPatch: " fmt "\n", ##__VA_ARGS__); \
 	{ FILE* _mf = fopen("C:\\temp\\mj_patches.log","a"); \
 	  if(_mf){ fprintf(_mf, "MahjongPatch: " fmt "\n", ##__VA_ARGS__); fclose(_mf); } } \
 } while(0)
+#else
+#define MJ_LOG(...) do {} while(0)
+#endif
 
 // ── Feature toggles (1=enabled, 0=disabled) ─────────────────────
 #define MJ_LINKOK           1

@@ -38,8 +38,12 @@
 extern bool g_QodGamePatchesActive;
 
 // File-based media board command log (stdout may be buffered)
-// Set to 1 to enable logging to C:\temp\mb_log.txt
+// File logging is available only in Debug builds.
+#if defined(_DEBUG)
 #define MB_LOG_ENABLED 1
+#else
+#define MB_LOG_ENABLED 0
+#endif
 
 static FILE* g_mbLog = nullptr;
 uint32_t s_type3TableBase = 0; // exported for state monitor
@@ -737,7 +741,9 @@ void MediaBoard::ComWrite(uint32_t offset, void* buffer, uint32_t length)
         case MB_CMD_DIMM_SIZE: { // 0x0001
             // MAME returns 0x00f00000 (partition-related size value)
             *(uint32_t*)&outputBuffer[4] = 0x00f00000;
+#if defined(_DEBUG)
             EmuLog(LOG_LEVEL::DEBUG, "  MB_CMD_DIMM_SIZE -> 0x00f00000");
+#endif
             break;
         }
         case MB_CMD_STATUS: { // 0x0100
@@ -753,7 +759,9 @@ void MediaBoard::ComWrite(uint32_t offset, void* buffer, uint32_t length)
         }
         case MB_CMD_SYSTEM_TYPE: { // 0x0102
             *(uint32_t*)&outputBuffer[4] = 0; // MAME returns 0; bit 16 = develop mode
+#if defined(_DEBUG)
             EmuLog(LOG_LEVEL::DEBUG, "  MB_CMD_SYSTEM_TYPE -> 0 (normal)");
+#endif
             break;
         }
         case MB_CMD_SERIAL_NUMBER: { // 0x0103

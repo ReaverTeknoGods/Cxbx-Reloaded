@@ -586,8 +586,10 @@ XBSYSAPI EXPORTNUM(49) xbox::void_xt DECLSPEC_NORETURN NTAPI xbox::HalReturnToFi
 						gameExe.erase(0, 1);
 					if (!gameExe.empty()) {
 						XbePath = g_MediaBoard->GetMountPath() + "\\" + gameExe;
+#if defined(_DEBUG)
 						EmuLog(LOG_LEVEL::INFO, "Chihiro QuickReboot: launching %s XBE: %s",
 							g_bChihiroTestMode ? "test" : "game", XbePath.c_str());
+#endif
 					} else {
 						XbePath = g_MediaBoardBasePath + "\\" + MediaBoardRomFile;
 					}

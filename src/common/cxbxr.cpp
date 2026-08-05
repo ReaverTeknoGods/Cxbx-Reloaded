@@ -93,6 +93,7 @@ bool HandleFirstLaunch()
 [[noreturn]] void CxbxrShutDown(bool is_reboot)
 {
 	// QoD debug: log shutdown reason using Win32 API (bypasses CRT)
+#if defined(_DEBUG)
 	{
 		HANDLE hFile = CreateFileA("C:\\temp\\qod_shutdown.log", GENERIC_WRITE, FILE_SHARE_READ,
 			NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -106,6 +107,7 @@ bool HandleFirstLaunch()
 			CloseHandle(hFile);
 		}
 	}
+#endif
 
 	if (!is_reboot) {
 		// Clear all kernel boot flags. These (together with the shared memory) persist until Cxbx-Reloaded is closed otherwise.
@@ -161,6 +163,7 @@ bool HandleFirstLaunch()
 [[noreturn]] void CxbxrAbortEx(CXBXR_MODULE cxbxr_module, const char* szErrorMessage, ...)
 {
 	// QoD debug: log abort using Win32 API
+#if defined(_DEBUG)
 	{
 		char abortBuf[1024] = {0};
 		if (szErrorMessage) { va_list ap; va_start(ap, szErrorMessage); vsnprintf(abortBuf, sizeof(abortBuf)-1, szErrorMessage, ap); va_end(ap); }
@@ -176,6 +179,7 @@ bool HandleFirstLaunch()
 			CloseHandle(hFile);
 		}
 	}
+#endif
 
 	// print out error message (if exists)
 	if (szErrorMessage != NULL)

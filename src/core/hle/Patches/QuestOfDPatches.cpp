@@ -30,18 +30,24 @@
 #include "devices\chihiro\JvsIo.h"
 
 // D3D swap diagnostic — defined in Direct3D9.cpp
+#if defined(_DEBUG)
 extern volatile uint32_t g_D3DSwapCounter;
+#endif
 #include <cstdio>
 #include <windows.h>
 #include <psapi.h>
 #include <TlHelp32.h>
 
+#if defined(_DEBUG)
 #define QOD_LOG(fmt, ...) do { \
 	printf("QuestOfDPatch: " fmt "\n", ##__VA_ARGS__); \
 	{ FILE* _f = fopen("C:\\temp\\qod_patches.log","a"); \
 	  if(_f){ SYSTEMTIME _st; GetLocalTime(&_st); \
 	  fprintf(_f, "[%02d:%02d:%02d.%03d] QoD: " fmt "\n", _st.wHour,_st.wMinute,_st.wSecond,_st.wMilliseconds, ##__VA_ARGS__); fclose(_f); } } \
 } while(0)
+#else
+#define QOD_LOG(...) do {} while(0)
+#endif
 
 static void QodAtExit() {
 	QOD_LOG("*** atexit called — process is terminating ***");
@@ -100,6 +106,7 @@ static LONG WINAPI QodCrashHandler(EXCEPTION_POINTERS* ep)
 	}
 
 	// Use Win32 API only — CRT may be corrupted
+#if defined(_DEBUG)
 	HANDLE hFile = CreateFileA("C:\\temp\\qod_crash.log", FILE_APPEND_DATA, FILE_SHARE_READ|FILE_SHARE_WRITE,
 		NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (hFile != INVALID_HANDLE_VALUE) {
@@ -156,6 +163,7 @@ static LONG WINAPI QodCrashHandler(EXCEPTION_POINTERS* ep)
 		WriteFile(hFile, buf, len, &written, NULL);
 		CloseHandle(hFile);
 	}
+#endif
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -1218,8 +1226,10 @@ bool IsQuestOfDXbe(uint64_t xbeHash)
 void ApplyQuestOfDPatches(uint64_t xbeHash, uint32_t imageSize)
 {
 	AddVectoredExceptionHandler(1, QodCrashHandler);
+#if defined(_DEBUG)
 	atexit(QodAtExit);
 	remove("C:\\temp\\qod_crash.log");
+#endif
 
 	QodGame game = IdentifyQodGame(xbeHash);
 	const char* gameName = "???";

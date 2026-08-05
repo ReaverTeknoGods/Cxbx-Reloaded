@@ -141,30 +141,38 @@ DWORD CxbxGetStrideFromVertexDeclaration(CxbxVertexDeclaration* pCxbxVertexDecla
 }
 
 // Draw mode counters for diagnostic
+#if defined(_DEBUG)
 volatile uint32_t s_drawArraysCount = 0;
 volatile uint32_t s_drawInlineBufferCount = 0;
 volatile uint32_t s_drawInlineArrayCount = 0;
 volatile uint32_t s_drawInlineElementsCount = 0;
+#endif
 
 void HLE_draw_arrays(NV2AState *d)
 {
+#if defined(_DEBUG)
 	s_drawArraysCount++;
 	if ((s_drawArraysCount & 0xFF) == 1) {
 		LOG_TEST_CASE("HLE_draw_arrays");
 	}
+#endif
 }
 
 void HLE_draw_inline_buffer(NV2AState *d)
 {
+#if defined(_DEBUG)
 	s_drawInlineBufferCount++;
 	if ((s_drawInlineBufferCount & 0xFF) == 1) {
 		LOG_TEST_CASE("HLE_draw_inline_buffer");
 	}
+#endif
 }
 
 void HLE_draw_inline_array(NV2AState *d)
 {
+#if defined(_DEBUG)
 	s_drawInlineArrayCount++;
+#endif
 	PGRAPHState *pg = &d->pgraph;
 
 	//DWORD vertex data array, 
@@ -194,7 +202,9 @@ void HLE_draw_inline_array(NV2AState *d)
 
 void HLE_draw_inline_elements(NV2AState *d)
 {
+#if defined(_DEBUG)
 	s_drawInlineElementsCount++;
+#endif
 	PGRAPHState *pg = &d->pgraph;
 
 	unsigned int uiIndexCount = pg->inline_elements_length;

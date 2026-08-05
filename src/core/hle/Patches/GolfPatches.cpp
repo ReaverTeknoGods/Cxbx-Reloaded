@@ -32,11 +32,15 @@
 #include <Windows.h>
 #include <intrin.h>
 
+#if defined(_DEBUG)
 #define GOLF_LOG(fmt, ...) do { \
 	FILE* _f = fopen("C:\\temp\\golf_patches.log", "a"); \
 	if (_f) { fprintf(_f, fmt "\n", ##__VA_ARGS__); fclose(_f); } \
 	printf(fmt "\n", ##__VA_ARGS__); \
 } while(0)
+#else
+#define GOLF_LOG(...) do {} while(0)
+#endif
 
 // ── Card file I/O ────────────────────────────────────────────────
 
@@ -1364,10 +1368,12 @@ void ApplyGolfPatches(uint64_t xbeHash, uint32_t imageSize)
 	GOLF_LOG("GolfPatch: Backbuffer override set to 800x600");
 
 	// Write marker file so we know patches are running
+#if defined(_DEBUG)
 	{
 		FILE* f = fopen("C:\\temp\\golf_patches.log", "w");
 		if (f) { fprintf(f, "GolfPatch: start (imageSize=0x%X)\n", imageSize); fclose(f); }
 	}
+#endif
 #if GOLF_LINKOK
 	// === LinkOK — JMP hook to GolfLinkOkHook ===
 	// Pattern: TEST EAX,EAX; JNZ +8; MOV EAX,0xFFFFFFFE; RET 0Ch

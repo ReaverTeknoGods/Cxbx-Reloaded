@@ -58,6 +58,7 @@ extern std::atomic_bool g_bEnableAllInterrupts;
 
 static int field_pin = 0;
 
+#if defined(_DEBUG)
 static void X86ProbeLog(xbox::addr_xt addr, uint32_t value, int size)
 {
 	static int probeLogCount = 0;
@@ -72,6 +73,7 @@ static void X86ProbeLog(xbox::addr_xt addr, uint32_t value, int size)
 	fclose(logFile);
 	probeLogCount++;
 }
+#endif
 
 uint32_t EmuX86_IORead(xbox::addr_xt addr, int size)
 {
@@ -99,7 +101,9 @@ uint32_t EmuX86_IORead(xbox::addr_xt addr, int size)
 			// field pin from tv encoder?
 			field_pin = (field_pin + 1) & 1;
 			uint32_t value = field_pin << 5;
+#if defined(_DEBUG)
 			X86ProbeLog(addr, value, size);
+#endif
 			return value;
 		}
 		break;

@@ -36,6 +36,7 @@ JvsIo* g_pJvsIo;
 #include <vector>
 #include <Windows.h>
 
+#if defined(_DEBUG)
 static void GolfJvsIoLog(const char* fmt, ...)
 {
 	FILE* file = fopen("C:\\temp\\golf_jvs_io.log", "a");
@@ -47,11 +48,14 @@ static void GolfJvsIoLog(const char* fmt, ...)
 	fputc('\n', file);
 	fclose(file);
 }
+#else
+#define GolfJvsIoLog(...) do {} while(0)
+#endif
 
 // ============================================================================
 // JVS logging
 // ============================================================================
-#ifdef JVS_LOG
+#if defined(JVS_LOG) && defined(_DEBUG)
 FILE* g_JvsLogFile = nullptr;
 static ULONGLONG g_JvsLogStartMs = 0;
 
@@ -943,7 +947,7 @@ size_t JvsIo::ReceivePacket(uint8_t* buffer)
 	printf("\n");
 #endif
 	// Log outgoing response
-#ifdef JVS_LOG
+#if defined(JVS_LOG) && defined(_DEBUG)
 	if (g_JvsLogFile && total_packet_size > 0) {
 		JvsLog("[+%llums] ", JvsElapsedMs());
 		LogPacketHex("ReceivePacket <-", buffer_start, total_packet_size);

@@ -201,6 +201,7 @@ DWORD WINAPI Emulate(unsigned int reserved_systems, blocks_reserved_t blocks_res
 	CxbxKrnlEmulate(reserved_systems, blocks_reserved);
 
 	// QoD debug: log normal exit
+#if defined(_DEBUG)
 	{
 		FILE* _f = fopen("C:\\temp\\qod_patches.log", "a");
 		if (_f) {
@@ -210,6 +211,7 @@ DWORD WINAPI Emulate(unsigned int reserved_systems, blocks_reserved_t blocks_res
 			fclose(_f);
 		}
 	}
+#endif
 
 	/*! cleanup shared memory */
 	EmuShared::Cleanup();

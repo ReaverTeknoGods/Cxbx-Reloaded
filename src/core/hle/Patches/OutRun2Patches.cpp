@@ -29,9 +29,13 @@
 #include "core\kernel\support\Emu.h"
 #include <cstdio>
 
+#if defined(_DEBUG)
 #define OR2_LOG(fmt, ...) do { \
 	printf("OutRun2Patch: " fmt "\n", ##__VA_ARGS__); \
 } while(0)
+#else
+#define OR2_LOG(...) do {} while(0)
+#endif
 
 // ── Hook functions ────────────────────────────────────────────────
 
