@@ -101,9 +101,15 @@ XboxTextureStateConverter XboxTextureStates;
 D3D8LightState d3d8LightState = D3D8LightState();
 D3D8TransformState d3d8TransformState = D3D8TransformState();
 FixedFunctionVertexShaderState ffShaderState = {0}; // TODO find a home for this and associated code
+extern bool g_ChihiroCrazyTaxiGame;
 static bool g_FFRestInvalid = true; // Set when Xbox constants overwrite GPU registers, forces re-upload of non-transform FF data
 static bool g_FFTransformDirty = true; // Set when any transform changes (SetTransform)
 static bool g_FFNonTransformDirty = true; // Set when render states, lights, materials, or non-world transforms change
+
+void CxbxInvalidateFixedFunctionNonTransformState()
+{
+	g_FFNonTransformDirty = true;
+}
 
 // Allow use of time duration literals (making 16ms, etc possible)
 using namespace std::literals::chrono_literals;
@@ -6722,15 +6728,22 @@ void UpdateFixedFunctionShaderLight(int d3dLightIndex, Light* pShaderLight, D3DX
 	pShaderLight->Type = (float)((int)d3dLight->Type);
 	pShaderLight->Diffuse = toVector(d3dLight->Diffuse);
 	pShaderLight->Specular = SpecularEnable ? toVector(d3dLight->Specular) : toVector(0);
-	pShaderLight->Range = d3dLight->Range;
+	pShaderLight->RangeAmbient.x = d3dLight->Range;
+	pShaderLight->RangeAmbient.y = d3dLight->Ambient.r;
+	pShaderLight->RangeAmbient.z = d3dLight->Ambient.g;
+	pShaderLight->RangeAmbient.w = d3dLight->Ambient.b;
 	pShaderLight->Falloff = d3dLight->Falloff;
 	pShaderLight->Attenuation.x = d3dLight->Attenuation0;
 	pShaderLight->Attenuation.y = d3dLight->Attenuation1;
 	pShaderLight->Attenuation.z = d3dLight->Attenuation2;
 
-	pLightAmbient->x += d3dLight->Ambient.r;
-	pLightAmbient->y += d3dLight->Ambient.g;
-	pLightAmbient->z += d3dLight->Ambient.b;
+	// Crazy Taxi needs NV2A-style per-light ambient attenuation. Preserve the
+	// established global accumulation for every other title.
+	if (!g_ChihiroCrazyTaxiGame) {
+		pLightAmbient->x += d3dLight->Ambient.r;
+		pLightAmbient->y += d3dLight->Ambient.g;
+		pLightAmbient->z += d3dLight->Ambient.b;
+	}
 
 	auto cosHalfPhi = cos(d3dLight->Phi / 2);
 	pShaderLight->CosHalfPhi = cosHalfPhi;
@@ -6797,8 +6810,23 @@ void UpdateFixedFunctionVertexShaderState()
 		ffShaderState.Modes.VertexBlend_NrOfMatrices = (float)s_NrBlendMatrices;
 		ffShaderState.Modes.VertexBlend_CalcLastWeight = (float)CalcLastBlendWeight;
 
+		// SetVertexBlendModelView supplies a projection/viewport composite for
+		// multi-matrix draws. Use the extracted projection only for those draws;
+		// later fixed-function passes keep the title's logical projection.
+		const D3DMATRIX* activeProjection =
+			&d3d8TransformState.Transforms[X_D3DTS_PROJECTION];
+		if (s_NrBlendMatrices > 1) {
+			const D3DMATRIX* vertexBlendProjection =
+				d3d8TransformState.GetVertexBlendProjection();
+			if (vertexBlendProjection != nullptr) {
+				activeProjection = vertexBlendProjection;
+			}
+		}
+
 		// Transforms — Projection, View, Texture (only change with non-world SetTransform)
-		D3DXMatrixTranspose((D3DXMATRIX*)&ffShaderState.Transforms.Projection, (D3DXMATRIX*)&d3d8TransformState.Transforms[X_D3DTS_PROJECTION]);
+		D3DXMatrixTranspose(
+			(D3DXMATRIX*)&ffShaderState.Transforms.Projection,
+			(D3DXMATRIX*)activeProjection);
 		D3DXMatrixTranspose((D3DXMATRIX*)&ffShaderState.Transforms.View, (D3DXMATRIX*)&d3d8TransformState.Transforms[X_D3DTS_VIEW]);
 
 		for (unsigned i = 0; i < 4; i++) {
@@ -6813,6 +6841,10 @@ void UpdateFixedFunctionVertexShaderState()
 		ffShaderState.Modes.Lighting = LightingEnable && !PointSpriteEnable;
 		ffShaderState.Modes.TwoSidedLighting = (float)XboxRenderStates.GetXboxRenderState(X_D3DRS_TWOSIDEDLIGHTING);
 		ffShaderState.Modes.LocalViewer = (float)XboxRenderStates.GetXboxRenderState(X_D3DRS_LOCALVIEWER);
+		// Crazy Taxi's camera-space reflection-vector convention is opposite
+		// D3D9's fixed-function host convention before its scale/bias matrix.
+		ffShaderState.ReflectionVectorYSign =
+			g_ChihiroCrazyTaxiGame ? -1.0f : 1.0f;
 
 		// Material sources
 		bool ColorVertex = XboxRenderStates.GetXboxRenderState(X_D3DRS_COLORVERTEX) != FALSE;
@@ -11115,6 +11147,46 @@ xbox::hresult_xt WINAPI xbox::EMUPATCH(D3DDevice_DrawTriPatch)
 }
 
 #pragma warning(disable:4244)
+static D3DXMATRIX CxbxBuildProjectionViewportMatrix(
+	const D3DXMATRIX& projection,
+	const xbox::X_D3DVIEWPORT8& viewport)
+{
+	D3DXMATRIX viewportTransform;
+	D3DXMatrixIdentity(&viewportTransform);
+
+	const float halfWidth = static_cast<float>(viewport.Width) * 0.5f;
+	const float halfHeight = static_cast<float>(viewport.Height) * 0.5f;
+	viewportTransform._11 = halfWidth;
+	viewportTransform._22 = -halfHeight;
+	viewportTransform._33 = viewport.MaxZ - viewport.MinZ;
+	viewportTransform._41 = static_cast<float>(viewport.X) + halfWidth;
+	viewportTransform._42 = static_cast<float>(viewport.Y) + halfHeight;
+	viewportTransform._43 = viewport.MinZ;
+
+	D3DXMATRIX projectionViewport;
+	D3DXMatrixMultiply(&projectionViewport, &projection, &viewportTransform);
+	return projectionViewport;
+}
+
+static bool CxbxExtractProjectionMatrix(
+	const D3DXMATRIX& projectionViewport,
+	const xbox::X_D3DVIEWPORT8& viewport,
+	D3DXMATRIX& projection)
+{
+	D3DXMATRIX identity;
+	D3DXMatrixIdentity(&identity);
+	const D3DXMATRIX viewportTransform =
+		CxbxBuildProjectionViewportMatrix(identity, viewport);
+
+	D3DXMATRIX inverseViewport;
+	if (D3DXMatrixInverse(&inverseViewport, nullptr, &viewportTransform) == nullptr) {
+		return false;
+	}
+
+	D3DXMatrixMultiply(&projection, &projectionViewport, &inverseViewport);
+	return true;
+}
+
 // ******************************************************************
 // * patch: D3DDevice_GetProjectionViewportMatrix
 // ******************************************************************
@@ -11125,50 +11197,14 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_GetProjectionViewportMatrix)
 {
 	LOG_FUNC_ONE_ARG(pProjectionViewport);
 
-	// blueshogun96 1/25/10
-	// It's been almost 3 years, but I think this is a better 
-	// implementation.  Still probably not right, but better
-	// then before.
+	if (pProjectionViewport == nullptr) {
+		return;
+	}
 
-	HRESULT hRet;
-	D3DXMATRIX Out, mtxProjection, mtxViewport;
-	D3DVIEWPORT Viewport;
-
-	// Get current viewport
-	hRet = g_pD3DDevice->GetViewport(&Viewport);
-	DEBUG_D3DRESULT(hRet, "g_pD3DDevice->GetViewport - Unable to get viewport!");
-
-	// Get current projection matrix
-	hRet = g_pD3DDevice->GetTransform(D3DTS_PROJECTION, &mtxProjection);
-	DEBUG_D3DRESULT(hRet, "g_pD3DDevice->GetTransform - Unable to get projection matrix!");
-
-	// Clear the destination matrix
-	::ZeroMemory(&Out, sizeof(D3DMATRIX));
-
-	// Create the Viewport matrix manually
-	// Direct3D8 doesn't give me everything I need in a viewport structure
-	// (one thing I REALLY HATE!) so some constants will have to be used
-	// instead.
-
-	float ClipWidth = 2.0f;
-	float ClipHeight = 2.0f;
-	float ClipX = -1.0f;
-	float ClipY = 1.0f;
-	float Width = DWtoF(Viewport.Width);
-	float Height = DWtoF(Viewport.Height);
-
-	D3DXMatrixIdentity(&mtxViewport);
-	mtxViewport._11 = Width / ClipWidth;
-	mtxViewport._22 = -(Height / ClipHeight);
-	mtxViewport._41 = -(ClipX * mtxViewport._11);
-	mtxViewport._42 = -(ClipY * mtxViewport._22);
-
-	// Multiply projection and viewport matrix together
-	Out = mtxProjection * mtxViewport;
-
-	*pProjectionViewport = Out;
-
-//	__asm int 3;
+	*pProjectionViewport = CxbxBuildProjectionViewportMatrix(
+		*reinterpret_cast<const D3DXMATRIX*>(
+			&d3d8TransformState.Transforms[xbox::X_D3DTS_PROJECTION]),
+		g_Xbox_Viewport);
 }
 #pragma warning(default:4244)
 
@@ -11340,9 +11376,48 @@ xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_SetModelView)
 		LOG_FUNC_ARG(pComposite)
 		LOG_FUNC_END;
 
-	// TODO handle other matrices
-	d3d8TransformState.SetWorldView(0, pModelView);
-	LOG_TEST_CASE("SetModelView");
+	if (pComposite == nullptr) {
+		d3d8TransformState.SetModelView(nullptr, nullptr);
+	}
+	else {
+		d3d8TransformState.SetModelView(pModelView, pInverseModelView);
+	}
+	g_FFTransformDirty = true;
+	g_FFNonTransformDirty = true;
+}
+
+// ******************************************************************
+// * patch: D3DDevice_SetVertexBlendModelView
+// ******************************************************************
+xbox::void_xt WINAPI xbox::EMUPATCH(D3DDevice_SetVertexBlendModelView)
+(
+	uint_xt Count,
+	CONST D3DMATRIX *pModelViews,
+	CONST D3DMATRIX *pInverseModelViews,
+	CONST D3DMATRIX *pProjectionViewport
+)
+{
+	d3d8TransformState.SetVertexBlendModelView(
+		Count,
+		pModelViews,
+		pInverseModelViews);
+
+	if (pProjectionViewport != nullptr) {
+		D3DXMATRIX projection;
+		if (CxbxExtractProjectionMatrix(
+			*reinterpret_cast<const D3DXMATRIX*>(pProjectionViewport),
+			g_Xbox_Viewport,
+			projection)) {
+			d3d8TransformState.SetVertexBlendProjection(
+				reinterpret_cast<const D3DMATRIX*>(&projection));
+		}
+	}
+	else {
+		d3d8TransformState.SetVertexBlendProjection(nullptr);
+	}
+
+	g_FFTransformDirty = true;
+	g_FFNonTransformDirty = true;
 }
 
 // ******************************************************************

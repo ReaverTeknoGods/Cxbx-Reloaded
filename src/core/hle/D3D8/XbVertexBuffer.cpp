@@ -452,11 +452,15 @@ void CxbxVertexBufferConverter::ConvertStream
 			uint8_t *pXboxVertexAsByte = &pXboxVertexData[uiVertex * uiXboxVertexStride];
 			uint8_t *pHostVertexAsByte = &pHostVertexData[uiVertex * uiHostVertexStride];
 			for (UINT uiElement = 0; uiElement < pVertexShaderStreamInfo->NumberOfVertexElements; uiElement++) {
-				FLOAT *pXboxVertexAsFloat = (FLOAT*)pXboxVertexAsByte;
-				SHORT *pXboxVertexAsShort = (SHORT*)pXboxVertexAsByte;
-				const int XboxElementByteSize = pVertexShaderStreamInfo->VertexElements[uiElement].XboxByteSize;
-				FLOAT *pHostVertexAsFloat = (FLOAT*)pHostVertexAsByte;
-				SHORT *pHostVertexAsShort = (SHORT*)pHostVertexAsByte;
+				const CxbxVertexShaderStreamElement& element =
+					pVertexShaderStreamInfo->VertexElements[uiElement];
+				uint8_t *pXboxElementAsByte = pXboxVertexAsByte + element.XboxOffset;
+				uint8_t *pHostElementAsByte = pHostVertexAsByte + element.HostOffset;
+				FLOAT *pXboxVertexAsFloat = (FLOAT*)pXboxElementAsByte;
+				SHORT *pXboxVertexAsShort = (SHORT*)pXboxElementAsByte;
+				const int XboxElementByteSize = element.XboxByteSize;
+				FLOAT *pHostVertexAsFloat = (FLOAT*)pHostElementAsByte;
+				SHORT *pHostVertexAsShort = (SHORT*)pHostElementAsByte;
 				// Dxbx note : The following code handles only the D3DVSDT enums that need conversion;
 				// All other cases are catched by the memcpy in the default-block.
 				switch (pVertexShaderStreamInfo->VertexElements[uiElement].XboxType) {
@@ -537,7 +541,7 @@ void CxbxVertexBufferConverter::ConvertStream
 						};
 					} NormPacked3;
 
-					NormPacked3.value = ((int32_t*)pXboxVertexAsByte)[0];
+					NormPacked3.value = ((int32_t*)pXboxElementAsByte)[0];
 
 					pHostVertexAsFloat[0] = PackedIntToFloat(NormPacked3.x, 1023.0f, 1024.f);
 					pHostVertexAsFloat[1] = PackedIntToFloat(NormPacked3.y, 1023.0f, 1024.f);
@@ -562,27 +566,27 @@ void CxbxVertexBufferConverter::ConvertStream
 				case xbox::X_D3DVSDT_PBYTE1: { // 0x14:
 					if (g_D3DCaps.DeclTypes & D3DDTCAPS_UBYTE4N) {
 						// Make it UBYTE4N
-						pHostVertexAsByte[0] = pXboxVertexAsByte[0];
-						pHostVertexAsByte[1] = 0;
-						pHostVertexAsByte[2] = 0;
-						pHostVertexAsByte[3] = 255; // TODO : Verify
+						pHostElementAsByte[0] = pXboxElementAsByte[0];
+						pHostElementAsByte[1] = 0;
+						pHostElementAsByte[2] = 0;
+						pHostElementAsByte[3] = 255; // TODO : Verify
 					} else {
 						// Make it FLOAT1
-						pHostVertexAsFloat[0] = ByteToFloat(pXboxVertexAsByte[0]);
+						pHostVertexAsFloat[0] = ByteToFloat(pXboxElementAsByte[0]);
 					}
 					break;
 				}
 				case xbox::X_D3DVSDT_PBYTE2: { // 0x24:
 					if (g_D3DCaps.DeclTypes & D3DDTCAPS_UBYTE4N) {
 						// Make it UBYTE4N
-						pHostVertexAsByte[0] = pXboxVertexAsByte[0];
-						pHostVertexAsByte[1] = pXboxVertexAsByte[1];
-						pHostVertexAsByte[2] = 0;
-						pHostVertexAsByte[3] = 255; // TODO : Verify
+						pHostElementAsByte[0] = pXboxElementAsByte[0];
+						pHostElementAsByte[1] = pXboxElementAsByte[1];
+						pHostElementAsByte[2] = 0;
+						pHostElementAsByte[3] = 255; // TODO : Verify
 					} else {
 						// Make it FLOAT2
-						pHostVertexAsFloat[0] = ByteToFloat(pXboxVertexAsByte[0]);
-						pHostVertexAsFloat[1] = ByteToFloat(pXboxVertexAsByte[1]);
+						pHostVertexAsFloat[0] = ByteToFloat(pXboxElementAsByte[0]);
+						pHostVertexAsFloat[1] = ByteToFloat(pXboxElementAsByte[1]);
 					}
 					break;
 				}
@@ -590,15 +594,15 @@ void CxbxVertexBufferConverter::ConvertStream
 					// Test-cases : Turok
 					if (g_D3DCaps.DeclTypes & D3DDTCAPS_UBYTE4N) {
 						// Make it UBYTE4N
-						pHostVertexAsByte[0] = pXboxVertexAsByte[0];
-						pHostVertexAsByte[1] = pXboxVertexAsByte[1];
-						pHostVertexAsByte[2] = pXboxVertexAsByte[2];
-						pHostVertexAsByte[3] = 255; // TODO : Verify
+						pHostElementAsByte[0] = pXboxElementAsByte[0];
+						pHostElementAsByte[1] = pXboxElementAsByte[1];
+						pHostElementAsByte[2] = pXboxElementAsByte[2];
+						pHostElementAsByte[3] = 255; // TODO : Verify
 					} else {
 						// Make it FLOAT3
-						pHostVertexAsFloat[0] = ByteToFloat(pXboxVertexAsByte[0]);
-						pHostVertexAsFloat[1] = ByteToFloat(pXboxVertexAsByte[1]);
-						pHostVertexAsFloat[2] = ByteToFloat(pXboxVertexAsByte[2]);
+						pHostVertexAsFloat[0] = ByteToFloat(pXboxElementAsByte[0]);
+						pHostVertexAsFloat[1] = ByteToFloat(pXboxElementAsByte[1]);
+						pHostVertexAsFloat[2] = ByteToFloat(pXboxElementAsByte[2]);
 					}
 					break;
 				}
@@ -607,18 +611,18 @@ void CxbxVertexBufferConverter::ConvertStream
 					if (g_D3DCaps.DeclTypes & D3DDTCAPS_UBYTE4N) {
 						// No need for patching when D3D9 supports D3DDECLTYPE_UBYTE4N
 						// TODO : goto default; // ??
-						//memcpy(pHostVertexAsByte, pXboxVertexAsByte, XboxElementByteSize);
+						//memcpy(pHostElementAsByte, pXboxElementAsByte, XboxElementByteSize);
 						// Make it UBYTE4N
-						pHostVertexAsByte[0] = pXboxVertexAsByte[0];
-						pHostVertexAsByte[1] = pXboxVertexAsByte[1];
-						pHostVertexAsByte[2] = pXboxVertexAsByte[2];
-						pHostVertexAsByte[3] = pXboxVertexAsByte[3];
+						pHostElementAsByte[0] = pXboxElementAsByte[0];
+						pHostElementAsByte[1] = pXboxElementAsByte[1];
+						pHostElementAsByte[2] = pXboxElementAsByte[2];
+						pHostElementAsByte[3] = pXboxElementAsByte[3];
 					} else {
 						// Make it FLOAT4
-						pHostVertexAsFloat[0] = ByteToFloat(pXboxVertexAsByte[0]);
-						pHostVertexAsFloat[1] = ByteToFloat(pXboxVertexAsByte[1]);
-						pHostVertexAsFloat[2] = ByteToFloat(pXboxVertexAsByte[2]);
-						pHostVertexAsFloat[3] = ByteToFloat(pXboxVertexAsByte[3]);
+						pHostVertexAsFloat[0] = ByteToFloat(pXboxElementAsByte[0]);
+						pHostVertexAsFloat[1] = ByteToFloat(pXboxElementAsByte[1]);
+						pHostVertexAsFloat[2] = ByteToFloat(pXboxElementAsByte[2]);
+						pHostVertexAsFloat[3] = ByteToFloat(pXboxElementAsByte[3]);
 					}
 					break;
 				}
@@ -639,15 +643,10 @@ void CxbxVertexBufferConverter::ConvertStream
 				}
 				default: {
 					// Generic 'conversion' - just make a copy :
-					memcpy(pHostVertexAsByte, pXboxVertexAsByte, XboxElementByteSize);
+					memcpy(pHostElementAsByte, pXboxElementAsByte, XboxElementByteSize);
 					break;
 				}
 				} // switch
-
-				// Increment the Xbox pointer :
-				pXboxVertexAsByte += XboxElementByteSize;
-				// Increment the host pointer :
-				pHostVertexAsByte += pVertexShaderStreamInfo->VertexElements[uiElement].HostByteSize;
 			} // for NumberOfVertexElements
 		} // for uiVertexCount
     }

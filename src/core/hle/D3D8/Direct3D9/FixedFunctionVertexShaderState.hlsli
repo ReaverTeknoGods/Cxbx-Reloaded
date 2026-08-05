@@ -64,7 +64,11 @@ struct Light {
 
     // Viewspace light position
     alignas(16) float3 PositionV;
-    alignas(16) float Range;
+    // Range previously occupied a full constant register by itself. Store the
+    // light's ambient RGB in the unused components so local-light ambient can
+    // be attenuated correctly without growing the VS 3.0 constant block.
+    // x = range, yzw = ambient RGB.
+    alignas(16) float4 RangeAmbient;
 
     // Viewspace light direction (normalized)
     alignas(16) float3 DirectionVN;
@@ -153,6 +157,7 @@ struct FixedFunctionVertexShaderState {
     alignas(16) arr(TextureStates, TextureState, 4);
     alignas(16) PointSprite PointSprite;
     alignas(16) float4 TexCoordComponentCount;
+    alignas(16) float ReflectionVectorYSign;
 };
 
 #ifdef  __cplusplus

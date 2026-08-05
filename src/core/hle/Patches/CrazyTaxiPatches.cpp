@@ -28,8 +28,11 @@
 #include "ChihiroPatches.h"
 #include "core\kernel\support\Emu.h"
 #include "common\BetaConfig.h"
+#include <cmath>
 #include <cstdio>
 #include <thread>
+
+bool g_ChihiroCrazyTaxiGame = false;
 
 bool IsCrazyTaxiXbe(uint64_t xbeHash)
 {
@@ -104,18 +107,20 @@ static volatile DWORD g_SpinExitTick = 0;
 static void __cdecl TaxiCriAsyncSpinHelper() {
 	if (!g_CriSpinFlagAddr) return;
 
-	// Capture game thread ID and entry time — NO file I/O!
-	// File operations (fopen/fclose) get intercepted by the emulator's
-	// kernel HLE and block forever in XBE thread context.
+	// NtReadFile queues its completion APC to this same native thread, but the
+	// original title code only busy-spins. Enter an alertable wait so Windows
+	// can dispatch the real completion callback without forcing CRI requests.
 	g_GameThreadId = GetCurrentThreadId();
 	g_SpinEnterTick = GetTickCount();
 
-	// Tight spin with CPU PAUSE + timeout.
-	DWORD start = GetTickCount();
+	const DWORD start = GetTickCount();
 	while (*g_CriSpinFlagAddr == 0) {
-		_mm_pause();
-		if (GetTickCount() - start >= 200) {
-			*g_CriSpinFlagAddr = 1;
+		SleepEx(1, TRUE);
+		if (g_BetaConfig.ct_cri_wait_timeout_ms != 0 &&
+			GetTickCount() - start >= g_BetaConfig.ct_cri_wait_timeout_ms) {
+			InterlockedExchange(
+				reinterpret_cast<volatile LONG*>(g_CriSpinFlagAddr),
+				1);
 			break;
 		}
 	}
@@ -124,27 +129,22 @@ static void __cdecl TaxiCriAsyncSpinHelper() {
 }
 
 // Apply CRI async spin patch at runtime (called when GM=7 detected)
-static void ApplyCriAsyncSpinPatch(FILE* logFile) {
+static void ApplyCriAsyncSpinPatch() {
 	if (!g_CriSpinPatchAddr) return;
 	uint8_t* funcStart = g_CriSpinPatchAddr;
-	uint32_t flagAddr = (uint32_t)(uintptr_t)g_CriSpinFlagAddr;
 	DWORD oldProtect;
 	const int kPatchLen = 36;
 	if (VirtualProtect(funcStart, kPatchLen, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-		funcStart[0] = 0xC7;
-		funcStart[1] = 0x05;
-		*(uint32_t*)(funcStart + 2) = flagAddr;
-		*(uint32_t*)(funcStart + 6) = 1;
-		funcStart[10] = 0xEB;
-		funcStart[11] = (uint8_t)(kPatchLen - 12);
-		for (int i = 12; i < kPatchLen; i++) funcStart[i] = 0x90;
+		funcStart[0] = 0xE8;
+		*reinterpret_cast<int32_t*>(funcStart + 1) =
+			static_cast<int32_t>(
+				reinterpret_cast<uintptr_t>(&TaxiCriAsyncSpinHelper) -
+					(reinterpret_cast<uintptr_t>(funcStart) + 5));
+		funcStart[5] = 0xEB;
+		funcStart[6] = static_cast<uint8_t>(kPatchLen - 7);
+		for (int i = 7; i < kPatchLen; ++i) funcStart[i] = 0x90;
 		VirtualProtect(funcStart, kPatchLen, oldProtect, &oldProtect);
 		FlushInstructionCache(GetCurrentProcess(), funcStart, kPatchLen);
-		if (logFile) {
-			fprintf(logFile, "[CRI-PATCH] Applied CRI async spin patch @0x%08X (flag=0x%08X)\n",
-				(unsigned)(uintptr_t)funcStart, flagAddr);
-			fflush(logFile);
-		}
 	}
 	g_CriSpinPatchAddr = nullptr; // only apply once
 }
@@ -174,11 +174,117 @@ static void TaxiDiagThread() {
 	fclose(f);
 }
 
+// Crazy Taxi builds one spotlight every frame but never adds it to the
+// renderer's eight-light list. Reuse that dormant object as the arcade
+// cabinet's broad, camera-following headlight cone before committing lights.
+static int __fastcall TaxiCommitLightsWithHeadlightHook(
+	void* renderer,
+	void* /*edx*/)
+{
+	using RegisterLightFn = int(__thiscall*)(void*, char*);
+	using CommitLightsFn = int(__thiscall*)(void*);
+
+	const auto registerLight = reinterpret_cast<RegisterLightFn>(0x000C0140);
+	const auto commitLights = reinterpret_cast<CommitLightsFn>(0x000B8660);
+
+	if (g_BetaConfig.ct_headlights) {
+		__try {
+			const auto gameMode =
+				*reinterpret_cast<volatile const uint32_t*>(0x0031CC6C);
+			if (gameMode == 3) {
+				auto* light = reinterpret_cast<volatile float*>(0x00324328);
+				const auto* camera =
+					reinterpret_cast<volatile const float*>(0x00278DB0);
+				const auto* target =
+					reinterpret_cast<volatile const float*>(0x00278D60);
+
+				float forwardX = target[0] - camera[0];
+				float forwardZ = target[2] - camera[2];
+				const float horizontalLength =
+					std::sqrt(forwardX * forwardX + forwardZ * forwardZ);
+				if (std::isfinite(horizontalLength) &&
+					horizontalLength > 0.001f) {
+					forwardX /= horizontalLength;
+					forwardZ /= horizontalLength;
+
+					constexpr float kForwardOffset = 8.0f;
+					constexpr float kHeightOffset = 3.0f;
+					constexpr float kDownwardPitch = -0.08f;
+					constexpr float kRange = 900.0f;
+					constexpr float kHalfRange = kRange * 0.5f;
+					const float directionScale =
+						1.0f / std::sqrt(
+							1.0f + kDownwardPitch * kDownwardPitch);
+					const float directionX = forwardX * directionScale;
+					const float directionY = kDownwardPitch * directionScale;
+					const float directionZ = forwardZ * directionScale;
+					const float positionX =
+						target[0] + forwardX * kForwardOffset;
+					const float positionY = target[1] + kHeightOffset;
+					const float positionZ =
+						target[2] + forwardZ * kForwardOffset;
+
+					*reinterpret_cast<volatile uint32_t*>(light) = 2u;
+					light[13] = positionX;
+					light[14] = positionY;
+					light[15] = positionZ;
+					light[16] = directionX;
+					light[17] = directionY;
+					light[18] = directionZ;
+					light[19] = kRange;
+					light[20] = 1.0f;       // Falloff
+					light[21] = 1.0f;       // Attenuation0
+					light[22] = 0.0015f;    // Attenuation1
+					light[23] = 0.000008f;  // Attenuation2
+					light[24] = 0.45f;
+					light[25] = 0.90f;
+					light[26] = positionX + directionX * kHalfRange;
+					light[27] = positionY + directionY * kHalfRange;
+					light[28] = positionZ + directionZ * kHalfRange;
+					light[29] = kHalfRange;
+
+					registerLight(
+						reinterpret_cast<void*>(0x00324328),
+						static_cast<char*>(renderer));
+				}
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			// Alternate executable revisions retain the normal light commit.
+		}
+	}
+
+	return commitLights(renderer);
+}
+
 void ApplyCrazyTaxiPatches(uint64_t xbeHash, uint32_t imageSize)
 {
 	printf("CrazyTaxiPatch: xbeHash=0x%016llX, match=%d\n", (unsigned long long)xbeHash, (int)IsCrazyTaxiXbe(xbeHash));
 
-	if (!IsCrazyTaxiXbe(xbeHash)) return;
+	g_ChihiroCrazyTaxiGame = IsCrazyTaxiXbe(xbeHash);
+	if (!g_ChihiroCrazyTaxiGame) return;
+
+	// The title requests an immediate interval. At 120 Hz this doubles its
+	// frame-counted menus and physics, so use CXBXR's existing 60 Hz limiter.
+	extern xbox::dword_xt g_Xbox_PresentationInterval_Override;
+	g_Xbox_PresentationInterval_Override = 1;
+
+	// Add the title-local headlight only when this known call still targets the
+	// expected light commit function.
+	{
+		constexpr uintptr_t kCommitLightsCall = 0x00025CBD;
+		const auto* call = reinterpret_cast<const uint8_t*>(kCommitLightsCall);
+		if (call[0] == 0xE8) {
+			const int32_t displacement =
+				*reinterpret_cast<const int32_t*>(call + 1);
+			if (kCommitLightsCall + 5 + displacement == 0x000B8660) {
+				PatchWithCall(
+					kCommitLightsCall,
+					&TaxiCommitLightsWithHeadlightHook,
+					5);
+			}
+		}
+	}
 
 	// NOTE: D3D BetaConfig overrides for Crazy Taxi are applied EARLY in CxbxKrnl.cpp
 	// (right after BetaConfig_Load, before CxbxInitWindow) because D3D device creation
@@ -287,6 +393,28 @@ void ApplyCrazyTaxiPatches(uint64_t xbeHash, uint32_t imageSize)
 	} else {
 		printf("CrazyTaxiPatch: CRI spin force-complete DISABLED (ct_cri_force_complete=0)\n");
 		if (plog) { fprintf(plog, "CRI spin force-complete: DISABLED by ct_cri_force_complete=0\n"); fflush(plog); }
+
+		static const uint8_t kCriSpinPat[] = {
+			0x85, 0xC0,
+			0x75, 0x1B,
+			0x8D, 0xA4, 0x24, 0x00, 0x00, 0x00, 0x00
+		};
+		const uintptr_t matchVA =
+			ScanXbe(kCriSpinPat, sizeof(kCriSpinPat), imageSize);
+		if (matchVA) {
+			auto* funcStart = reinterpret_cast<uint8_t*>(matchVA - 5);
+			if (funcStart[0] == 0xA1 &&
+				funcStart[27] == 0xA1 &&
+				funcStart[32] == 0x85 &&
+				funcStart[33] == 0xC0 &&
+				funcStart[34] == 0x74) {
+				g_CriSpinPatchAddr = funcStart;
+				g_CriSpinFlagAddr =
+					reinterpret_cast<volatile uint32_t*>(
+						*reinterpret_cast<uint32_t*>(funcStart + 1));
+				ApplyCriAsyncSpinPatch();
+			}
+		}
 	}
 
 	// === CRI async I/O completion spin fix (SleepEx trampoline) ===

@@ -41,7 +41,11 @@ extern void EmuInitFS();
 
 // generate fs segment selector
 template<bool IsHostThread = false>
-void EmuGenerateFS(xbox::PETHREAD Ethread, unsigned XboxThreadStackBaseReserved = 0, unsigned XboxThreadStackSizeReserved = 0);
+void EmuGenerateFS(
+	xbox::PETHREAD Ethread,
+	unsigned XboxThreadStackBaseReserved = 0,
+	unsigned XboxThreadStackSizeReserved = 0,
+	unsigned XboxThreadTlsDataSize = 0);
 // free kpcr allocated for the thread
 void EmuKeFreePcr();
 

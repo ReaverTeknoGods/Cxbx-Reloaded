@@ -190,6 +190,14 @@ void XboxTextureStateConverter::Apply()
                 continue;
             }
 
+			// Texgen and texture-transform flags are consumed by Cxbx's HLSL
+			// fixed-function vertex shader. Rebuild its non-transform state when
+			// either Xbox state changes instead of reusing stale coordinates.
+			if (State == xbox::X_D3DTSS_TEXCOORDINDEX ||
+				State == xbox::X_D3DTSS_TEXTURETRANSFORMFLAGS) {
+				CxbxInvalidateFixedFunctionNonTransformState();
+			}
+
             switch (State) {
                 // These types map 1:1 but have some unsupported values
                 case xbox::X_D3DTSS_ADDRESSU: case xbox::X_D3DTSS_ADDRESSV: case xbox::X_D3DTSS_ADDRESSW:

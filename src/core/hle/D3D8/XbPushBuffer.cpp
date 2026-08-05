@@ -27,6 +27,7 @@
 
 #define LOG_PREFIX CXBXR_MODULE::PSHB
 
+#include <algorithm>
 #include <assert.h> // For assert()
 
 #include "core\kernel\support\Emu.h"
@@ -109,8 +110,24 @@ DWORD CxbxGetStrideFromVertexDeclaration(CxbxVertexDeclaration* pCxbxVertexDecla
 		//LOG_TEST_CASE("Non-FVF Vertex Shaders not yet (completely) supported for PushBuffer emulation!");
 
 		if (pCxbxVertexDeclaration->NumberOfVertexStreams == 1) {
-			// Note : This assumes that the only stream in use will be stream zero :
-			Stride = pCxbxVertexDeclaration->VertexStreams[0].HostVertexStride;
+			// Inline arrays still contain Xbox vertex data. Host element types can
+			// be wider after conversion, so using HostVertexStride here shifts every
+			// vertex after the first to the wrong DWORD (notably OutRun 2 shadows).
+			const CxbxVertexShaderStreamInfo& stream =
+				pCxbxVertexDeclaration->VertexStreams[0];
+			for (DWORD elementIndex = 0;
+				elementIndex < stream.NumberOfVertexElements;
+				++elementIndex) {
+				const CxbxVertexShaderStreamElement& element =
+					stream.VertexElements[elementIndex];
+				Stride = std::max<DWORD>(
+					Stride,
+					static_cast<DWORD>(element.XboxOffset) +
+						element.XboxByteSize);
+			}
+			// Inline-array attributes are DWORD aligned.
+			Stride = (Stride + sizeof(DWORD) - 1) &
+				~(sizeof(DWORD) - 1);
 		}
 		else {
 			LOG_TEST_CASE("Non-FVF Vertex Shaders with multiple streams not supported for PushBuffer emulation!");

@@ -487,6 +487,10 @@ void ExecuteDpcQueue()
 		// KeInsertQueueDpc releases the lock, corrupting the pointer (e.g. 0x12A).
 		// RemoveEntryList only checks for nullptr, so a small non-null value crashes.
 		xbox::PLIST_ENTRY pHead = g_DpcData.DpcQueue.Flink;
+		if ((uintptr_t)pHead < 0x10000u) {
+			InitializeListHead(&g_DpcData.DpcQueue);
+			break;
+		}
 		if ((uintptr_t)pHead->Blink < 0x10000u) {
 			EmuLog(LOG_LEVEL::DEBUG, "ExecuteDpcQueue: corrupt DpcListEntry at %p Blink=%p -- skipping",
 				pHead, pHead->Blink);
@@ -503,6 +507,11 @@ void ExecuteDpcQueue()
 		pkdpc = CONTAINING_RECORD(RemoveHeadList(&(g_DpcData.DpcQueue)), xbox::KDPC, DpcListEntry);
 		// Mark it as no longer linked into the DpcQueue
 		pkdpc->Inserted = FALSE;
+		// A title handoff can clear a queued DPC before this host thread drains
+		// it. Discard only the invalid entry instead of calling address zero.
+		if (pkdpc->DeferredRoutine == nullptr) {
+			continue;
+		}
 		// Set DpcRoutineActive to support KeIsExecutingDpc:
 		g_DpcData.IsDpcActive.test_and_set();
 		KeGetCurrentPrcb()->DpcRoutineActive = TRUE; // Experimental
@@ -763,10 +772,19 @@ XBSYSAPI EXPORTNUM(99) xbox::ntstatus_xt NTAPI xbox::KeDelayExecutionThread
 	// Because user APCs from NtQueueApcThread are now handled by the kernel, we need to wait for them ourselves
 	// We can't remove NtDll::NtDelayExecution until all APCs queued by Io are implemented by our kernel as well
 	// Test case: Metal Slug 3
+	// The Xbox Win32 layer converts INFINITE to INT64_MIN. CRI uses that value
+	// for an alertable worker wait; negating it overflows and returning early
+	// makes the worker repeatedly consume the same streaming request.
+	PLARGE_INTEGER effectiveInterval = Interval;
+	if (g_BetaConfig.llong_min_timeout_fix &&
+		effectiveInterval != nullptr &&
+		effectiveInterval->QuadPart == LLONG_MIN) {
+		effectiveInterval = nullptr;
+	}
 
 	PKTHREAD kThread = KeGetCurrentThread();
 	kThread->WaitStatus = X_STATUS_SUCCESS;
-	if (!AddWaitObject(kThread, Interval)) {
+	if (!AddWaitObject(kThread, effectiveInterval)) {
 		RETURN(X_STATUS_TIMEOUT);
 	}
 
@@ -776,9 +794,9 @@ XBSYSAPI EXPORTNUM(99) xbox::ntstatus_xt NTAPI xbox::KeDelayExecutionThread
 	// that 2–3ms overshoot causes the game to miss its vblank window and drop from 60fps to 30fps.
 	// SleepPrecise sleeps for (interval - 2ms) then spin-waits for the last 2ms, so WaitApc exits immediately.
 	// Absolute timeouts (QuadPart > 0) are not handled here — they are rare and correctness isn't impacted.
-	if (Interval != nullptr && Interval->QuadPart < 0) {
+	if (effectiveInterval != nullptr && effectiveInterval->QuadPart < 0) {
 		// Interval is a relative timeout in 100ns units (negative). Convert to nanoseconds.
-		int64_t intervalNs = (-Interval->QuadPart) * 100LL;
+		int64_t intervalNs = (-effectiveInterval->QuadPart) * 100LL;
 		auto target = std::chrono::steady_clock::now() + std::chrono::nanoseconds(intervalNs);
 		SleepPrecise(target);
 	}
@@ -795,7 +813,7 @@ XBSYSAPI EXPORTNUM(99) xbox::ntstatus_xt NTAPI xbox::KeDelayExecutionThread
 		// to the thread. Test case: Steel Battalion
 		xbox::KiUnwaitThreadAndLock(kThread, Status, 0);
 		return std::make_optional<ntstatus_xt>(kThread->WaitStatus);
-		}, Interval, Alertable, WaitMode, kThread);
+		}, effectiveInterval, Alertable, WaitMode, kThread);
 
 	if (ret == X_STATUS_TIMEOUT) {
 		// NOTE: this function considers a timeout a success

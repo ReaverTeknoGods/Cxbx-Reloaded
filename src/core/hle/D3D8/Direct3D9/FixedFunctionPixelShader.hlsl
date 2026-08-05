@@ -192,12 +192,11 @@ TextureArgs ExecuteTextureStage(
 	else if (type == SAMPLE_CUBE)
 		t = texCUBE(samplers[i], TexCoords[i].xyz + offset.xyz);
 
-#ifdef ENABLE_FF_ALPHAKILL
-	if (stage.ALPHAKILL)
-		if (t.a == 0)
-			discard;
-
-#endif
+	// Xbox D3DTALPHAKILL_ENABLE rejects only fully transparent texels.
+	// This is runtime stage state, so it must remain active in the generic
+	// fixed-function shader rather than being compiled out globally.
+	if (stage.ALPHAKILL && t.a == 0)
+		clip(-1);
 	// Assign the final value for TEXTURE
 	ctx.TEXTURE = t * factor;
 

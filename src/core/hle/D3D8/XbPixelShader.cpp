@@ -1015,7 +1015,10 @@ void UpdateFixedFunctionPixelShaderState()
 {
 	using namespace FixedFunctionPixelShader;
 
-	FixedFunctionPixelShaderState ffPsState;
+	// Each scalar member is alignas(16), so the upload contains padding. Clear
+	// the complete buffer first; otherwise an uninitialised padding float can
+	// be a signalling NaN and trip host D3D9 validation or the shader compiler.
+	FixedFunctionPixelShaderState ffPsState{};
 	ffPsState.TextureFactor = (D3DXVECTOR4)((D3DXCOLOR)(XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_TEXTUREFACTOR)));
 	ffPsState.SpecularEnable = XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_SPECULARENABLE);
 	ffPsState.FogEnable = XboxRenderStates.GetXboxRenderState(xbox::X_D3DRS_FOGENABLE);

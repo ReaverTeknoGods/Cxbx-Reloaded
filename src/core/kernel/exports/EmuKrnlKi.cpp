@@ -1201,6 +1201,10 @@ xbox::void_xt xbox::KiWaitTest
 	WaitList = &FirstObject->Header.WaitListHead;
 	WaitEntry = WaitList->Flink;
 	while ((FirstObject->Header.SignalState > 0) && (WaitEntry != WaitList)) {
+		if ((uintptr_t)WaitEntry < 0x10000u) {
+			InitializeListHead(WaitList);
+			break;
+		}
 		/* Get the current wait block */
 		WaitBlock = CONTAINING_RECORD(WaitEntry, KWAIT_BLOCK, WaitListEntry);
 		WaitThread = WaitBlock->Thread;
@@ -1213,7 +1217,12 @@ xbox::void_xt xbox::KiWaitTest
 		else {
 			/* WaitAll, check that all the objects are signalled */
 			NextBlock = WaitBlock->NextWaitBlock;
+			bool corruptWaitChain = false;
 			while (NextBlock != WaitBlock) {
+				if ((uintptr_t)NextBlock < 0x10000u) {
+					corruptWaitChain = true;
+					break;
+				}
 				if (NextBlock->WaitKey != X_STATUS_TIMEOUT) {
 					PKMUTANT Mutant = (PKMUTANT)NextBlock->Object;
 					// NOTE: we ignore mutants because we forward them to ntdll
@@ -1224,6 +1233,10 @@ xbox::void_xt xbox::KiWaitTest
 				}
 
 				NextBlock = NextBlock->NextWaitBlock;
+			}
+			if (corruptWaitChain) {
+				InitializeListHead(WaitList);
+				break;
 			}
 
 			KiWaitSatisfyAll(WaitBlock);

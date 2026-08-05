@@ -1152,7 +1152,18 @@ static void CxbxrKrnlInitHacks()
 {
 	unsigned Host2XbStackBaseReserved = 0;
 	__asm mov Host2XbStackBaseReserved, esp;
-	unsigned Host2XbStackSizeReserved = EmuGenerateStackSize(Host2XbStackBaseReserved, 0);
+	xbox::ulong_xt HostThreadTlsDataSize = 0;
+	if (pTLS != nullptr) {
+		// The kernel/DPC loop executes title callbacks on this host thread. Give
+		// it the same stack-relative Xbox TLS layout as ordinary title threads.
+		HostThreadTlsDataSize = pTLS->dwDataEndAddr - pTLS->dwDataStartAddr;
+		HostThreadTlsDataSize += pTLS->dwSizeofZeroFill + 15;
+		HostThreadTlsDataSize =
+			(HostThreadTlsDataSize & ~15) + sizeof(xbox::addr_xt);
+	}
+	unsigned Host2XbStackSizeReserved = EmuGenerateStackSize(
+		Host2XbStackBaseReserved,
+		HostThreadTlsDataSize);
 	__asm sub esp, Host2XbStackSizeReserved;
     // Set windows timer period to 1ms
     // Windows will automatically restore this value back to original on program exit
@@ -1250,7 +1261,11 @@ static void CxbxrKrnlInitHacks()
 
 	// Create a kpcr for this thread. This is necessary because ObInitSystem needs to access the irql. This must also be done before
 	// CxbxInitWindow because that function creates the xbox EmuUpdateTickCount thread
-	EmuGenerateFS<true>(xbox::zeroptr, Host2XbStackBaseReserved, Host2XbStackSizeReserved);
+	EmuGenerateFS<true>(
+		xbox::zeroptr,
+		Host2XbStackBaseReserved,
+		Host2XbStackSizeReserved,
+		HostThreadTlsDataSize);
 	if (!xbox::ObInitSystem()) {
 		CxbxrAbortEx(LOG_PREFIX_INIT, "Unable to intialize ObInitSystem.");
 	}

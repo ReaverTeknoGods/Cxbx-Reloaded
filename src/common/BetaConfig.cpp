@@ -67,8 +67,11 @@ void BetaConfig_Load()
 	g_BetaConfig.timer_exp_max_ticks      = ReadIniInt(path, "timer_exp_max_ticks", 0);
 
 	// Crazy Taxi game-specific
-	g_BetaConfig.ct_skip_movies           = ReadIniInt(path, "ct_skip_movies", 1);
-	g_BetaConfig.ct_cri_force_complete    = ReadIniInt(path, "ct_cri_force_complete", 1);
+	g_BetaConfig.ct_skip_movies           = ReadIniInt(path, "ct_skip_movies", 0);
+	g_BetaConfig.ct_cri_force_complete    = ReadIniInt(path, "ct_cri_force_complete", 0);
+	g_BetaConfig.ct_cri_wait_timeout_ms   = static_cast<unsigned>(
+		ReadIniInt(path, "ct_cri_wait_timeout_ms", 3000));
+	g_BetaConfig.ct_headlights            = ReadIniInt(path, "ct_headlights", 1);
 
 	// Chihiro MediaBoard
 	g_BetaConfig.mb_board_type            = ReadIniInt(path, "mb_board_type", 0);

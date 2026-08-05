@@ -689,6 +689,7 @@ protected:
 	bool IsFixedFunction;
 	D3DVERTEXELEMENT* pCurrentHostVertexElement;
 	std::array<bool, 16> RegVIsPresentInDeclaration;
+	WORD CurrentXboxStreamEnd;
 
 private:
 	#define D3DDECLUSAGE_UNSUPPORTED ((D3DDECLUSAGE)-1)
@@ -911,8 +912,9 @@ private:
 					pCurrentVertexDeclaration->NumberOfVertexStreams++]);
 			pCurrentVertexShaderStreamInfo->NeedPatch = FALSE;
 			pCurrentVertexShaderStreamInfo->XboxStreamIndex = (WORD)slot.StreamIndex;
-			pCurrentVertexShaderStreamInfo->HostVertexStride = (WORD)slot.Offset;
+			pCurrentVertexShaderStreamInfo->HostVertexStride = 0;
 			pCurrentVertexShaderStreamInfo->NumberOfVertexElements = 0;
+			CurrentXboxStreamEnd = 0;
 			// Dxbx note : Use Dophin(s), FieldRender, MatrixPaletteSkinning and PersistDisplay as a testcase
 		}
 
@@ -929,15 +931,24 @@ private:
 			pCurrentVertexShaderStreamInfo->NeedPatch |= TRUE;
 		}
 
+		// Preserve leading/inter-element padding while allowing converted element
+		// sizes to expand or shrink independently of the Xbox layout.
+		if (slot.Offset >= CurrentXboxStreamEnd) {
+			pCurrentVertexShaderStreamInfo->HostVertexStride +=
+				static_cast<WORD>(slot.Offset - CurrentXboxStreamEnd);
+		}
+
 		pCurrentVertexShaderStreamElementInfo->XboxType = XboxVertexElementDataType;
+		pCurrentVertexShaderStreamElementInfo->XboxOffset = (WORD)slot.Offset;
 		pCurrentVertexShaderStreamElementInfo->XboxByteSize = XboxVertexElementByteSize;
+		pCurrentVertexShaderStreamElementInfo->HostOffset =
+			pCurrentVertexShaderStreamInfo->HostVertexStride;
 		pCurrentVertexShaderStreamElementInfo->HostDataType = HostVertexElementDataType;
 		pCurrentVertexShaderStreamElementInfo->HostByteSize = HostVertexElementByteSize;
 
 		// Convert to host vertex element
 		pCurrentHostVertexElement->Stream = pCurrentVertexShaderStreamInfo->XboxStreamIndex; // Use Xbox stream index on host
-		// FIXME Don't assume vertex elements are contiguous!
-		pCurrentHostVertexElement->Offset = pCurrentVertexShaderStreamInfo->HostVertexStride;
+		pCurrentHostVertexElement->Offset = pCurrentVertexShaderStreamElementInfo->HostOffset;
 		pCurrentHostVertexElement->Type = pCurrentVertexShaderStreamElementInfo->HostDataType;
 		pCurrentHostVertexElement->Method = D3DDECLMETHOD_DEFAULT;
 		if (IsFixedFunction) {
@@ -954,6 +965,9 @@ private:
 		}
 
 		pCurrentVertexShaderStreamInfo->HostVertexStride += HostVertexElementByteSize;
+		CurrentXboxStreamEnd = std::max<WORD>(
+			CurrentXboxStreamEnd,
+			static_cast<WORD>(slot.Offset + XboxVertexElementByteSize));
 
 		return true;
 	}

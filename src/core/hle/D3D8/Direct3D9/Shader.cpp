@@ -45,10 +45,81 @@
 #include <chrono>
 #include <unordered_map>
 #include <unordered_set>
+#include <float.h>
+#include <xmmintrin.h>
 #include "common\util\hasher.h" // For ComputeHash
 //#include <sstream>
 
 ShaderSources g_ShaderSources;
+
+namespace
+{
+class HostShaderCompilerFpGuard
+{
+public:
+	HostShaderCompilerFpGuard()
+		: m_guestMxcsr(_mm_getcsr())
+	{
+		_controlfp_s(&m_guestControlWord, 0, 0);
+
+		// D3DCompiler is host code and must not inherit the Xbox thread's
+		// exception masks. Some titles deliberately unmask guest exceptions;
+		// D3DCompiler and its CRT math helpers then raise host-side floating
+		// traps during otherwise valid shader compilation. Masking alone is
+		// insufficient when the guest left a pending x87/SSE status bit set:
+		// The host can surface that stale state as STATUS_FLOAT_MULTIPLE_TRAPS at
+		// the first compiler CRT operation. Start the host call with both
+		// exception families masked and their pending flags cleared.
+		_mm_setcsr((m_guestMxcsr | _MM_MASK_MASK) & ~_MM_EXCEPT_MASK);
+		unsigned int ignored = 0;
+		_controlfp_s(&ignored, _MCW_EM, _MCW_EM);
+		_clearfp();
+	}
+
+	~HostShaderCompilerFpGuard()
+	{
+		// Do not leak status flags raised by the compiler back into the Xbox
+		// thread. Restore the guest exception masks and rounding/precision
+		// modes, but leave the transient host exception status clear.
+		_clearfp();
+		unsigned int ignored = 0;
+		_controlfp_s(&ignored, m_guestControlWord, _MCW_EM);
+		_mm_setcsr(m_guestMxcsr & ~_MM_EXCEPT_MASK);
+	}
+
+private:
+	unsigned int m_guestMxcsr;
+	unsigned int m_guestControlWord;
+};
+
+HRESULT CxbxD3DCompile(
+	LPCVOID sourceData,
+	SIZE_T sourceDataSize,
+	LPCSTR sourceName,
+	const D3D_SHADER_MACRO* defines,
+	ID3DInclude* include,
+	LPCSTR entryPoint,
+	LPCSTR target,
+	UINT flags1,
+	UINT flags2,
+	ID3DBlob** code,
+	ID3DBlob** errorMessages)
+{
+	HostShaderCompilerFpGuard fpGuard;
+	return D3DCompile(
+		sourceData,
+		sourceDataSize,
+		sourceName,
+		defines,
+		include,
+		entryPoint,
+		target,
+		flags1,
+		flags2,
+		code,
+		errorMessages);
+}
+}
 
 // ============================================================================
 // Disk-based shader bytecode cache
@@ -476,7 +547,7 @@ static void EnsureFallbackShaders()
 	// pixels are black (preferable to white which washes out the scene).
 	const char* psSrc =
 		"float4 main() : COLOR0 { return float4(0,0,0,0); }\n";
-	D3DCompile(psSrc, strlen(psSrc), nullptr, nullptr, nullptr,
+	CxbxD3DCompile(psSrc, strlen(psSrc), nullptr, nullptr, nullptr,
 		"main", "ps_3_0", D3DCOMPILE_OPTIMIZATION_LEVEL0, 0, &g_FallbackPSBlob, nullptr);
 
 	ShaderCacheLog("Fallback PS compiled: %p (%zu bytes)\n",
@@ -493,7 +564,7 @@ static void AsyncCompileWorker(std::string hlsl_str, std::string profile,
 	ID3DBlob* pErrors = nullptr;
 	UINT flags1 = D3DCOMPILE_OPTIMIZATION_LEVEL3;
 
-	HRESULT hr = D3DCompile(
+	HRESULT hr = CxbxD3DCompile(
 		hlsl_str.c_str(), hlsl_str.length(),
 		sourceName.empty() ? nullptr : sourceName.c_str(),
 		nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
@@ -506,7 +577,7 @@ static void AsyncCompileWorker(std::string hlsl_str, std::string profile,
 			pErrors->Release(); pErrors = nullptr;
 		}
 		flags1 |= D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY | D3DCOMPILE_AVOID_FLOW_CONTROL;
-		hr = D3DCompile(
+		hr = CxbxD3DCompile(
 			hlsl_str.c_str(), hlsl_str.length(),
 			sourceName.empty() ? nullptr : sourceName.c_str(),
 			nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
@@ -706,7 +777,7 @@ extern HRESULT EmuCompileShader
 	auto tCompileStart = std::chrono::high_resolution_clock::now();
 	UINT flags1 = D3DCOMPILE_OPTIMIZATION_LEVEL3;
 
-	hRet = D3DCompile(
+	hRet = CxbxD3DCompile(
 		hlsl_str.c_str(),
 		hlsl_str.length(),
 		pSourceName,
@@ -724,7 +795,7 @@ extern HRESULT EmuCompileShader
 		// Attempt to retry in compatibility mode, this allows some vertex-state shaders to compile
 		// Test Case: Spy vs Spy
 		flags1 |= D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY | D3DCOMPILE_AVOID_FLOW_CONTROL;
-		hRet = D3DCompile(
+		hRet = CxbxD3DCompile(
 			hlsl_str.c_str(),
 			hlsl_str.length(),
 			pSourceName,

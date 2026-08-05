@@ -94,6 +94,8 @@ D3D8TransformState::D3D8TransformState() {
 	this->Transforms.fill(identity);
 	this->WorldView.fill(identity);
 	this->WorldViewInverseTranspose.fill(identity);
+	this->DirectWorldViewEnabled.fill(false);
+	this->VertexBlendProjection = identity;
 	bWorldViewDirty.fill(true);
 }
 
@@ -119,6 +121,92 @@ void D3D8TransformState::SetTransform(xbox::X_D3DTRANSFORMSTATETYPE state, const
 	}
 }
 
+void D3D8TransformState::SetModelView(
+	const D3DMATRIX* pModelView,
+	const D3DMATRIX* pInverseModelView)
+{
+	if (pModelView == nullptr) {
+		DirectWorldViewEnabled[0] = false;
+		bWorldViewDirty[0] = true;
+		return;
+	}
+
+	DirectWorldViewEnabled[0] = true;
+	bWorldViewDirty[0] = false;
+	WorldView[0] = *pModelView;
+
+	if (pInverseModelView != nullptr) {
+		SetWorldViewInverseTranspose(0, pInverseModelView);
+	}
+	else {
+		D3DXMATRIX worldViewInverseTranspose;
+		D3DXMatrixInverse(
+			&worldViewInverseTranspose,
+			nullptr,
+			reinterpret_cast<const D3DXMATRIX*>(pModelView));
+		D3DXMatrixTranspose(
+			&worldViewInverseTranspose,
+			&worldViewInverseTranspose);
+		WorldViewInverseTranspose[0] = worldViewInverseTranspose;
+	}
+}
+
+void D3D8TransformState::SetVertexBlendModelView(
+	unsigned count,
+	const D3DMATRIX* pModelViews,
+	const D3DMATRIX* pInverseModelViews)
+{
+	VertexBlendModelViewManaged = true;
+
+	if (pModelViews == nullptr) {
+		DirectWorldViewEnabled.fill(false);
+		bWorldViewDirty.fill(true);
+		return;
+	}
+
+	assert(count > 0 && count <= 4);
+
+	for (unsigned i = 0; i < count; ++i) {
+		DirectWorldViewEnabled[i] = true;
+		bWorldViewDirty[i] = false;
+		WorldView[i] = pModelViews[i];
+
+		if (pInverseModelViews != nullptr) {
+			SetWorldViewInverseTranspose(i, &pInverseModelViews[i]);
+		}
+		else {
+			D3DXMATRIX worldViewInverseTranspose;
+			D3DXMatrixInverse(
+				&worldViewInverseTranspose,
+				nullptr,
+				reinterpret_cast<const D3DXMATRIX*>(&pModelViews[i]));
+			D3DXMatrixTranspose(
+				&worldViewInverseTranspose,
+				&worldViewInverseTranspose);
+			WorldViewInverseTranspose[i] = worldViewInverseTranspose;
+		}
+	}
+}
+
+void D3D8TransformState::SetVertexBlendProjection(
+	const D3DMATRIX* pProjection)
+{
+	VertexBlendProjectionEnabled = pProjection != nullptr;
+	if (pProjection != nullptr) {
+		VertexBlendProjection = *pProjection;
+	}
+}
+
+const D3DMATRIX* D3D8TransformState::GetVertexBlendProjection() const
+{
+	return VertexBlendProjectionEnabled ? &VertexBlendProjection : nullptr;
+}
+
+bool D3D8TransformState::IsVertexBlendModelViewManaged() const
+{
+	return VertexBlendModelViewManaged;
+}
+
 void D3D8TransformState::RecalculateDependentMatrices(unsigned i)
 {
 	auto worldState = xbox::X_D3DTS_WORLD + i;
@@ -132,9 +220,28 @@ void D3D8TransformState::RecalculateDependentMatrices(unsigned i)
 	this->WorldViewInverseTranspose[i] = worldViewInverseTranspose;
 }
 
+void D3D8TransformState::SetWorldViewInverseTranspose(
+	unsigned i,
+	const D3DMATRIX* pInverseModelView)
+{
+	assert(i < 4);
+	assert(pInverseModelView != nullptr);
+
+	D3DXMATRIX worldViewInverseTranspose =
+		*reinterpret_cast<const D3DXMATRIX*>(pInverseModelView);
+	D3DXMatrixTranspose(
+		&worldViewInverseTranspose,
+		&worldViewInverseTranspose);
+	this->WorldViewInverseTranspose[i] = worldViewInverseTranspose;
+}
+
 D3DMATRIX* D3D8TransformState::GetWorldView(unsigned i)
 {
 	assert(i < 4);
+
+	if (DirectWorldViewEnabled[i]) {
+		return &WorldView[i];
+	}
 
 	if (bWorldViewDirty[i]) {
 		RecalculateDependentMatrices(i);
@@ -151,18 +258,33 @@ void D3D8TransformState::SetWorldView(unsigned i, const D3DMATRIX* pMatrix)
     if (!pMatrix) {
         // null indicates the title is done with setting
         // the worldview matrix explicitly
+        DirectWorldViewEnabled[i] = false;
         bWorldViewDirty[i] = true;
         return;
     }
     else {
+        DirectWorldViewEnabled[i] = true;
         bWorldViewDirty[i] = false;
         WorldView[i] = *pMatrix;
+		D3DXMATRIX worldViewInverseTranspose;
+		D3DXMatrixInverse(
+			&worldViewInverseTranspose,
+			nullptr,
+			reinterpret_cast<const D3DXMATRIX*>(pMatrix));
+		D3DXMatrixTranspose(
+			&worldViewInverseTranspose,
+			&worldViewInverseTranspose);
+		WorldViewInverseTranspose[i] = worldViewInverseTranspose;
     }
 }
 
 D3DMATRIX* D3D8TransformState::GetWorldViewInverseTranspose(unsigned i)
 {
 	assert(i < 4);
+
+	if (DirectWorldViewEnabled[i]) {
+		return &WorldViewInverseTranspose[i];
+	}
 
 	if (bWorldViewDirty[i]) {
 		RecalculateDependentMatrices(i);

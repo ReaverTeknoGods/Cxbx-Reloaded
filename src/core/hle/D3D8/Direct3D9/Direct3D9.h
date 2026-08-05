@@ -43,6 +43,7 @@ void LookupTrampolinesD3D();
 extern void CxbxInitWindow();
 
 void CxbxUpdateNativeD3DResources();
+void CxbxInvalidateFixedFunctionNonTransformState();
 
 void CxbxImpl_SetRenderTarget(xbox::X_D3DSurface* pRenderTarget, xbox::X_D3DSurface* pNewZStencil);
 void CxbxImpl_SetViewport(xbox::X_D3DVIEWPORT8* pViewport);
@@ -2072,6 +2073,17 @@ xbox::void_xt WINAPI EMUPATCH(D3DDevice_SetModelView)
 	CONST D3DMATRIX *pModelView, 
 	CONST D3DMATRIX *pInverseModelView, 
 	CONST D3DMATRIX *pComposite
+);
+
+// ******************************************************************
+// * patch: D3DDevice_SetVertexBlendModelView
+// ******************************************************************
+xbox::void_xt WINAPI EMUPATCH(D3DDevice_SetVertexBlendModelView)
+(
+	uint_xt Count,
+	CONST D3DMATRIX *pModelViews,
+	CONST D3DMATRIX *pInverseModelViews,
+	CONST D3DMATRIX *pProjectionViewport
 );
 
 // ******************************************************************

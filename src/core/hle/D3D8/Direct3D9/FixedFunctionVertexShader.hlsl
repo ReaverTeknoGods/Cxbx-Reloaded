@@ -112,6 +112,7 @@ struct LightingOutput
 {
     TwoSidedColor Diffuse;
     TwoSidedColor Specular;
+    TwoSidedColor Ambient;
 };
 
 // useful reference https://drivers.amd.com/misc/samples/dx9/FixedFuncShader.pdf
@@ -120,6 +121,7 @@ LightingOutput DoLight(const Light l, const float2 powers)
     LightingOutput o;
     o.Diffuse.Front = o.Diffuse.Back = float3(0, 0, 0);
     o.Specular.Front = o.Specular.Back = float3(0, 0, 0);
+    o.Ambient.Front = o.Ambient.Back = float3(0, 0, 0);
 
 	float3 toLight;
 	float3 toLightN;
@@ -141,7 +143,7 @@ LightingOutput DoLight(const Light l, const float2 powers)
 		float cosAlpha = dot(l.DirectionVN, toVertexN);
 		// I = ( cos(a) - cos(phi/2) ) / ( cos(theta/2) - cos(phi/2) )
 		float spotBase = saturate((cosAlpha - l.CosHalfPhi) / l.SpotIntensityDivisor);
-		float spotIntensity = pow(spotBase, l.Falloff);
+		spotIntensity = pow(spotBase, l.Falloff);
 	}
 
 	if (l.Type == LIGHT_TYPE_POINT || l.Type == LIGHT_TYPE_SPOT) {
@@ -154,9 +156,17 @@ LightingOutput DoLight(const Light l, const float2 powers)
 			+ l.Attenuation[2] * lightDist * lightDist);
 
 		// Range cutoff
-		if (lightDist > l.Range)
+		if (lightDist > l.RangeAmbient.x)
 			attenuation = 0;
 	}
+
+	// Xemu/NV2A semantics apply a local light's attenuation and spotlight
+	// factor to its ambient colour as well as its diffuse/specular colour.
+	// CXBXR historically accumulated all light ambient globally on the CPU,
+	// which made Crazy Taxi's course lights illuminate and saturate every
+	// surface regardless of range.
+	o.Ambient.Front = o.Ambient.Back =
+		l.RangeAmbient.yzw * attenuation * spotIntensity;
 
 	// Diffuse lighting calculation
 	const float NdotLFront = dot(View.Normal, toLightN);
@@ -189,6 +199,8 @@ LightingOutput CalcLighting(const float2 powers)
     totalLightOutput.Diffuse.Back = float3(0, 0, 0);
     totalLightOutput.Specular.Front = float3(0, 0, 0);
     totalLightOutput.Specular.Back = float3(0, 0, 0);
+    totalLightOutput.Ambient.Front = float3(0, 0, 0);
+    totalLightOutput.Ambient.Back = float3(0, 0, 0);
 
     for (uint i = 0; i < 8; i++)
     {
@@ -202,6 +214,8 @@ LightingOutput CalcLighting(const float2 powers)
 			totalLightOutput.Diffuse.Back += currentLightOutput.Diffuse.Back;
 			totalLightOutput.Specular.Front += currentLightOutput.Specular.Front;
 			totalLightOutput.Specular.Back += currentLightOutput.Specular.Back;
+			totalLightOutput.Ambient.Front += currentLightOutput.Ambient.Front;
+			totalLightOutput.Ambient.Back += currentLightOutput.Ambient.Back;
 		}
     }
 
@@ -351,10 +365,14 @@ float4 DoTexCoord(const uint stage, const VS_INPUT xIn)
         texCoord = View.Position;
     else
     {
-        const float3 reflected = reflect(normalize(View.Position.xyz), View.Normal);
+        const float3 reflected =
+            reflect(normalize(View.Position.xyz), View.Normal);
 
         if (tState.TexCoordIndexGen == TCI_CAMERASPACEREFLECTIONVECTOR)
-            texCoord.xyz = reflected;
+            texCoord.xyz = float3(
+                reflected.x,
+                reflected.y * state.ReflectionVectorYSign,
+                reflected.z);
         // else if TCI_OBJECT TODO is this just model position?
         else if (tState.TexCoordIndexGen == TCI_SPHERE)
         {
@@ -362,8 +380,8 @@ float4 DoTexCoord(const uint stage, const VS_INPUT xIn)
             // http://www.bluevoid.com/opengl/sig99/advanced99/notes/node177.html
             const float3 R = reflected;
             const float p = sqrt(pow(R.x, 2) + pow(R.y, 2) + pow(R.z + 1, 2));
-            texCoord.x = R.x / 2 * p + 0.5f;
-            texCoord.y = R.y / 2 * p + 0.5f;
+            texCoord.x = R.x / (2 * p) + 0.5f;
+            texCoord.y = R.y / (2 * p) + 0.5f;
         }
     }
 
@@ -496,7 +514,15 @@ VS_OUTPUT main(const VS_INPUT xInput)
         // Frontface
         material.Specular.rgb *= lighting.Specular.Front;
         material.Diffuse.rgb *= lighting.Diffuse.Front;
-        material.Ambient.rgb *= state.TotalLightsAmbient.Front;
+        // ReflectionVectorYSign is negative only for Crazy Taxi's title-scoped
+        // fixed-function path. Other titles keep CXBXR's established global
+        // light-ambient behavior while this Chihiro title uses NV2A-style
+        // per-light ambient attenuation.
+        const float usePerLightAmbient =
+            state.ReflectionVectorYSign < 0 ? 1.0 : 0.0;
+        material.Ambient.rgb *=
+            state.TotalLightsAmbient.Front +
+            lighting.Ambient.Front * usePerLightAmbient;
         xOut.oD0 = float4(material.Diffuse.rgb + material.Ambient.rgb + material.Emissive.rgb, material.Diffuse.a);
         xOut.oD1 = float4(material.Specular.rgb, 0);
 
@@ -505,7 +531,9 @@ VS_OUTPUT main(const VS_INPUT xInput)
             // Backface
             backMaterial.Specular.rgb *= lighting.Specular.Back;
             backMaterial.Diffuse.rgb *= lighting.Diffuse.Back;
-            backMaterial.Ambient.rgb *= state.TotalLightsAmbient.Back;
+            backMaterial.Ambient.rgb *=
+                state.TotalLightsAmbient.Back +
+                lighting.Ambient.Back * usePerLightAmbient;
             xOut.oB0 = float4(backMaterial.Diffuse.rgb + backMaterial.Ambient.rgb + backMaterial.Emissive.rgb, backMaterial.Diffuse.a);
             xOut.oB1 = float4(backMaterial.Specular.rgb, 0);
         }

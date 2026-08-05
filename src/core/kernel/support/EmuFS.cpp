@@ -115,8 +115,16 @@
 // = 0x104/260 */ LIST_ENTRY ThreadListEntry;
 // = 0x10C/268 */ UCHAR _padding[4];
 
-template void EmuGenerateFS<true>(xbox::PETHREAD Ethread, unsigned XboxStackBaseReserved, unsigned XboxStackSizeReserved);
-template void EmuGenerateFS<false>(xbox::PETHREAD Ethread, unsigned XboxStackBaseReserved, unsigned XboxStackSizeReserved);
+template void EmuGenerateFS<true>(
+	xbox::PETHREAD Ethread,
+	unsigned XboxStackBaseReserved,
+	unsigned XboxStackSizeReserved,
+	unsigned XboxThreadTlsDataSize);
+template void EmuGenerateFS<false>(
+	xbox::PETHREAD Ethread,
+	unsigned XboxStackBaseReserved,
+	unsigned XboxStackSizeReserved,
+	unsigned XboxThreadTlsDataSize);
 
 NT_TIB *GetNtTib()
 {
@@ -654,7 +662,11 @@ xbox::dword_xt EmuGenerateStackSize(xbox::addr_xt& espBaseAddress, xbox::ulong_x
 
 // generate fs segment selector
 template<bool IsHostThread>
-void EmuGenerateFS(xbox::PETHREAD Ethread, unsigned Host2XbStackBaseReserved, unsigned Host2XbStackSizeReserved)
+void EmuGenerateFS(
+	xbox::PETHREAD Ethread,
+	unsigned Host2XbStackBaseReserved,
+	unsigned Host2XbStackSizeReserved,
+	unsigned XboxThreadTlsDataSize)
 {
 	xbox::PVOID base;
 	xbox::ulong_xt size;
@@ -737,7 +749,7 @@ void EmuGenerateFS(xbox::PETHREAD Ethread, unsigned Host2XbStackBaseReserved, un
 			&Ethread->Tcb,
 			(xbox::PVOID)Host2XbStackBaseReserved,
 			KernelStackSize,
-			xbox::zero,
+			XboxThreadTlsDataSize,
 			xbox::zeroptr,  // Unused (SystemRoutine)
 			xbox::zeroptr,  // Unused (StartRoutine)
 			xbox::zeroptr,  // Unused (StartContext)

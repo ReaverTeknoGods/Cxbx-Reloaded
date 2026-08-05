@@ -34,8 +34,10 @@ struct BetaConfig {
 	int timer_exp_max_ticks      = 0; // Max tick range per DPC call (0=use caller range)
 
 	// Crazy Taxi game-specific patches
-	int ct_skip_movies          = 1; // 1 = skip Sofdec FMVs (return "done"), 0 = allow movie playback
-	int ct_cri_force_complete   = 1; // 1 = force CRI async I/O instant-complete, 0 = let CRI spin naturally
+	int ct_skip_movies          = 0; // 1 = skip Sofdec FMVs (return "done"), 0 = allow movie playback
+	int ct_cri_force_complete   = 0; // 1 = force CRI async I/O instant-complete, 0 = use the alertable CRI wait
+	unsigned ct_cri_wait_timeout_ms = 3000; // Recovery timeout for a stuck title-local CRI completion wait
+	int ct_headlights           = 1; // 1 = add the arcade cabinet's always-on gameplay headlight cone
 
 	// Chihiro MediaBoard hardware identity
 	int mb_board_type           = 0; // 0 = Type-1 (0x0000), 1 = Type-3 (0x0001)

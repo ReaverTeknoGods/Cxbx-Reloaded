@@ -27,6 +27,11 @@ class D3D8TransformState {
 public:
 	D3D8TransformState();
 	void SetTransform(xbox::X_D3DTRANSFORMSTATETYPE state, const D3DMATRIX* pMatrix);
+	void SetModelView(const D3DMATRIX* pModelView, const D3DMATRIX* pInverseModelView);
+	void SetVertexBlendModelView(unsigned count, const D3DMATRIX* pModelViews, const D3DMATRIX* pInverseModelViews);
+	void SetVertexBlendProjection(const D3DMATRIX* pProjection);
+	const D3DMATRIX* GetVertexBlendProjection() const;
+	bool IsVertexBlendModelViewManaged() const;
 	D3DMATRIX* GetWorldView(unsigned i);
 	void SetWorldView(unsigned i, const D3DMATRIX* pMatrix);
 	D3DMATRIX* GetWorldViewInverseTranspose(unsigned i);
@@ -36,8 +41,13 @@ public:
 
 private:
 	void RecalculateDependentMatrices(unsigned i);
+	void SetWorldViewInverseTranspose(unsigned i, const D3DMATRIX* pInverseModelView);
 
 	std::array<bool, 4> bWorldViewDirty;
+	std::array<bool, 4> DirectWorldViewEnabled;
+	bool VertexBlendModelViewManaged = false;
+	bool VertexBlendProjectionEnabled = false;
+	D3DMATRIX VertexBlendProjection;
 	// Combines world/view matrices
 	std::array<D3DMATRIX, 4> WorldView;
 	// World/view inverse transpose for lighting calculations
