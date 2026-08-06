@@ -27,7 +27,6 @@
 // ******************************************************************
 
 #include "MediaBoard.h"
-#include "common/BetaConfig.h"
 #include <cstdio>
 #include <cstdarg>
 #include <string>
@@ -37,7 +36,6 @@
 // Set by QuestOfDPatches when the game XBE (not SEGABOOT) is loaded.
 // Used to skip SEGABOOT-only logic (forced QuickReboot) in the game process.
 extern bool g_QodGamePatchesActive;
-
 #if defined(_DEBUG)
 static FILE* g_mbLog = nullptr;
 uint32_t s_type3TableBase = 0; // exported for state monitor
@@ -91,12 +89,13 @@ uint32_t MediaBoard::LpcRead(uint32_t addr, int size)
     case 0x4020: result = 0x00A0;     desc = "XBAM[0]";            break;
     case 0x4022: result = 0x4258;     desc = "XBAM[1] 'XB'";       break;
     case 0x4024: result = 0x4D41;     desc = "XBAM[2] 'MA'";       break;
-    case 0x40F4: result = g_BetaConfig.mb_dimm_size ? 0x0002 : 0x03;
-                desc = g_BetaConfig.mb_dimm_size ? "DIMM_SIZE(512MB)" : "DIMM_SIZE(1GB)";
+    // Use the standard Type-1, 1 GB MediaBoard identity for supported games.
+    // Per-install beta.ini overrides made otherwise compatible titles enter
+    // the Type-3 network-boot path and wait indefinitely for a network image.
+    case 0x40F4: result = 0x0003;     desc = "DIMM_SIZE(1GB)";
                 break;
     case 0x4026: result = temp_0x4026;  desc = "HANDSHAKE(echo)";    break;
-    case 0x40F0: result = g_BetaConfig.mb_board_type ? 0x0100 : 0x0000;
-                desc = g_BetaConfig.mb_board_type ? "BOARD_TYPE(Type-3)" : "BOARD_TYPE(Type-1)";
+    case 0x40F0: result = 0x0000;     desc = "BOARD_TYPE(Type-1)";
                 break;
     case 0x4084: result = 0;          desc = "UNK_4084";           break;
     case 0x4000:
@@ -589,9 +588,9 @@ void MediaBoard::LpcWrite(uint32_t addr, uint32_t value, int size)
 
 void MediaBoard::ComRead(uint32_t offset, void* buffer, uint32_t length)
 {
-    // Offset 0: game uses this when port 0x4084 returns 0 (DRAM base unset).
-    // Single shared buffer for both read and write (like real DIMM RAM at offset 0).
-    if (offset == 0x00000000) {
+    // Quest of D's unsupported Type-3 path uses offset zero when its DRAM base
+    // is unset. Supported titles retain the standard 0x900000/0x900200 path.
+    if (offset == 0x00000000 && g_QodGamePatchesActive) {
         static int comRead0Count = 0;
         comRead0Count++;
         if (comRead0Count <= 5 || (comRead0Count % 10000) == 0)
@@ -662,9 +661,9 @@ void MediaBoard::ComRead(uint32_t offset, void* buffer, uint32_t length)
 
 void MediaBoard::ComWrite(uint32_t offset, void* buffer, uint32_t length)
 {
-    // Offset 0: shared buffer for command/response when DRAM base unset.
-    // The game writes a command here, we process it and overwrite with response.
-    if (offset == 0x00000000) {
+    // Offset-zero command/response mailbox is reserved for Quest of D's
+    // unsupported Type-3 path; normal games use the standard DIMM channels.
+    if (offset == 0x00000000 && g_QodGamePatchesActive) {
         static int comWrite0Count = 0;
         comWrite0Count++;
         if (comWrite0Count <= 5 || (comWrite0Count % 10000) == 0)
