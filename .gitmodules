@@ -7,7 +7,7 @@
 	url = https://github.com/x1nixmzeng/cs_x86.git
 [submodule "import/XbSymbolDatabase"]
 	path = import/XbSymbolDatabase
-	url = https://github.com/Cxbx-Reloaded/XbSymbolDatabase.git
+	url = https://github.com/ReaverTeknoGods/XbSymbolDatabase.git
 [submodule "import/simpleini"]
 	path = import/simpleini
 	url = https://github.com/brofield/simpleini.git
