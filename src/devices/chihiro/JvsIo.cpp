@@ -142,6 +142,15 @@ void* g_jvs_view_ptr = nullptr;
 static bool g_coin_pressed_prev[JVS_MAX_PLAYERS] = { false };
 JvsGameType g_jvs_game_type = JvsGameType::Generic;
 std::atomic<uint8_t> g_jvs_general_output_bank0 { 0 };
+static std::atomic<ULONGLONG> g_last_jvs_test_press_ms { 0 };
+
+bool ConsumeRecentJvsTestRequest()
+{
+	const ULONGLONG pressedAt =
+		g_last_jvs_test_press_ms.exchange(0, std::memory_order_acq_rel);
+	return pressedAt != 0 && GetTickCount64() - pressedAt <= 5000;
+}
+
 // We will emulate SEGA 837-13551 IO Board
 JvsIo::JvsIo(uint8_t* sense)
 {
@@ -222,6 +231,11 @@ void JvsIo::Update()
 
 		// System inputs
 		Inputs.switches.system.test = (control & 0x01) != 0;
+		if (Inputs.switches.system.test) {
+			g_last_jvs_test_press_ms.store(
+				GetTickCount64(),
+				std::memory_order_release);
+		}
 
 		// Player 1 digital inputs
 		Inputs.switches.player[0].start     = (control & 0x02) != 0;

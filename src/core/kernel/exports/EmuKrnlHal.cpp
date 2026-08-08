@@ -39,6 +39,7 @@
 #include "EmuKrnl.h"
 #include "devices\x86\EmuX86.h" // HalReadWritePciSpace needs this
 #include "devices\chihiro\MediaBoard.h" // For g_MediaBoard->GetBootId()
+#include "devices\chihiro\JvsIo.h"
 #include "EmuShared.h"
 #include "core\kernel\support\EmuFile.h" // For FindNtSymbolicLinkObjectByDriveLetter
 #include "common\EmuEEPROM.h" // For EEPROM
@@ -510,6 +511,48 @@ XBSYSAPI EXPORTNUM(49) xbox::void_xt DECLSPEC_NORETURN NTAPI xbox::HalReturnToFi
 			LOG_UNIMPLEMENTED();
 		else
 		{
+			auto isCurrentChihiroTestExecutable = []() {
+				std::string testExecutable(
+					g_MediaBoard->GetBootId().testExecutable,
+					strnlen(g_MediaBoard->GetBootId().testExecutable, 0x20));
+				std::replace(
+					testExecutable.begin(), testExecutable.end(), '/', '\\');
+				while (!testExecutable.empty() && testExecutable.front() == '\\') {
+					testExecutable.erase(testExecutable.begin());
+				}
+
+				std::string currentExecutable = szFilePath_Xbe;
+				std::replace(
+					currentExecutable.begin(), currentExecutable.end(), '/', '\\');
+				std::transform(
+					testExecutable.begin(), testExecutable.end(),
+					testExecutable.begin(), ::tolower);
+				std::transform(
+					currentExecutable.begin(), currentExecutable.end(),
+					currentExecutable.begin(), ::tolower);
+
+				return !testExecutable.empty() &&
+					currentExecutable.size() >= testExecutable.size() &&
+					currentExecutable.compare(
+						currentExecutable.size() - testExecutable.size(),
+						testExecutable.size(),
+						testExecutable) == 0;
+			};
+			const bool recentJvsTestRequest =
+				g_bIsChihiro && g_MediaBoard &&
+				ConsumeRecentJvsTestRequest();
+
+			// A Chihiro operator Test press commonly asks the current game to
+			// QuickReboot with an empty or MediaBoard-partition launch path. Keep
+			// that short-lived input intent across the handoff so boot.id's test
+			// executable is selected instead of falling back to the game XBE. A
+			// Test press used to confirm Exit inside that XBE must return to the
+			// normal game, so never reselect the test executable from itself.
+			const bool useChihiroTestExecutable =
+				g_bIsChihiro && g_MediaBoard &&
+				!isCurrentChihiroTestExecutable() &&
+				(g_bChihiroTestMode || recentJvsTestRequest);
+
 			// Save the launch data page to disk for later.
 			// (Note : XWriteTitleInfoNoReboot does this too)
 			// Commented out because XLaunchNewImage is disabled!
@@ -571,10 +614,9 @@ XBSYSAPI EXPORTNUM(49) xbox::void_xt DECLSPEC_NORETURN NTAPI xbox::HalReturnToFi
 					// the game executable from the DIMM/network boot setup.
 					// If g_bChihiroTestMode is set, use testExecutable instead.
 					std::string gameExe;
-					if (g_bChihiroTestMode) {
+					if (useChihiroTestExecutable) {
 						gameExe.assign(g_MediaBoard->GetBootId().testExecutable,
 							strnlen(g_MediaBoard->GetBootId().testExecutable, 0x20));
-						g_bChihiroTestMode = false; // consume the flag
 					}
 					if (gameExe.empty()) {
 						gameExe.assign(g_MediaBoard->GetBootId().gameExecutable,
@@ -587,7 +629,7 @@ XBSYSAPI EXPORTNUM(49) xbox::void_xt DECLSPEC_NORETURN NTAPI xbox::HalReturnToFi
 						XbePath = g_MediaBoard->GetMountPath() + "\\" + gameExe;
 #if defined(_DEBUG)
 						EmuLog(LOG_LEVEL::INFO, "Chihiro QuickReboot: launching %s XBE: %s",
-							g_bChihiroTestMode ? "test" : "game", XbePath.c_str());
+							useChihiroTestExecutable ? "test" : "game", XbePath.c_str());
 #endif
 					} else {
 						XbePath = g_MediaBoardBasePath + "\\" + MediaBoardRomFile;
@@ -627,7 +669,7 @@ XBSYSAPI EXPORTNUM(49) xbox::void_xt DECLSPEC_NORETURN NTAPI xbox::HalReturnToFi
 				};
 
 				if (!isXbeFile(XbePath)) {
-					const bool useTestExecutable = g_bChihiroTestMode;
+					const bool useTestExecutable = useChihiroTestExecutable;
 					const char* executable = useTestExecutable
 						? g_MediaBoard->GetBootId().testExecutable
 						: g_MediaBoard->GetBootId().gameExecutable;
@@ -650,11 +692,13 @@ XBSYSAPI EXPORTNUM(49) xbox::void_xt DECLSPEC_NORETURN NTAPI xbox::HalReturnToFi
 								useTestExecutable ? "test executable" : "game executable",
 								fallbackPath.c_str());
 							XbePath = fallbackPath;
-							if (useTestExecutable)
-								g_bChihiroTestMode = false;
 						}
 					}
 				}
+			}
+
+			if (useChihiroTestExecutable) {
+				g_bChihiroTestMode = false;
 			}
 
 			// Relaunch Cxbx, to load another Xbe

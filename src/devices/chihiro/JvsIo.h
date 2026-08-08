@@ -72,6 +72,11 @@ extern JvsGameType g_jvs_game_type;
 // resulting controller state over the SC MIDI channel.
 extern std::atomic<uint8_t> g_jvs_general_output_bank0;
 
+// Consume a recent operator Test-button press when Chihiro requests a
+// QuickReboot. Some cabinets enter their separate test XBE through that
+// reboot instead of switching modes inside the running executable.
+bool ConsumeRecentJvsTestRequest();
+
 typedef struct _jvs_switch_player_inputs_t {
 	bool start = false;
 	bool service = false;
